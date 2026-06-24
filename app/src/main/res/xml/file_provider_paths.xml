@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Logs live in the app-private external-files directory. This maps
+         the on-disk path Android/data/com.portalpad.app/files/logs/ to the
+         FileProvider URI scheme so we can grant temporary read access via
+         system share intents. -->
+    <external-files-path
+        name="logs"
+        path="logs/" />
+    <!-- Screenshots captured via shell screencap of the external display.
+         Same external-files path scheme — auto-cleared on uninstall. -->
+    <external-files-path
+        name="screenshots"
+        path="screenshots/" />
+</paths>

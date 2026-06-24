@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- PortalPad icon — portal-on-pad concept.
+         Adaptive icon safe zone is roughly the center 66x66 region of the
+         108x108 viewport (y ≈ 21–87, x ≈ 21–87). All key elements must live
+         inside that zone to avoid being clipped by launcher icon masks
+         (squircle, circle, teardrop, etc).
+         Previous version placed the portal too high (top at y=17), getting
+         clipped on round launchers. This revision centers the portal at
+         y=40 and the pad at y=72, with everything in the safe zone. -->
+
+    <!-- Touch pad — rounded rectangle base. Vertical span 60..84, inside the
+         safe zone with margin. Subtle gradient gives it a "device surface" feel. -->
+    <path android:pathData="M30,60 L78,60 A7,7 0 0 1 85,67 L85,77 A7,7 0 0 1 78,84 L30,84 A7,7 0 0 1 23,77 L23,67 A7,7 0 0 1 30,60 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="54" android:startY="60"
+                android:endX="54" android:endY="84"
+                android:startColor="#3A2D55"
+                android:endColor="#1A1326" />
+        </aapt:attr>
+    </path>
+    <!-- Pad highlight stroke for definition -->
+    <path
+        android:pathData="M30,60 L78,60 A7,7 0 0 1 85,67 L85,77 A7,7 0 0 1 78,84 L30,84 A7,7 0 0 1 23,77 L23,67 A7,7 0 0 1 30,60 Z"
+        android:strokeColor="#5B4A8F"
+        android:strokeWidth="1.2"
+        android:fillColor="#00000000" />
+
+    <!-- Touch dot — amber on the pad surface -->
+    <path
+        android:pathData="M54,72 m -3,0 a 3,3 0 1,0 6,0 a 3,3 0 1,0 -6,0"
+        android:fillColor="#FFB547" />
+    <!-- Subtle ripple around touch dot -->
+    <path
+        android:pathData="M54,72 m -6,0 a 6,6 0 1,0 12,0 a 6,6 0 1,0 -12,0"
+        android:strokeColor="#FFB547"
+        android:strokeWidth="0.7"
+        android:strokeAlpha="0.4"
+        android:fillColor="#00000000" />
+
+    <!-- Portal — main visual focus, lowered to y=40 so its top edge is
+         around y=26 (well inside the safe zone). Slightly smaller than
+         before so it doesn't crowd the pad. -->
+    <!-- Outer amber halo -->
+    <path android:pathData="M54,40 m -23,0 a 23,16 0 1,0 46,0 a 23,16 0 1,0 -46,0">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="54" android:centerY="40"
+                android:gradientRadius="23"
+                android:startColor="#33FFB547"
+                android:endColor="#00FFB547" />
+        </aapt:attr>
+    </path>
+    <!-- Portal interior — violet gradient "depth through portal" -->
+    <path android:pathData="M54,40 m -18,0 a 18,12 0 1,0 36,0 a 18,12 0 1,0 -36,0">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="54" android:centerY="40"
+                android:gradientRadius="18"
+                android:startColor="#7C61D6"
+                android:endColor="#1A1326" />
+        </aapt:attr>
+    </path>
+    <!-- Portal ring — bright amber outer rim -->
+    <path
+        android:pathData="M54,40 m -18,0 a 18,12 0 1,0 36,0 a 18,12 0 1,0 -36,0"
+        android:strokeColor="#FFB547"
+        android:strokeWidth="2.2"
+        android:fillColor="#00000000" />
+    <!-- Inner secondary ring for depth -->
+    <path
+        android:pathData="M54,40 m -13,0 a 13,8.5 0 1,0 26,0 a 13,8.5 0 1,0 -26,0"
+        android:strokeColor="#FFCB7A"
+        android:strokeWidth="0.7"
+        android:strokeAlpha="0.6"
+        android:fillColor="#00000000" />
+
+    <!-- Connection beam — amber line from touch dot up into the portal -->
+    <path
+        android:pathData="M54,69 L54,49"
+        android:strokeColor="#FFB547"
+        android:strokeWidth="1.4"
+        android:strokeLineCap="round"
+        android:strokeAlpha="0.7"
+        android:fillColor="#00000000" />
+
+</vector>

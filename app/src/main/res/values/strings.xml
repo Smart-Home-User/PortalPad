@@ -1,0 +1,59 @@
+<resources>
+    <string name="app_name">PortalPad</string>
+
+    <!-- Main screen -->
+    <string name="enable">Enable</string>
+    <string name="disable">Disable</string>
+    <string name="input_mode">Input Mode</string>
+    <string name="trackpad">Trackpad</string>
+    <string name="air_mouse">Air Mouse</string>
+    <string name="media_controls">Media Controls</string>
+    <string name="target_display">Target Display</string>
+    <string name="no_external_display">No external display</string>
+    <string name="display_dpi">Display DPI: %1$d</string>
+
+    <!-- Configuration -->
+    <string name="configuration">Configuration</string>
+    <string name="home_button_action">Home button action: %1$s</string>
+    <string name="back_button_action">Back button action: %1$s</string>
+    <string name="dock_setup">Dock setup</string>
+    <string name="show_finger_dots">Show finger dots</string>
+    <string name="enable_mouse_hover">Enable mouse hover</string>
+    <string name="floating_nav_buttons">Floating navigation buttons</string>
+    <string name="show_keyboard_target">Show keyboard on target display</string>
+    <string name="auto_launch_after_move">Auto-launch trackpad after app move</string>
+    <string name="auto_launch_when_enabled">Auto-launch trackpad when enabled</string>
+    <string name="auto_activate_external">Auto-activate on external display</string>
+    <string name="lock_when_disconnect">Lock screen when display disconnects</string>
+
+    <!-- Experimental -->
+    <string name="experimental">Experimental</string>
+    <string name="system_decorations">Enable system display decorations</string>
+    <string name="allow_lockscreen">Allow lockscreen display</string>
+    <string name="multi_window">Enable multi-window on external display</string>
+
+    <!-- Shizuku -->
+    <string name="shizuku_status">Shizuku: %1$s</string>
+    <string name="shizuku_running">running</string>
+    <string name="shizuku_not_running">not running</string>
+    <string name="shizuku_authorize">Authorize Shizuku</string>
+    <string name="restart_shizuku">Restart Shizuku service</string>
+
+    <!-- Picker -->
+    <string name="pick_app_or_activity">Pick app or activity</string>
+    <string name="search_apps">Search apps</string>
+    <string name="show_activities">Show activities</string>
+
+    <!-- Trackpad UI -->
+    <string name="mode_trackpad">Trackpad</string>
+    <string name="mode_media">Media</string>
+    <string name="hdmi_screen">HDMI Screen (%1$dx%2$d)</string>
+
+
+    <!-- Dock settings -->
+    <string name="dock_icon_size">Dock icon size: %1$d dp</string>
+    <string name="dock_visible_items">Dock visible items: %1$d</string>
+
+    <!-- Accessibility service: auto-open the typing relay on field focus -->
+    <string name="accessibility_service_description">Lets PortalPad notice when a text field on the glasses is tapped or focused — including when you tap something that opens one, like a search icon — and automatically open the phone typing page, so you can type into apps on the external display without reaching for the keyboard button. PortalPad watches only editable fields on the external display, and reads the focused field\'s current text solely to show it in the typing page for editing. It does not store or transmit your content.</string>
+</resources>

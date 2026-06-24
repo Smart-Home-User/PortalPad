@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Legacy (pre-Android 12) Auto Backup config. We exclude everything to
+     match data_extraction_rules.xml; android:allowBackup="false" should
+     prevent backup entirely on all versions, but keeping these explicit
+     is defensive.                                                        -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="." />
+    <exclude domain="file" path="datastore/" />
+    <exclude domain="database" path="." />
+    <exclude domain="root" path="." />
+</full-backup-content>

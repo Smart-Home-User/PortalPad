@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Splash entrance animation: the portal "powers on" (scales up + fades in)
+     and the connection beam draws upward into it. Short (~700ms) to respect
+     the system splash timing window. Orientation-safe: everything animates in
+     place around the centered pivot, so it reads correctly in portrait,
+     landscape, and on the ultrawide. -->
+<animated-vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/splash_logo">
+
+    <!-- Portal: scale 0.6 -> 1.0 with a slight overshoot feel, and fade in. -->
+    <target android:name="portal_grp">
+        <aapt:attr name="android:animation" xmlns:aapt="http://schemas.android.com/aapt">
+            <set>
+                <objectAnimator
+                    android:propertyName="scaleX"
+                    android:valueFrom="0.6" android:valueTo="1.0"
+                    android:startOffset="80"
+                    android:duration="520"
+                    android:interpolator="@android:interpolator/decelerate_quint" />
+                <objectAnimator
+                    android:propertyName="scaleY"
+                    android:valueFrom="0.6" android:valueTo="1.0"
+                    android:startOffset="80"
+                    android:duration="520"
+                    android:interpolator="@android:interpolator/decelerate_quint" />
+                <objectAnimator
+                    android:propertyName="alpha"
+                    android:valueFrom="0.0" android:valueTo="1.0"
+                    android:startOffset="80"
+                    android:duration="360"
+                    android:interpolator="@android:interpolator/decelerate_cubic" />
+            </set>
+        </aapt:attr>
+    </target>
+
+    <!-- Beam: draw upward into the portal (trimPathStart 1 -> 0). -->
+    <target android:name="beam">
+        <aapt:attr name="android:animation" xmlns:aapt="http://schemas.android.com/aapt">
+            <objectAnimator
+                android:propertyName="trimPathStart"
+                android:valueFrom="1.0" android:valueTo="0.0"
+                android:startOffset="420"
+                android:duration="300"
+                android:interpolator="@android:interpolator/accelerate_decelerate" />
+        </aapt:attr>
+    </target>
+</animated-vector>

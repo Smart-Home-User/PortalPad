@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- PortalPad deliberately opts out of Auto Backup AND Device Transfer.
+     Settings are intentionally local-only so uninstalling fully clears
+     them (no surprise restoration of old prefs on reinstall). Users who
+     want backup can use Settings → System → Backup (manual export).      -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="datastore/" />
+        <exclude domain="database" path="." />
+        <exclude domain="root" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="datastore/" />
+        <exclude domain="database" path="." />
+        <exclude domain="root" path="." />
+    </device-transfer>
+</data-extraction-rules>

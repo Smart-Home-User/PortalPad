@@ -1,0 +1,285 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Required for foreground service / floating UI / input -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Optional. Only used for the mobile network-type label (5G/LTE/4G) on the
+         status icon — signal bars do NOT need it. Inert unless the user opts in on
+         the setup page, which grants it via `pm grant` through Shizuku/Root. -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <!-- Optional. Used to count connected Bluetooth devices for the status menu.
+         Opt-in on the setup page (granted via `pm grant` through Shizuku/Root). -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- CAMERA permission is required to control the flashlight (torch).
+         We never access camera frames — only setTorchMode for the LED.
+         Marked required=false on the feature so the app is still installable
+         on devices without a flash unit; the flashlight button hides itself
+         in that case. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
+
+    <!-- App listing for home-button / dock pickers -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!-- Granted via Shizuku at runtime -->
+    <uses-permission android:name="android.permission.INJECT_EVENTS"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.INTERNAL_SYSTEM_WINDOW"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.MANAGE_ACTIVITY_TASKS"
+        tools:ignore="ProtectedPermissions" />
+    <!-- Granted via `pm grant` through Shizuku/ADB. Used by FreeformManager to
+         enable the platform's freeform / force-resizable secure settings. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+        </intent>
+        <!-- Extinguish — used by the Remote tab's power button to turn off
+             the phone screen while the external display stays on. Listed
+             explicitly so we can detect installation via getPackageInfo on
+             Android 11+ (without this, package visibility restrictions make
+             the call fail even when the app is installed). -->
+        <package android:name="own.moderpach.extinguish" />
+        <!-- Shizuku — for the in-app Start/Stop control broadcast (explicit
+             setPackage broadcast needs the target visible on Android 11+). -->
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+
+    <application
+        android:name=".PortalPadApp"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@style/Theme.PortalPad"
+        android:supportsRtl="true"
+        android:enableOnBackInvokedCallback="true">
+
+        <!-- Settings screen -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.PortalPad.Splash">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Trackpad / media controls full-screen UI -->
+        <activity
+            android:name=".TrackpadActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|navigation|keyboard|screenLayout|smallestScreenSize|uiMode|density"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.PortalPad.Trackpad" />
+
+        <!-- Home backdrop shown on the external display when it would otherwise
+             be empty (no home app, or all apps closed). Launched onto the VD via
+             a display-targeted start command. Does NOT touch the Android system wallpaper. -->
+        <activity
+            android:name=".WallpaperActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.PortalPad.Trackpad" />
+
+        <!-- App / activity picker for home & back & dock customization -->
+        <activity
+            android:name=".ui.settings.AppPickerActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.PortalPad.FastLaunch" />
+
+        <!-- Window-limit manager: lists open external windows to close (on phone).
+             Its OWN taskAffinity keeps it isolated from WallpaperActivity's task
+             (both are PortalPad activities; without this, launching it disturbed
+             the external-display wallpaper backdrop → black background). -->
+        <activity
+            android:name=".ui.settings.WindowLimitActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity="com.portalpad.app.windowlimit"
+            android:theme="@style/Theme.PortalPad" />
+
+        <!-- Rename a dock item (folder/shortcut) on the phone — text input + IME
+             are unstable on the external-display overlay, so it lives here. -->
+        <activity
+            android:name=".ui.settings.RenameActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity="com.portalpad.app.rename"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.PortalPad" />
+
+        <!-- Arrange/tile open external windows in a chosen order (on phone). -->
+        <activity
+            android:name=".ui.settings.ArrangeWindowsActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity="com.portalpad.app.arrangewindows"
+            android:theme="@style/Theme.PortalPad" />
+
+        <!-- Pick which open external window to maximize / bring to full view (on phone). -->
+        <activity
+            android:name=".ui.settings.MaximizeWindowActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity="com.portalpad.app.maximizewindow"
+            android:theme="@style/Theme.PortalPad" />
+
+        <!-- Pick which open external window to minimize (on phone). -->
+        <activity
+            android:name=".ui.settings.MinimizeWindowActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity="com.portalpad.app.minimizewindow"
+            android:theme="@style/Theme.PortalPad" />
+
+        <!-- Button appearance customization (icon + colors) for Back/Home -->
+        <activity
+            android:name=".ui.settings.ButtonCustomizeActivity"
+            android:exported="false"
+            android:theme="@style/Theme.PortalPad" />
+
+        <!-- Keyboard relay: phone-side text input that forwards keystrokes to
+             the external display. Workaround for Android not rendering soft
+             keyboards on secondary displays. -->
+        <activity
+            android:name=".KeyboardRelayActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize|stateAlwaysVisible"
+            android:theme="@style/Theme.PortalPad" />
+
+        <!-- No-UI activity that requests the RECORD_AUDIO runtime permission for
+             voice search (overlays can't prompt for runtime permissions). -->
+        <activity
+            android:name=".MicPermissionActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- Phone-side app search + voice launcher (dock Search/Mic tiles). Runs
+             on the phone for a reliable keyboard/mic; launches the chosen app on
+             the external display. -->
+        <activity
+            android:name=".SearchActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:windowSoftInputMode="adjustResize|stateAlwaysVisible"
+            android:theme="@style/Theme.PortalPad.FastLaunch" />
+
+        <!-- Logcat viewer: in-app diagnostic screen that streams filtered
+             logs via Shizuku UserService (or Root). Phone-side only. -->
+        <activity
+            android:name=".diag.LogcatActivity"
+            android:exported="false"
+            android:label="Logcat"
+            android:theme="@style/Theme.PortalPad" />
+
+        <!-- FileProvider for sharing saved log files via the system share
+             sheet. Logs live in app-private external files (/Android/data/
+             com.portalpad.app/files/logs) so they auto-clear on uninstall. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_provider_paths" />
+        </provider>
+
+        <!-- Foreground service that owns the external-display pipeline.
+             Uses specialUse — we don't capture screen content; we host a
+             trusted virtual display and inject input to it. -->
+        <service
+            android:name=".service.PortalPadForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="External display input forwarding and dock presentation via Shizuku" />
+        </service>
+
+        <!-- Empty notification-listener service. Its sole purpose is to provide a
+             ComponentName for MediaSessionManager.getActiveSessions(). The user
+             grants permission via Settings → Apps → Notification access. This is
+             what unlocks media controls without needing Shizuku or root. -->
+        <service
+            android:name=".service.PortalPadNotificationListenerService"
+            android:exported="false"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- Accessibility service — detects editable-field focus on the external
+             display and auto-opens the typing relay on the phone. The user grants
+             it via Settings → Accessibility → PortalPad. Enabling it there is the
+             on/off switch; there is no separate in-app toggle. -->
+        <service
+            android:name=".service.PortalPadAccessibilityService"
+            android:exported="false"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- Shizuku binder provider -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!-- libsu RootService — launched in a root (uid 0) process by libsu to
+             host ShellUserService for root-mode parity with Shizuku. -->
+        <service
+            android:name=".service.RootShellService"
+            android:exported="false"
+            android:process=":root_shell" />
+
+        <!-- Boot receiver — auto-starts the foreground service after device boot
+             if the user has Start-on-boot enabled. -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:directBootAware="false">
+            <intent-filter android:priority="999">
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

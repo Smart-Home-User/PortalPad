@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Screenshot icon for the trackpad top bar. Matches the "camera in
+    bracket frame" pattern from the user's reference — four corner brackets
+    surrounding a small camera glyph. Reads more clearly as "screenshot"
+    than the bare PhotoCamera icon Material provides.
+
+    Single-color (stroke + filled lens dot) so it tints cleanly with the
+    Compose Icon tint — no holes, no clip-out tricks that would break under
+    color replacement.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="?android:attr/colorControlNormal">
+
+    <!-- Top-left bracket -->
+    <path
+        android:pathData="M3,8 L3,5 A2,2 0 0 1 5,3 L8,3"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+
+    <!-- Top-right bracket -->
+    <path
+        android:pathData="M16,3 L19,3 A2,2 0 0 1 21,5 L21,8"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+
+    <!-- Bottom-left bracket -->
+    <path
+        android:pathData="M3,16 L3,19 A2,2 0 0 0 5,21 L8,21"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+
+    <!-- Bottom-right bracket -->
+    <path
+        android:pathData="M16,21 L19,21 A2,2 0 0 0 21,19 L21,16"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+
+    <!-- Camera body — stroked rounded rectangle with viewfinder bump on top.
+         Stroke only (transparent fill) so we get a clean outlined-camera look. -->
+    <path
+        android:pathData="M9,8 L10.5,8 L11.5,7 L12.5,7 L13.5,8 L15,8 A1.5,1.5 0 0 1 16.5,9.5 L16.5,14.5 A1.5,1.5 0 0 1 15,16 L9,16 A1.5,1.5 0 0 1 7.5,14.5 L7.5,9.5 A1.5,1.5 0 0 1 9,8 Z"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+
+    <!-- Lens — outer ring (stroked circle) -->
+    <path
+        android:pathData="M12,12 m -1.8,0 a 1.8,1.8 0 1,0 3.6,0 a 1.8,1.8 0 1,0 -3.6,0"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.2"
+        android:fillColor="#00000000" />
+
+    <!-- Lens — inner dot (solid) — provides the camera-iris feel -->
+    <path
+        android:pathData="M12,12 m -0.6,0 a 0.6,0.6 0 1,0 1.2,0 a 0.6,0.6 0 1,0 -1.2,0"
+        android:fillColor="#FFFFFFFF" />
+
+</vector>

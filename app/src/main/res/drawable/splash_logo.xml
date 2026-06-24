@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Splash logo: the PortalPad portal-on-pad mark, authored with named groups
+     so the AnimatedVectorDrawable (avd_splash_logo) can scale/fade the portal
+     "on" and draw the connection beam. viewport 108x108, centered. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Touch pad — rounded rectangle base. -->
+    <group android:name="pad_grp">
+        <path android:pathData="M30,60 L78,60 A7,7 0 0 1 85,67 L85,77 A7,7 0 0 1 78,84 L30,84 A7,7 0 0 1 23,77 L23,67 A7,7 0 0 1 30,60 Z">
+            <aapt:attr name="android:fillColor">
+                <gradient
+                    android:type="linear"
+                    android:startX="54" android:startY="60"
+                    android:endX="54" android:endY="84"
+                    android:startColor="#3A2D55"
+                    android:endColor="#1A1326" />
+            </aapt:attr>
+        </path>
+        <path
+            android:pathData="M30,60 L78,60 A7,7 0 0 1 85,67 L85,77 A7,7 0 0 1 78,84 L30,84 A7,7 0 0 1 23,77 L23,67 A7,7 0 0 1 30,60 Z"
+            android:strokeColor="#5B4A8F"
+            android:strokeWidth="1.2"
+            android:fillColor="#00000000" />
+        <path
+            android:pathData="M54,72 m -3,0 a 3,3 0 1,0 6,0 a 3,3 0 1,0 -6,0"
+            android:fillColor="#FFB547" />
+    </group>
+
+    <!-- Connection beam — drawn from the pad up into the portal. The path is
+         trimmed via trimPathStart so the AVD can "draw" it on. -->
+    <group android:name="beam_grp">
+        <path
+            android:name="beam"
+            android:pathData="M54,69 L54,49"
+            android:strokeColor="#FFB547"
+            android:strokeWidth="1.4"
+            android:strokeLineCap="round"
+            android:strokeAlpha="0.7"
+            android:fillColor="#00000000"
+            android:trimPathStart="0"
+            android:trimPathEnd="1" />
+    </group>
+
+    <!-- Portal — scaled + faded "on" by the AVD via this pivot group. -->
+    <group android:name="portal_grp" android:pivotX="54" android:pivotY="40">
+        <!-- Outer amber halo -->
+        <path android:pathData="M54,40 m -23,0 a 23,16 0 1,0 46,0 a 23,16 0 1,0 -46,0">
+            <aapt:attr name="android:fillColor">
+                <gradient
+                    android:type="radial"
+                    android:centerX="54" android:centerY="40"
+                    android:gradientRadius="23"
+                    android:startColor="#33FFB547"
+                    android:endColor="#00FFB547" />
+            </aapt:attr>
+        </path>
+        <!-- Portal interior — violet depth -->
+        <path android:pathData="M54,40 m -18,0 a 18,12 0 1,0 36,0 a 18,12 0 1,0 -36,0">
+            <aapt:attr name="android:fillColor">
+                <gradient
+                    android:type="radial"
+                    android:centerX="54" android:centerY="40"
+                    android:gradientRadius="18"
+                    android:startColor="#7C61D6"
+                    android:endColor="#1A1326" />
+            </aapt:attr>
+        </path>
+        <!-- Portal ring — bright amber rim -->
+        <path
+            android:pathData="M54,40 m -18,0 a 18,12 0 1,0 36,0 a 18,12 0 1,0 -36,0"
+            android:strokeColor="#FFB547"
+            android:strokeWidth="2.2"
+            android:fillColor="#00000000" />
+        <!-- Inner secondary ring -->
+        <path
+            android:pathData="M54,40 m -13,0 a 13,8.5 0 1,0 26,0 a 13,8.5 0 1,0 -26,0"
+            android:strokeColor="#FFCB7A"
+            android:strokeWidth="0.7"
+            android:strokeAlpha="0.6"
+            android:fillColor="#00000000" />
+    </group>
+</vector>

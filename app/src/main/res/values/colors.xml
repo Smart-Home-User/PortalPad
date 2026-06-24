@@ -1,0 +1,10 @@
+<resources>
+    <color name="ab_background">#0B0F12</color>
+    <color name="ab_surface">#161B20</color>
+    <color name="ab_surface_variant">#1E262C</color>
+    <color name="ab_primary">#00A8B5</color>
+    <color name="ab_primary_bright">#00E5FF</color>
+    <color name="ab_on_surface">#E4ECF1</color>
+    <color name="ab_on_surface_muted">#8FA3B0</color>
+    <color name="ab_grid_line">#1A2429</color>
+</resources>

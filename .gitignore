@@ -1,0 +1,27 @@
+# Android Studio / IntelliJ
+*.iml
+.idea/
+
+# Gradle / build outputs
+.gradle
+build/
+/captures
+.externalNativeBuild
+.cxx
+
+# OS
+.DS_Store
+
+# Local machine config (SDK path) — never commit
+local.properties
+
+# Signing secrets — NEVER commit these
+*.jks
+*.keystore
+keystore.properties
+
+# Built APK output (goes to GitHub Releases, not the repo)
+app/release/
+
+# Keep the wrapper jar so checkouts can './gradlew' immediately
+!gradle/wrapper/gradle-wrapper.jar
