@@ -107,6 +107,19 @@ class PortalPadForegroundService : Service() {
      */
     private var lastReconciledDisplayId: Int? = null
 
+    // True when the last reconcile WANTED a wrapped VD (backend ready) but VD
+    // creation failed and we fell back to raw-glasses mode. On some devices (e.g.
+    // Android 12 where the shell-uid VD create is rejected with "packageName must
+    // match the calling uid") this fails every time, so retrying is pointless. The
+    // VD watchdog uses this to avoid re-reconciling — and thus rebuilding the dock
+    // + cursor overlays — every few seconds, which otherwise breaks auto-hide.
+    private var lastAttachWasRawFallback = false
+
+    // De-dups the "skipping display" log: pickExternalDisplay() runs on every
+    // watchdog tick (~3s), so without this it logs the same built-in-display skip
+    // forever. Only log when the skipped display identity changes.
+    private var lastSkippedDisplaySig: String? = null
+
     // Tracks the VD id from the last reconcile that used a wrapped (trusted) VD.
     // Used to tell a FRESH/RECREATED VD (new id → empty → needs the wallpaper
     // backdrop re-laid) apart from a mid-session reconcile that reuses the same VD
@@ -124,6 +137,14 @@ class PortalPadForegroundService : Service() {
      * wrap again) doesn't thrash. Matches a reference debounce pattern.
      */
     @Volatile private var suppressDisplayListenerUntil: Long = 0
+
+    // Last (w,h,dpi) applyAspectToLiveVd() actually pushed to the live VD. The
+    // aspectRatio pref flow can re-emit the SAME value repeatedly (any DataStore
+    // write re-fires it), and each re-apply was needlessly restarting the VD AND
+    // opening a 1500ms suppression window — the window that could swallow a
+    // concurrent physical unplug. Skipping no-op re-applies closes that gap.
+    // Cleared on teardown so the next attach always re-applies.
+    @Volatile private var lastAppliedVdSpec: Triple<Int, Int, Int>? = null
 
     private fun suppressDisplayListener(reason: String, durationMs: Long = 1500) {
         suppressDisplayListenerUntil = System.currentTimeMillis() + durationMs
@@ -320,9 +341,24 @@ class PortalPadForegroundService : Service() {
             // fresh user attach. Captured before the refresh so it reflects the gap.
             val flapMs = if (lastDisplayRemovedAt > 0L)
                 System.currentTimeMillis() - lastDisplayRemovedAt else Long.MAX_VALUE
+            // A flap (quick re-add after a removal) means recoverStrandedSessionOnFlap
+            // below will bring the prior windows back — so suppress the Auto-Launch
+            // wallpaper/app on this attach to avoid stacking a spurious extra window
+            // over the recovered session. Trackpad re-activation still fires.
+            val isFlap = flapMs < 30_000L
             maybeShowTransitionSpinner("displayAdded", holdUntilReady = true)
-            refreshExternalDisplay(autoLaunchOnFirstAttach = true, trigger = "displayAdded($displayId)")
-            if (flapMs < 30_000L) {
+            refreshExternalDisplay(
+                autoLaunchOnFirstAttach = true,
+                trigger = "displayAdded($displayId)",
+                suppressAutoStartContent = isFlap,
+            )
+            // External display connected — let the external mouse auto-resume if
+            // opted in. Delayed so the display finishes setting up (injector
+            // displayId assigned) before discovery runs.
+            runCatching {
+                (applicationContext as? PortalPadApp)?.btMouse?.maybeAutoArm(delayMs = 1500L)
+            }
+            if (isFlap) {
                 Log.d("PortalPadSleep", "FLAP-RECREATE (gone ${flapMs}ms) -> recover stranded session")
                 recoverStrandedSessionOnFlap(displayId)
             }
@@ -350,6 +386,9 @@ class PortalPadForegroundService : Service() {
             scheduleDebouncedChangedRefresh()
         }
         override fun onDisplayRemoved(displayId: Int) {
+            val physId = (applicationContext as? PortalPadApp)?.physicalExternalDisplayId?.value
+            val isPhysicalUnplug = physId != null && displayId == physId
+            val suppressed = isDisplayListenerSuppressed()
             runCatching {
                 val a = applicationContext as? PortalPadApp
                 val extId = a?.externalDisplayId?.value
@@ -360,11 +399,22 @@ class PortalPadForegroundService : Service() {
                         "backendReady=${a?.activeBoundBackend?.isReady == true})",
                 )
             }
-            if (isDisplayListenerSuppressed()) {
+            // The suppression window exists to swallow the VD's OWN add/remove
+            // churn when we restart it (AirGlassesSession start/stop, aspect-live).
+            // It must NEVER swallow the physical panel actually being unplugged:
+            // that skips the disconnect bookkeeping below (gone-timestamp + ext-id
+            // clear), which kills BOTH the disconnect banner and the flap recovery
+            // on the next replug. So a real physical unplug bypasses suppression;
+            // only non-physical (VD) removals honor it.
+            if (suppressed && !isPhysicalUnplug) {
                 Log.d(TAG, "Display removed (suppressed): $displayId")
                 return
             }
-            Log.d(TAG, "Display removed: $displayId")
+            Log.d(
+                TAG,
+                "Display removed: $displayId" +
+                    if (suppressed && isPhysicalUnplug) " (physical unplug, bypassed suppression)" else "",
+            )
             maybeShowTransitionSpinner("displayRemoved", holdUntilReady = false)
             // Reset IME policy before tearing down so a dangling policy on the
             // departing display can't strand the phone keyboard.
@@ -398,6 +448,17 @@ class PortalPadForegroundService : Service() {
             // The display we'd reconciled is gone — clear the cache so a
             // future re-attach doesn't get short-circuited as "same as last".
             lastReconciledDisplayId = null
+            // The VD is torn down; force the next attach's aspect apply to run.
+            lastAppliedVdSpec = null
+            // The external display is gone, so freeform/force-resizable have no
+            // reason to stay on. Revert now (force_resizable_activities OFF — leaving
+            // it on system-wide crashes SystemUI's split-screen coordinator on later
+            // app launches). Re-enabled on reconnect. Off the main thread (shells out).
+            scope.launch {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching { tdApp.freeform.disableFreeform() }
+                }
+            }
         }
     }
 
@@ -607,10 +668,21 @@ class PortalPadForegroundService : Service() {
                 kotlinx.coroutines.delay(3000)
                 runCatching {
                     val a = applicationContext as? PortalPadApp ?: return@runCatching
+                    val ext = pickExternalDisplay()
+                    // Skip when we're already in a STABLE raw-glasses fallback for the
+                    // present display: VD creation was attempted and failed (it'll keep
+                    // failing on this device), but the overlays are attached and working.
+                    // Re-reconciling here would rebuild the dock + cursor every 3s and
+                    // break auto-hide. The genuine "display present but never attached"
+                    // case still self-heals: there, we haven't reconciled to this id (or
+                    // the last attach used a VD that died), so the guard doesn't apply.
+                    val stableRawFallback = lastAttachWasRawFallback &&
+                        ext != null && lastReconciledDisplayId == ext.displayId
                     if (!isDisplayListenerSuppressed() &&
                         a.activeBoundBackend?.isReady == true &&
-                        pickExternalDisplay() != null &&
-                        !virtualDisplaySession.isActive
+                        ext != null &&
+                        !virtualDisplaySession.isActive &&
+                        !stableRawFallback
                     ) {
                         Log.d(TAG, "VD watchdog: display present + backend ready but no session → forcing reconcile")
                         refreshExternalDisplay(force = true, trigger = "vdWatchdog")
@@ -688,6 +760,8 @@ class PortalPadForegroundService : Service() {
                     }
                     var lastMoveMs = android.os.SystemClock.elapsedRealtime()
                     var hiddenByUs = false
+                    val dm = applicationContext
+                        .getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager
                     // Watch cursor movement on a child job: any change = activity.
                     val moveWatcher = launch {
                         app.injector.cursorPosition
@@ -711,13 +785,18 @@ class PortalPadForegroundService : Service() {
                             // fullscreen, not playing in a small freeform window the
                             // user is working alongside. When desktop mode is OFF apps
                             // always run fullscreen, so any playback qualifies. When ON,
-                            // require a maximized window to exist (you've maximized what
-                            // you're watching). Heuristic: doesn't correlate the exact
-                            // playing package to the maximized task, but that mismatch
-                            // (maximize A, play in freeform B) is rare. Reads the already
-                            // -polled WindowMonitor snapshot — no extra binder calls.
+                            // it's fullscreen IF either PortalPad maximized a window OR a
+                            // visible window fills the external display — the latter
+                            // catches Android's caption-bar maximize and app-driven
+                            // fullscreen (e.g. YouTube), neither of which sets PortalPad's
+                            // own maximize flag. Reads the already-polled WindowMonitor
+                            // snapshot; the only extra work is one local display-metrics
+                            // read, and only while playback is the gating concern.
                             val snap = app.windowMonitor.snapshot.value
-                            val fullscreenContext = !snap.desktop || snap.maximizedId != null
+                            val fillsExternal = snap.maximizedId == null &&
+                                hasWindowFillingExternal(dm, snap)
+                            val fullscreenContext =
+                                !snap.desktop || snap.maximizedId != null || fillsExternal
                             val idleMs = android.os.SystemClock.elapsedRealtime() - lastMoveMs
                             if (playing && fullscreenContext && !hiddenByUs && idleMs >= secs * 1000L) {
                                 app.injector.setCursorVisible(false)
@@ -757,8 +836,17 @@ class PortalPadForegroundService : Service() {
                     // with a second pass for any window that survives the first close.
                     runCatching {
                         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                            if (enabled) app.freeform.enableFreeform()
-                            else app.freeform.disableFreeform()
+                            if (enabled) {
+                                app.freeform.enableFreeform()
+                            } else {
+                                app.freeform.disableFreeform()
+                                // Disabling is a deliberate teardown — forget the saved
+                                // layout so re-enabling starts fresh instead of
+                                // resurfacing stale windows. (A flap never toggles this
+                                // pref, so reconnect recovery is unaffected.)
+                                runCatching { app.prefs.setLastSession(com.portalpad.app.data.SavedSession()) }
+                                runCatching { app.prefs.setSessionsByWidth(com.portalpad.app.data.SavedSessions()) }
+                            }
                             closeAllExternalWindows()
                         }
                     }
@@ -815,9 +903,58 @@ class PortalPadForegroundService : Service() {
         }
         lastRecoveryAt = now
         val app = applicationContext as PortalPadApp
+        // Flap auto-recovery now owns the restore — silence the phone "Restore
+        // last session?" popup for the duration (4s settle + relaunch + retile,
+        // with headroom) so it doesn't ask a question we've already answered.
+        app.flapRecoveryUntilMs = System.currentTimeMillis() + 25_000L
         scope.launch {
-            // Let the recreated display + rebound backend + dock settle first.
-            kotlinx.coroutines.delay(1500)
+            // Show the black "Restoring your windows…" cover on the GLASSES for
+            // the duration of recovery — but ONLY if there's actually a saved
+            // layout to bring back. With nothing to restore (clean state) there's
+            // no fullscreen shuffle to mask, so popping the cover would just flash
+            // a message that restores nothing. Resolving vdDisp to null in that
+            // case makes every cover call below (show AND done) a no-op.
+            // Overlays live on the VD (injector display), not the physical id.
+            val hasSavedLayout = runCatching {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    app.prefs.lastSession.first().windows.isNotEmpty()
+                }
+            }.getOrDefault(false)
+            val vdDisp = if (!hasSavedLayout) null else runCatching {
+                val dm = getSystemService(android.hardware.display.DisplayManager::class.java)
+                dm?.getDisplay(app.injector.displayId)
+            }.getOrNull()
+            vdDisp?.let {
+                com.portalpad.app.presentation.RestoreCover.showRestoring(applicationContext, it)
+            }
+            // This device re-homes the surviving apps onto the new display, and on
+            // Samsung the windowing mode they land in depends on whether freeform
+            // support is enabled AT THAT MOMENT. disableFreeform() ran on the
+            // disconnect (force_resizable_activities -> 0), and the reconnect's
+            // enableFreeform() is async + gated on desktop mode, so it can fail to
+            // land before the platform re-homes the survivors (~3-4s) — they then
+            // come back FULLSCREEN, and this device ignores live windowing-mode
+            // changes, so a fullscreen survivor can't be tiled afterward. Force
+            // freeform ON up front, awaited + unconditional, so survivors re-home
+            // freeform-capable and the retile's resize can actually tile them.
+            val ffOk = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching { app.freeform.enableFreeform() }.getOrDefault(false)
+            }
+            val ffState = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching {
+                    val ef = app.access.execShell("settings get global enable_freeform_support").trim()
+                    val fr = app.access.execShell("settings get global force_resizable_activities").trim()
+                    "enable_freeform=$ef force_resizable=$fr"
+                }.getOrDefault("unread")
+            }
+            Log.d("PortalPadSleep", "RECOVERY enableFreeform up-front ok=$ffOk $ffState display=$newDisplayId")
+            // Let the recreated display + rebound backend + dock settle first AND
+            // give the platform time to re-home surviving apps onto the new display
+            // on its own (a physical replug does this over ~3-4s). Checking earlier
+            // saw present=0 and wrongly relaunched, duplicating apps the system was
+            // about to bring back. Wait past that window so move-first's presence
+            // check is accurate.
+            kotlinx.coroutines.delay(4000)
             // 1) move-first: re-home each app we launched onto the glasses this
             //    session. After a screen-off flap the system evicts them to the
             //    phone, where they are NOT the focused task (the launcher/
@@ -830,44 +967,97 @@ class PortalPadForegroundService : Service() {
                 val comps = synchronized(app.externalAppComponents) {
                     app.externalAppComponents.toList()
                 }
+                // Apps that survived the flap are STILL on the external display — do
+                // NOT relaunch them. `am start` spawns a SECOND window for apps like
+                // Chrome, which is the phantom "extra window behind" the arranged
+                // ones. Only relaunch+move apps genuinely missing from the display
+                // (e.g. evicted to the phone by a screen-off). retileToSaved then
+                // arranges whatever survived.
+                val livePkgs = runCatching { app.freeform.listExternalTasks() }
+                    .getOrDefault(emptyList()).map { it.packageName }.toMutableSet()
                 var any = false
+                var present = 0
                 for (comp in comps) {
+                    val pkg = comp.substringBefore('/')
+                    if (pkg in livePkgs) { present++; continue } // already home → skip relaunch
                     runCatching { app.access.startActivityOnDisplay(comp, newDisplayId) }
                     kotlinx.coroutines.delay(500)
                     if (runCatching {
                             app.activeBoundBackend?.moveFocusedTaskToDisplay(newDisplayId) == true
                         }.getOrDefault(false)
-                    ) any = true
+                    ) { any = true; livePkgs += pkg }
                 }
-                // Nothing recorded (or none moved) → old behavior: move whatever
-                // is focused. Harmless if there's nothing to move.
-                if (!any) {
+                // Nothing was missing AND nothing already present → old behavior:
+                // move whatever is focused. Harmless if there's nothing to move.
+                if (!any && present == 0) {
                     any = runCatching {
                         app.activeBoundBackend?.moveFocusedTaskToDisplay(newDisplayId) == true
                     }.getOrDefault(false)
                 }
                 Log.d(
                     "PortalPadSleep",
-                    "RECOVERY move-first comps=${comps.size} moved=$any display=$newDisplayId",
+                    "RECOVERY move-first comps=${comps.size} moved=$any present=$present display=$newDisplayId",
                 )
-                any
+                // Recovered if we moved something OR apps were already home — either
+                // way retile (not the relaunch-fallback, which would re-duplicate).
+                any || present > 0
             }
-            if (moved) return@launch
+            if (moved) {
+                // Fix 2: move-first kept the live tasks alive but not their layout
+                // (they return default/minimized). Re-apply the saved arrangement
+                // IN PLACE — no relaunch, so playback survives. Skipped silently if
+                // there's no saved layout to apply.
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    val dm = getSystemService(android.hardware.display.DisplayManager::class.java)
+                    val disp = dm?.getDisplay(newDisplayId)
+                    val m = android.util.DisplayMetrics()
+                        .also { @Suppress("DEPRECATION") disp?.getRealMetrics(it) }
+                    val w2 = m.widthPixels.let { if (it <= 1) 1920 else it }
+                    val h2 = m.heightPixels.let { if (it <= 1) 1080 else it }
+                    // Per-resolution memory: restore THIS width's remembered layout
+                    // exactly (scale 1f); a width never seen is seeded by scaling the
+                    // most-recent layout to fit.
+                    val (session, sxM, syM) = app.prefs.sessionForCanvas(w2, h2)
+                    if (session.windows.isNotEmpty()) {
+                        // Let the re-homed tasks settle on the new display first.
+                        kotlinx.coroutines.delay(600)
+                        val n = runCatching { app.freeform.retileToSaved(session, newDisplayId, w2, h2, scaleX = sxM, scaleY = syM) }
+                            .getOrDefault(0)
+                        Log.d("PortalPadSleep", "RECOVERY re-tile applied=$n display=$newDisplayId scale=${sxM}x$syM")
+                    }
+                }
+                vdDisp?.let {
+                    com.portalpad.app.presentation.RestoreCover.showDone(applicationContext, it)
+                }
+                return@launch
+            }
             // 2) relaunch-fallback: same path the "Restore last session" button uses.
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                val session = runCatching { app.prefs.lastSession.first() }.getOrNull()
-                if (session == null || session.windows.isEmpty()) {
-                    Log.d("PortalPadSleep", "RECOVERY relaunch skipped (no saved session)")
-                    return@withContext
-                }
                 val dm = getSystemService(android.hardware.display.DisplayManager::class.java)
                 val disp = dm?.getDisplay(newDisplayId)
                 val m = android.util.DisplayMetrics()
                     .also { @Suppress("DEPRECATION") disp?.getRealMetrics(it) }
                 val w = m.widthPixels.let { if (it <= 1) 1920 else it }
                 val h = m.heightPixels.let { if (it <= 1) 1080 else it }
+                // Per-resolution memory: this width's remembered layout (exact), or
+                // the most-recent layout scaled to fit if this width is new.
+                val (session, sxF, syF) = app.prefs.sessionForCanvas(w, h)
+                if (session.windows.isEmpty()) {
+                    Log.d("PortalPadSleep", "RECOVERY relaunch skipped (no saved session)")
+                    return@withContext
+                }
                 runCatching { app.freeform.restoreSession(session, newDisplayId, w, h) }
                 Log.d("PortalPadSleep", "RECOVERY relaunch via restoreSession display=$newDisplayId")
+                // restoreSession only relaunches apps that were genuinely missing
+                // (it skips survivors). Now tile EVERYTHING — survivors + relaunches
+                // — to the saved layout. Brief settle so the relaunches register.
+                kotlinx.coroutines.delay(800)
+                val n = runCatching { app.freeform.retileToSaved(session, newDisplayId, w, h, relaunchFullscreen = true, scaleX = sxF, scaleY = syF) }
+                    .getOrDefault(0)
+                Log.d("PortalPadSleep", "RECOVERY fallback re-tile applied=$n display=$newDisplayId scale=${sxF}x$syF")
+            }
+            vdDisp?.let {
+                com.portalpad.app.presentation.RestoreCover.showDone(applicationContext, it)
             }
         }
     }
@@ -915,15 +1105,41 @@ class PortalPadForegroundService : Service() {
         val app = applicationContext as PortalPadApp
         scope.launch {
             val displayId = app.externalDisplayId.value ?: return@launch
+            // Gate: only proceed if there's any saved layout at all.
+            val hasAnything = runCatching { app.prefs.lastSession.first() }.getOrNull()
+                ?.windows?.isNotEmpty() == true
+            if (!hasAnything) return@launch
+            // Same cover the flap recovery uses — so a popup-triggered restore
+            // also hides the brief fullscreen shuffle on the glasses. Renders on
+            // the VD (injector display), not the physical display id.
+            val vdDisp = runCatching {
+                val dm = getSystemService(android.hardware.display.DisplayManager::class.java)
+                dm?.getDisplay(app.injector.displayId)
+            }.getOrNull()
+            vdDisp?.let {
+                com.portalpad.app.presentation.RestoreCover.showRestoring(applicationContext, it)
+            }
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                val session = runCatching { app.prefs.lastSession.first() }.getOrNull() ?: return@withContext
-                if (session.windows.isEmpty()) return@withContext
                 val dm = getSystemService(android.hardware.display.DisplayManager::class.java)
                 val disp = dm?.getDisplay(displayId)
                 val m = android.util.DisplayMetrics().also { @Suppress("DEPRECATION") disp?.getRealMetrics(it) }
                 val w = m.widthPixels.let { if (it <= 1) 1920 else it }
                 val h = m.heightPixels.let { if (it <= 1) 1080 else it }
-                runCatching { app.freeform.restoreSession(session, displayId, w, h) }
+                // Per-resolution memory: this width's remembered layout (exact), or
+                // the most-recent layout scaled to fit if this width is new.
+                val (session, sxR, syR) = app.prefs.sessionForCanvas(w, h)
+                if (session.windows.isNotEmpty()) {
+                    runCatching { app.freeform.restoreSession(session, displayId, w, h) }
+                    // restoreSession only relaunches genuinely-missing apps; tile
+                    // everything (survivors + relaunches) to the saved layout, closing
+                    // and relaunching any that came back fullscreen.
+                    kotlinx.coroutines.delay(800)
+                    runCatching { app.freeform.retileToSaved(session, displayId, w, h, relaunchFullscreen = true, scaleX = sxR, scaleY = syR) }
+                    Log.d(TAG, "restore: re-tiled display=$displayId scale=${sxR}x$syR")
+                }
+            }
+            vdDisp?.let {
+                com.portalpad.app.presentation.RestoreCover.showDone(applicationContext, it)
             }
         }
     }
@@ -934,6 +1150,12 @@ class PortalPadForegroundService : Service() {
         runCatching { sessionWakeLock?.let { if (it.isHeld) it.release() } }
         sessionWakeLock = null
         runCatching { unregisterReceiver(screenStateReceiver) }
+        // Revert freeform/force-resizable on teardown so a stopped/killed session
+        // doesn't leave force_resizable_activities on system-wide (the SystemUI
+        // crash / random black-screen). Synchronous + best-effort: scope is about to
+        // be cancelled, and this no-ops if the privileged backend is already gone
+        // (onDisplayRemoved is the primary, earlier hook).
+        runCatching { (applicationContext as PortalPadApp).freeform.disableFreeform() }
         // Cover the phone with a black "PortalPad" transition BEFORE we tear down
         // the VD below — tearing down the VD migrates the glasses app (e.g.
         // Chrome) to the phone and flashes it for a moment before our MainActivity
@@ -1142,9 +1364,81 @@ class PortalPadForegroundService : Service() {
                 val nativeH = m.heightPixels.coerceAtLeast(1)
                 val (w, h) = aspectToVdSize(aspect, nativeW, nativeH)
                 val dpi = effectiveExternalDpi(app.prefs.displayDpi.first())
+                val spec = Triple(w, h, dpi)
+                if (spec == lastAppliedVdSpec) {
+                    // Same size+dpi already live. The aspectRatio flow re-emits on
+                    // any DataStore write, so without this guard we'd restart the
+                    // VD (flicker) and open a suppression window on every emit —
+                    // the window that could swallow a concurrent physical unplug.
+                    return@runCatching
+                }
+                val prev = lastAppliedVdSpec
+                lastAppliedVdSpec = spec
+                // Decide up front whether we'll rescale, and if so snapshot each
+                // window's bounds BEFORE the resize — reading them after a shrink is
+                // unsafe (the platform may clamp windows that no longer fit, and we'd
+                // then scale the clamped wreck). Only when the canvas SIZE changes —
+                // width or height; a pure DPI change keeps the same pixel canvas so
+                // windows are left alone. (Wide SBS panel: aspect changes width; 1920
+                // panel: ultrawide shortens height — both must fire.)
+                val sizeChanged = prev != null && (prev.first != w || prev.second != h)
+                val desktopOn = if (sizeChanged) runCatching {
+                    app.prefs.bool(PreferencesRepository.Keys.DESKTOP_MODE_ENABLED, false).first()
+                }.getOrDefault(false) else false
+                val capturedBefore: Map<Int, com.portalpad.app.data.WindowBounds> =
+                    if (sizeChanged && desktopOn) runCatching {
+                        app.freeform.listTasks(app.injector.displayId)
+                            .filter {
+                                !it.packageName.contains("launcher", ignoreCase = true) &&
+                                    it.packageName != app.packageName
+                            }
+                            .mapNotNull { t -> t.bounds?.let { t.taskId to it } }
+                            .toMap()
+                    }.getOrDefault(emptyMap()) else emptyMap()
+                // Snapshot the OLD layout (apps + bounds + old width) so it's saved
+                // under the old resolution's slot before we switch away from it.
+                val oldSnap = if (capturedBefore.isNotEmpty()) runCatching {
+                    app.freeform.snapshotSession(app.injector.displayId)
+                }.getOrNull() else null
                 suppressDisplayListener("aspect-live")
                 virtualDisplaySession.start(physId, w, h, dpi)
                 Log.d(TAG, "Applied aspect $aspect → ${w}x$h dpi=$dpi to live VD (phys=$physId)")
+                // Proportionally rescale the captured windows to the new canvas so a
+                // custom layout is preserved rather than flattened into even columns
+                // (manual "arrange evenly" stays the deliberate way to even them).
+                if (capturedBefore.isNotEmpty()) {
+                    // Remember the old resolution's layout under its own width slot
+                    // (so switching back later restores it exactly).
+                    oldSnap?.let {
+                        if (it.canvasWidth > 0 && it.windows.isNotEmpty()) {
+                            app.prefs.putSessionForWidth(it.canvasWidth, it)
+                        }
+                    }
+                    // Let the resize propagate before re-applying bounds.
+                    Thread.sleep(250)
+                    // Baseline: proportionally rescale the captured windows to the new
+                    // canvas, so even windows with no remembered spot at this width
+                    // land somewhere sane (never off-screen). Synchronous.
+                    com.portalpad.app.presentation.WindowArranger.scaleWindowsFromBounds(
+                        capturedBefore,
+                        oldW = prev!!.first,
+                        oldH = prev.second,
+                        newW = w,
+                        newH = h,
+                    )
+                    Log.d(TAG, "aspect change → rescaled ${capturedBefore.size} windows ${prev.first}x${prev.second} → ${w}x$h")
+                    // Overlay: if THIS width has a remembered layout, snap matched
+                    // windows to their exact remembered bounds (in place — no relaunch,
+                    // so live state is preserved). Windows not in it keep the scaled
+                    // baseline above.
+                    val slot = runCatching { app.prefs.sessionsByWidth.first().byWidth[w] }.getOrNull()
+                    if (slot != null && slot.windows.isNotEmpty()) {
+                        runCatching {
+                            app.freeform.retileToSaved(slot, app.injector.displayId, w, h, relaunchFullscreen = false)
+                        }
+                        Log.d(TAG, "aspect change → applied remembered layout for width $w (${slot.windows.size} windows)")
+                    }
+                }
             }.onFailure { Log.w(TAG, "live aspect apply failed", it) }
         }
     }
@@ -1343,10 +1637,73 @@ class PortalPadForegroundService : Service() {
         return true
     }
 
+    /**
+     * Public reconcile entry for bubble-launched interfaces. The floating bubble
+     * (drawn by the foreground service) can outlive the trackpad activity — e.g.
+     * the user swipes PortalPad from recents but the service survives. That can
+     * leave the external-display session half-wired, so an interface launched
+     * straight from the bubble flashes onto the glasses and dies. Calling this
+     * first rebuilds the session on the live display (a forced reconcile, the
+     * same work opening the app does) so the interface has something to attach to.
+     */
+    fun reconcileExternalForBubbleLaunch() {
+        // Only rebuild if the session is actually torn — a forced reconcile when
+        // it's healthy would needlessly flash the glasses. The real cause of the
+        // "lands in a hidden task" bug was a manifest task-affinity collision
+        // (fixed separately); this just covers the case where the service also
+        // lost its VD session.
+        val torn = !virtualDisplaySession.isActive
+        Log.d(TAG, "reconcileExternalForBubbleLaunch: vdActive=${virtualDisplaySession.isActive} torn=$torn")
+        if (torn) refreshExternalDisplay(force = true, trigger = "bubble-launch")
+    }
+
+    /**
+     * True if a visible window fills (most of) the external display — the signal
+     * for "fullscreen media" used by the media cursor auto-hide when PortalPad's
+     * own maximize flag isn't set. That flag only tracks PortalPad's maximize
+     * action, so it misses Android's caption-bar maximize and app-driven
+     * fullscreen (e.g. tapping fullscreen in YouTube), which is what users
+     * actually do. Here we instead compare each task's parsed bounds against the
+     * external/VD display's real size: a window counts as filling when it covers
+     * >=90% width and >=85% height (the height slack tolerates a system caption
+     * strip). Returns false if the display size can't be read, so the cursor is
+     * never hidden on a guess. Only meaningful in desktop mode (in extend mode
+     * apps are always fullscreen and the caller short-circuits before calling).
+     */
+    private fun hasWindowFillingExternal(
+        dm: DisplayManager,
+        snap: WindowMonitor.Snapshot,
+    ): Boolean {
+        if (!snap.desktop) return false
+        val a = applicationContext as? PortalPadApp ?: return false
+        val dispId = a.externalDisplayId.value ?: return false
+        if (dispId < 0) return false
+        val display = runCatching { dm.getDisplay(dispId) }.getOrNull() ?: return false
+        val m = android.util.DisplayMetrics()
+        runCatching { display.getRealMetrics(m) }
+        val dw = m.widthPixels
+        val dh = m.heightPixels
+        if (dw <= 0 || dh <= 0) return false
+        val minW = (dw * 0.90f).toInt()
+        val minH = (dh * 0.85f).toInt()
+        return snap.tasks.any { t ->
+            val b = t.bounds
+            t.visible && b != null &&
+                (t.displayId == dispId || t.displayId < 0) &&
+                b.width >= minW && b.height >= minH
+        }
+    }
+
     private fun refreshExternalDisplay(
         autoLaunchOnFirstAttach: Boolean = false,
         force: Boolean = false,
         trigger: String = "?",
+        // When true, skip the Auto-Launch CONTENT (wallpaper/app) on this attach,
+        // but still do the rest of first-attach setup (trackpad re-activation, etc).
+        // Set on a flap-recovery replug: recoverStrandedSessionOnFlap is bringing
+        // the user's windows back, so firing the wallpaper/app on top would stack a
+        // spurious extra window over the recovered session.
+        suppressAutoStartContent: Boolean = false,
     ) {
         val app = applicationContext as PortalPadApp
         val external = pickExternalDisplay()
@@ -1374,6 +1731,7 @@ class PortalPadForegroundService : Service() {
                 dismissVdMirror()
             }
             lastReconciledDisplayId = null
+            lastAppliedVdSpec = null
             return
         }
 
@@ -1481,6 +1839,9 @@ class PortalPadForegroundService : Service() {
         // Expose VD id so Settings (and other observers) can target it for
         // `am start --display`. Null when not using the VD wrap.
         app.setVirtualDisplayId(if (usingVd) effectiveDisplayId else null)
+        // Wanted a VD (backend ready) but ended up raw → VD creation failed; mark
+        // it so the watchdog doesn't retry forever on devices that can't create one.
+        lastAttachWasRawFallback = wrapInVd && !usingVd
         // A wrapped VD whose id differs from the last one is brand-new and empty
         // (fresh attach, Shizuku stop→restart, or a screen-off flap-recreate) → its
         // backdrop must be (re)laid. A reused id is a mid-session reconcile (DOCK/
@@ -1624,7 +1985,8 @@ class PortalPadForegroundService : Service() {
                         // and (with Auto Launch = Wallpaper) slammed the wallpaper
                         // over the app the user had just opened. Matches the
                         // non-VD path's `autoLaunchOnFirstAttach && wasNullBefore`.
-                        if ((autoLaunchOnFirstAttach && wasNullBefore) || vdJustCreated) {
+                        if (!suppressAutoStartContent &&
+                            ((autoLaunchOnFirstAttach && wasNullBefore) || vdJustCreated)) {
                             mainHandler.postDelayed({
                                 launchAutoStart()
                             }, 200L)
@@ -1674,7 +2036,9 @@ class PortalPadForegroundService : Service() {
             // Non-VD path: the glasses-visual auto-launch isn't driven by a VD
             // surface-ready callback, so fire it here (once per fresh attach).
             // VD path handles its own launchAutoStart() after the surface is live.
-            if (!usingVd) launchAutoStart()
+            // Skipped on a flap-recovery so the wallpaper/app doesn't stack over the
+            // session being recovered — but the trackpad re-activation below still runs.
+            if (!usingVd && !suppressAutoStartContent) launchAutoStart()
             // Only auto-launch trackpad if the user has the pref enabled.
             val autoActivate = runCatching {
                 kotlinx.coroutines.runBlocking {
@@ -1786,7 +2150,11 @@ class PortalPadForegroundService : Service() {
         if (d.displayId == ourVdId) return false
         val ok = com.portalpad.app.DisplayUtil.isRealExternalDisplay(d)
         if (!ok) {
-            Log.d(TAG, "skipping display ${d.displayId} '${d.name}' (not a real external display)")
+            val sig = "${d.displayId}:${d.name}"
+            if (sig != lastSkippedDisplaySig) {
+                lastSkippedDisplaySig = sig
+                Log.d(TAG, "skipping display ${d.displayId} '${d.name}' (not a real external display)")
+            }
         }
         return ok
     }
@@ -1843,12 +2211,74 @@ class PortalPadForegroundService : Service() {
                 captureSessionNow(app)
             }
         }
-        // 2. Slow safety-net poll.
+        // 2. React to ANY window-state change — including native mouse-drag moves
+        //    and resizes, which DON'T fire windowsChanged (only PortalPad's own
+        //    window ops do). The shared WindowMonitor already polls bounds every 2s
+        //    and dedups, so this emits only on a real change; the debounce waits for
+        //    the drag to settle. This keeps each resolution's saved slot current, so
+        //    a custom layout is remembered when you switch/unplug — not lost until
+        //    the slow safety poll below.
+        scope.launch {
+            app.windowMonitor.snapshot
+                .map { snap -> snap.tasks.map { t -> Triple(t.taskId, t.bounds, t.visible) } }
+                .distinctUntilChanged()
+                .collectLatest {
+                    kotlinx.coroutines.delay(1_500)
+                    captureSessionNow(app)
+                }
+        }
+        // 3. Slow safety-net poll (backstop for anything the above misses).
         scope.launch {
             while (true) {
                 kotlinx.coroutines.delay(30_000)
                 captureSessionNow(app)
             }
+        }
+        // 4. Same-app window cap. Multiple windows of one app (e.g. a 3rd Chrome
+        //    window) can be destroyed by the display re-enumeration a resolution
+        //    switch triggers, with no way to relaunch a specific lost window — so we
+        //    hold the line at MAX_SAME_APP_WINDOWS. The WindowMonitor poll is the
+        //    only point that sees EVERY window however it opened (dock, drawer, or a
+        //    link opening a new window from inside the app), so the cap lives here.
+        //    Reactive by nature: the extra window opens, then is closed within ~2s
+        //    with a glasses toast. NOT enforced during recovery — restore brings
+        //    several same-app windows back at once and we must not race it.
+        scope.launch {
+            app.windowMonitor.snapshot
+                .map { snap -> snap.tasks.map { it.taskId to it.packageName } }
+                .distinctUntilChanged()
+                .collectLatest { tasks ->
+                    if (app.isFlapRecovering()) return@collectLatest
+                    val overflow = tasks
+                        .groupBy { it.second }
+                        .filterValues { it.size > MAX_SAME_APP_WINDOWS }
+                    if (overflow.isEmpty()) return@collectLatest
+                    kotlinx.coroutines.delay(500) // let the just-opened task settle before closing
+                    if (app.isFlapRecovering()) return@collectLatest
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        var closedAny = false
+                        for ((pkg, group) in overflow) {
+                            // Keep the oldest MAX_SAME_APP_WINDOWS (lowest taskIds);
+                            // close the newer extras — i.e. undo the over-limit open.
+                            val extras = group.sortedBy { it.first }.drop(MAX_SAME_APP_WINDOWS)
+                            for ((taskId, _) in extras) {
+                                runCatching { app.freeform.close(taskId) }
+                                closedAny = true
+                                Log.d(TAG, "same-app cap: closed extra window task=$taskId pkg=$pkg (cap=$MAX_SAME_APP_WINDOWS)")
+                            }
+                        }
+                        if (closedAny) {
+                            val dm = getSystemService(android.hardware.display.DisplayManager::class.java)
+                            dm?.getDisplay(app.injector.displayId)?.let { disp ->
+                                com.portalpad.app.presentation.GlassesToast.show(
+                                    applicationContext, disp,
+                                    "You can only have $MAX_SAME_APP_WINDOWS windows of the same app open.",
+                                    title = "Window limit",
+                                )
+                            }
+                        }
+                    }
+                }
         }
     }
 
@@ -1879,6 +2309,9 @@ class PortalPadForegroundService : Service() {
                 // it's a launch transient / all-maximized state; keep the old session.
                 if (snap.windows.any { isPositioned(it) }) {
                     app.prefs.setLastSession(snap)
+                    // Per-resolution memory: remember this layout under its canvas
+                    // width so each display size keeps its own arrangement.
+                    if (snap.canvasWidth > 0) app.prefs.putSessionForWidth(snap.canvasWidth, snap)
                 }
             }
         }
@@ -2123,6 +2556,12 @@ class PortalPadForegroundService : Service() {
 
     companion object {
         private const val TAG = "PortalPadFgService"
+
+        // Hard cap on windows of the SAME app. 2 is the observed-safe limit across a
+        // resolution flap (3+ same-app windows lost one in testing); a specific lost
+        // multi-window-app window can't be relaunched by component, so we prevent the
+        // unsafe state rather than try to recover from it.
+        private const val MAX_SAME_APP_WINDOWS = 2
         private const val NOTIF_ID = 4011
 
         // How long to wait for the onDisplayChanged storm to settle before
@@ -2304,6 +2743,16 @@ class PortalPadForegroundService : Service() {
                     }
                 }
             }
+        }
+
+        /**
+         * Run a window action (by id) from the trackpad radial menu, forwarding to
+         * the live top-bar overlay which owns the tested handlers. No-ops if the
+         * top bar isn't attached (e.g. not in desktop mode) — the radial is only
+         * reachable in desktop mode, so the overlay is normally present.
+         */
+        fun runWindowAction(id: String) {
+            instance?.topWindowBarOverlay?.runAction(id)
         }
 
         /**

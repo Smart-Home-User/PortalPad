@@ -101,6 +101,56 @@ abstract class PinnedDensityActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Opt-in: when an external display attaches while the device is keyguard-
+     * locked, prompt the user to unlock. Android won't extend the desktop onto a
+     * physical display while locked — the system keyguard claims the glasses — so
+     * without this you'd plug in and see a lock screen on both phone and display
+     * with no explanation (made worse by our show-when-locked trackpad, which can
+     * make it look like you're "in" when the phone is actually still locked).
+     * [enabled] should be the show-over-lockscreen pref; if the user opted out of
+     * lockscreen access we don't pop the unlock UI. Re-prompts on a fresh attach.
+     */
+    protected fun promptUnlockWhenDisplayAttachesLocked(enabled: Boolean) {
+        if (!enabled) return
+        val app = application as? PortalPadApp ?: return
+        val km = getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager ?: return
+        lifecycleScope.launch {
+            var prompted = false
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                app.externalDisplayId.collect { id ->
+                    when {
+                        id == null -> prompted = false // reset so a later attach re-prompts
+                        km.isKeyguardLocked && !prompted -> {
+                            prompted = true
+                            Log.i(
+                                "DIAG-KEYGUARD",
+                                "${this@PinnedDensityActivity.javaClass.simpleName}: display attached while locked — requesting unlock",
+                            )
+                            runCatching {
+                                km.requestDismissKeyguard(
+                                    this@PinnedDensityActivity,
+                                    object : android.app.KeyguardManager.KeyguardDismissCallback() {
+                                        override fun onDismissSucceeded() {
+                                            Log.i("DIAG-KEYGUARD", "unlock succeeded — desktop can show")
+                                        }
+                                        override fun onDismissCancelled() {
+                                            Log.i("DIAG-KEYGUARD", "unlock cancelled")
+                                        }
+                                        override fun onDismissError() {
+                                            Log.w("DIAG-KEYGUARD", "unlock error")
+                                        }
+                                    },
+                                )
+                            }
+                        }
+                        !km.isKeyguardLocked -> prompted = false // unlocked — allow re-prompt if it re-locks
+                    }
+                }
+            }
+        }
+    }
+
     companion object {
         /** Logical layout width the app is designed against (typical phone). */
         const val TARGET_WIDTH_DP = 411

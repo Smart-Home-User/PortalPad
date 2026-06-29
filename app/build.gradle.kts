@@ -22,8 +22,8 @@ android {
         applicationId = "com.portalpad.app"
         minSdk = 30
         targetSdk = 34
-        versionCode = 109
-        versionName = "1.0-beta"
+        versionCode = 110
+        versionName = "1.1-beta"
         vectorDrawables { useSupportLibrary = true }
         // Ship only 64-bit ARM. Every phone that can drive XREAL glasses (USB-C
         // DisplayPort Alt Mode, and DeX/desktop mode on top of that) is arm64-v8a —
@@ -70,8 +70,21 @@ android {
         buildConfig = true
         aidl = true
     }
+    // ── Native build for the external-mouse evdev capture lib ──
+    // Builds libportalpad_mouse.so from src/main/cpp via CMake. WITHOUT this block
+    // the .so is never compiled/packaged and the mouse toggle reports
+    // "native-lib-not-loaded". (No CMake version pin — uses whatever the SDK has.)
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
+    }
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        // Keep the native lib UNCOMPRESSED on disk (extracted) so the Shizuku
+        // shell / root process — which loads PortalPad's classes via app_process —
+        // can reliably dlopen it across the process boundary.
+        jniLibs { useLegacyPackaging = true }
     }
 }
 

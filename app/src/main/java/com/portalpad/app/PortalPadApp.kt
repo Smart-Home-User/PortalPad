@@ -44,6 +44,9 @@ class PortalPadApp : Application() {
         com.portalpad.app.service.InputInjector({ access }, this)
     }
 
+    /** Phase 1 physical-mouse capture controller (experimental). */
+    val btMouse by lazy { com.portalpad.app.service.BluetoothMouseController(injector) }
+
     /**
      * Active elevated-access backend for non-click operations (launching apps,
      * sending keys to external display, granting permissions). The user picks
@@ -450,6 +453,17 @@ class PortalPadApp : Application() {
     // tap it. This distinguishes "you tapped a field" (open) from "an app
     // auto-focused a field at launch" (Chrome's omnibox — no tap, so no relay).
     @Volatile var lastGlassesTapAt: Long = 0L
+
+    // Set by the foreground service when a flap auto-recovery kicks off (quick
+    // unplug/replug). While this is in the future, the phone's "Restore last
+    // session?" popup stays silent — auto-recovery is already bringing the
+    // session back on the external display, so asking would offer a choice
+    // that's already been made. A cold reconnect (no flap recovery) leaves this
+    // stale, so the popup still fires there.
+    @Volatile var flapRecoveryUntilMs: Long = 0L
+
+    /** True while a flap auto-recovery is restoring (or just restored) the session. */
+    fun isFlapRecovering(): Boolean = System.currentTimeMillis() < flapRecoveryUntilMs
 
     /** True when the foreground service is running. Used by Settings to show Enable/Disable toggle. */
     private val _serviceRunning = MutableStateFlow(false)

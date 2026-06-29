@@ -99,6 +99,7 @@
             android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:launchMode="singleTask"
+            android:taskAffinity="com.portalpad.app.wallpaper"
             android:theme="@style/Theme.PortalPad.Trackpad" />
 
         <!-- App / activity picker for home & back & dock customization -->

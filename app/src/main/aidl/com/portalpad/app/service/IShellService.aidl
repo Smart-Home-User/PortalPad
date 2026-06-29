@@ -20,6 +20,10 @@ interface IShellService {
     // Action: 0=DOWN, 1=UP, 2=MOVE, 7=HOVER_MOVE, 9=HOVER_ENTER, 10=HOVER_EXIT
     // Source: 4098=TOUCHSCREEN|CLASS_POINTER, 8194=MOUSE|CLASS_POINTER
     void injectPointer(int action, float x, float y, int displayId, int source, int buttonState, long downTime);
+    // Discrete mouse-wheel scroll (ACTION_SCROLL / AXIS_VSCROLL) at (x,y) on the
+    // given display. Unlike a swipe, this does NOT fling — content moves only
+    // while the wheel turns. vScroll +1.0 = up, hScroll +1.0 = right (one notch).
+    void injectScroll(float x, float y, float vScroll, float hScroll, int displayId);
     void injectKey(int keyCode, int action, int metaState, int displayId, int deviceId);
     /**
      * Inject a complete key PRESS (DOWN then UP) with a proper wall-clock gap
@@ -100,6 +104,9 @@ interface IShellService {
 
     // ─── Task / activity management ────────────────────────────────────
     boolean moveFocusedTaskToDisplay(int displayId);
+    // Move a SPECIFIC task (by id) to a display — used by evacuate-and-restore,
+    // which must move named windows individually (not just whatever is focused).
+    boolean moveTaskToDisplay(int taskId, int displayId);
 
     /**
      * Re-assert input focus on the given display by bringing its current top
@@ -162,4 +169,23 @@ interface IShellService {
      */
     ParcelFileDescriptor streamLogcat(String filterSpec);
     void stopLogcatStream();
+
+    // ─── Physical mouse capture (Phase 1: privileged evdev read) ─────────
+    /**
+     * Find a connected physical pointer device (a /dev/input/eventN advertising
+     * REL_X+REL_Y), open it, optionally EVIOCGRAB it for exclusive access, and
+     * spawn a native read loop that writes packed 16-byte delta records
+     * {int32 dx, dy, buttons, wheel} (little-endian) to [writeEnd].
+     *
+     * Returns a synchronous status string so the caller can immediately learn
+     * whether the device was found and whether the grab succeeded — e.g.
+     * "OK device=/dev/input/event12 grab=OK" or
+     * "OK device=/dev/input/event12 grab=FAILED(errno=1)" or "ERR no-mouse-found".
+     * The grab result is the key Phase-1 signal: it tells us whether the shell
+     * domain can exclusively grab input on this device (vs. needing root).
+     */
+    String startMouseCapture(boolean grab, String nativeLibDir, in ParcelFileDescriptor writeEnd);
+
+    /** Stop the native read loop, ungrab, and close the captured device. */
+    void stopMouseCapture();
 }

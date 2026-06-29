@@ -448,19 +448,6 @@ class TopWindowBarOverlay(
                 // While previewing on the customization page, the bar is pinned
                 // shown — don't let the cursor-below rule hide it.
                 if (zonePreviewActive) { if (!shown) setShown(true); return@collect }
-                // --- TEMP DIAGNOSTIC: top-bar reveal (remove after capture) ---
-                // Fires whenever the cursor is near the top edge, regardless of
-                // whether the bar reveals. In a FAILED activation this shows which
-                // gate blocked: suppress=true (latch), shown=true (desync),
-                // inBand=false (cursor outside the horizontal band), or the y
-                // values never dip to <= zoneH (cursor overshoot / sampling).
-                if (y <= zoneH * 4f) {
-                    Log.d(TAG, "REVEAL-EVAL x=${x.toInt()} y=${y.toInt()} zoneH=${zoneH.toInt()} " +
-                        "band=[${xLo.toInt()}..${(xLo + band).toInt()}] inBand=$inBand " +
-                        "shown=$shown suppress=$suppressRevealUntilExit mode=$mode " +
-                        "autoHide=${topBarCfg.autoHideAfterSec}")
-                }
-                // --- END TEMP DIAGNOSTIC ---
                 if (y <= zoneH && inBand && !shown && !suppressRevealUntilExit) setShown(true)
                 // Timed hide (>0) is handled by scheduleAutoHide(); the
                 // reveal-on-top-edge above brings a timed-hidden bar back.
@@ -1075,66 +1062,9 @@ class TopWindowBarOverlay(
      */
     private fun arrangeEvenly() {
         val s = scope ?: return
-        s.launch {
-            val windows = withContext(Dispatchers.IO) {
-                runCatching {
-                    fun isLauncher(t: RunningTask) =
-                        t.packageName.contains("launcher", ignoreCase = true) ||
-                            t.packageName.contains("nexuslauncher", ignoreCase = true)
-                    val seen = LinkedHashMap<Int, RunningTask>()
-                    // Try this display + the injector's display first.
-                    val ids = listOf(display.displayId, injector.displayId).distinct()
-                    for (id in ids) {
-                        for (t in freeform.listTasks(id)) {
-                            if (!isLauncher(t)) seen[t.taskId] = t
-                        }
-                    }
-                    // Fallback: if the per-display lookups didn't find at least
-                    // two windows (display-id mismatch between VD and where the
-                    // tasks are registered — the same quirk the close button
-                    // works around), enumerate ALL displays and take the
-                    // non-launcher tasks.
-                    if (seen.size < 2) {
-                        for (t in freeform.listTasks(-1)) {
-                            if (!isLauncher(t)) seen[t.taskId] = t
-                        }
-                    }
-                    Log.d(TAG, "arrangeEvenly: enumerated ${seen.size} candidate windows: " +
-                        seen.values.joinToString { "${it.packageName}#${it.taskId}@disp${it.displayId} b=${it.bounds}" })
-                    // Order left-to-right by current left edge (nulls last).
-                    seen.values.sortedBy { it.bounds?.left ?: Int.MAX_VALUE }
-                }.getOrDefault(emptyList())
-            }
-            val count = windows.size
-            if (count < 2) {
-                Log.d(TAG, "arrangeEvenly: $count window(s) — nothing to arrange")
-                return@launch
-            }
-            // Re-read the CURRENT display metrics rather than trusting the
-            // width/height captured when the bar was built — switching into
-            // super-ultrawide after the bar existed left displayW stale and
-            // narrower than the real canvas, so columns didn't span the full
-            // width (visible empty space on the right). Live metrics fix that.
-            val liveMetrics = DisplayMetrics().also { display.getRealMetrics(it) }
-            val w = liveMetrics.widthPixels.coerceAtLeast(displayW).coerceAtLeast(1)
-            val h = liveMetrics.heightPixels.coerceAtLeast(1)
-            // Arrange every open window (no fixed cap) so none are left
-            // stranded behind others. On the ultrawide canvas many columns are
-            // still usable; on a normal display this is naturally limited by how
-            // many windows you have open.
-            val n = count
-            Log.d(TAG, "arrangeEvenly: arranging all $n windows into even columns on ${w}x$h (cached was ${displayW}x$displayH)")
-            withContext(Dispatchers.IO) {
-                windows.take(n).forEachIndexed { i, task ->
-                    runCatching {
-                        freeform.resize(task.taskId, WindowBounds.evenColumn(i, n, w, h))
-                    }
-                    // Small gap between commands so a burst of resizes doesn't
-                    // race the shell / window manager.
-                    Thread.sleep(60)
-                }
-            }
-        }
+        // Shared with the trackpad's arrange button. Pass our cached width as the
+        // floor (the ultrawide stale-metrics guard) and our display as primary.
+        WindowArranger.arrangeEvenly(s, display.displayId, floorW = displayW)
     }
 
     /** "Restore to freeform": demote the maximized window back to a floating
@@ -1413,6 +1343,55 @@ class TopWindowBarOverlay(
                     )
                 }
             }
+        }
+    }
+
+    /**
+     * Run a window action by id, from another surface (the trackpad radial menu),
+     * using the SAME delegates as the top-bar buttons. Each delegate self-guards
+     * (enumerates windows, toasts on the glasses when not applicable) and runs on
+     * [scope], so callers don't pre-check. [closeAll] runs the close directly: the
+     * radial does its own two-tap confirm, so the on-glasses confirm is skipped.
+     * Unknown ids no-op. Mirrors the handlers at [controlGroups] verbatim.
+     */
+    fun runAction(action: String) {
+        when (action) {
+            "minimize" -> onSingleOrPick(
+                emptyMsg = "No windows to minimize",
+                single = { task ->
+                    withContext(Dispatchers.IO) {
+                        runCatching { freeform.minimizeByClose(task.taskId, task.packageName, task.bounds) }
+                    }
+                    maybeShowWallpaperIfEmpty()
+                },
+                multi = { launchMinimizePickerOnPhone() },
+            )
+            "maximize" -> onSingleOrPick(
+                emptyMsg = "No windows to maximize",
+                single = { task ->
+                    val m = DisplayMetrics().also { @Suppress("DEPRECATION") display.getRealMetrics(it) }
+                    withContext(Dispatchers.IO) {
+                        runCatching {
+                            freeform.maximizeByResize(
+                                taskId = task.taskId,
+                                component = task.topActivity,
+                                packageName = task.packageName,
+                                current = task.bounds,
+                                displayId = display.displayId,
+                                displayW = m.widthPixels.coerceAtLeast(1),
+                                displayH = m.heightPixels.coerceAtLeast(1),
+                            )
+                        }
+                    }
+                },
+                multi = { launchMaximizePickerOnPhone() },
+            )
+            "restoreFreeform" -> restoreFreeform()
+            "arrangeEvenly" -> requireWindows(2, "Need at least 2 windows to arrange") { arrangeEvenly() }
+            "arrangeInOrder" -> requireWindows(2, "Need at least 2 windows to arrange") { launchArrangeOnPhone() }
+            "stack" -> requireWindows(2, "Need at least 2 windows to stack") { stackWindows() }
+            "restoreSession" -> restoreLastSession()
+            "closeAll" -> closeAllExternalApps()
         }
     }
 

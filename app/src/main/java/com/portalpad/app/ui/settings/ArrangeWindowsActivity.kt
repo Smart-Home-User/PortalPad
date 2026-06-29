@@ -133,7 +133,7 @@ class ArrangeWindowsActivity : com.portalpad.app.PinnedDensityActivity() {
                 withContext(Dispatchers.IO) {
                     val n = ordered.size
                     ordered.forEachIndexed { i, task ->
-                        runCatching { app.freeform.resize(task.taskId, WindowBounds.evenColumn(i, n, w, h)) }
+                        runCatching { app.freeform.resizeToFreeform(task, WindowBounds.evenColumn(i, n, w, h), w, h) }
                         // Small gap so a burst of resizes doesn't race the shell.
                         Thread.sleep(60)
                     }

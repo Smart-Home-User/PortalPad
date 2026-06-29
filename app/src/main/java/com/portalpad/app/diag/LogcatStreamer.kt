@@ -162,15 +162,13 @@ class LogcatStreamer {
 
     companion object {
         private const val TAG = "LogcatStreamer"
-        // Root-shell fallback filter. Same PortalPad tags, but we DON'T silence
-        // everything (*:S) so SELinux denials and libsu errors are visible —
-        // those are the things that explain a failed root-service bind. Denials
-        // surface under the "avc" tag (and sometimes auditd/SELinux); we keep
-        // warnings-and-above globally to catch them without flooding.
-        private const val ROOT_FILTER =
-            "PortalPad:V InputInjector:V ShellUserService:V " +
-                "RootShellService:V RootClickBackend:V AirGlassesSession:V " +
-                "LaunchEntry:V DisableTransition:V " +
+        // Root-shell fallback filter. Same PortalPad tags as the Shizuku path
+        // (shared source of truth in LogTags), but we DON'T silence everything
+        // (*:S) — instead we keep SELinux denials (avc/auditd/SELinux), libsu
+        // errors, and warnings-and-above globally (*:W) so a failed root-service
+        // bind is visible. Those denials are what explain such failures.
+        private val ROOT_FILTER =
+            LogTags.PORTALPAD_TAGS +
                 "libsu:V avc:V auditd:V SELinux:V AndroidRuntime:E *:W"
     }
 }

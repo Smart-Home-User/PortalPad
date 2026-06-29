@@ -27,6 +27,14 @@
 -keep class android.hardware.display.IVirtualDisplayCallback { *; }
 -keep class android.hardware.display.IVirtualDisplayCallback$* { *; }
 
+# ---- JNI (physical mouse capture) ----
+# The native lib looks up Java_com_portalpad_app_service_NativeMouse_* by exact
+# class+method name. The whole-app keep above already preserves these, but pin
+# the standard JNI rule explicitly so it survives any future narrowing.
+-keepclasseswithmembernames,includedescriptorclasses class * {
+    native <methods>;
+}
+
 # ---- kotlinx.serialization ----
 # The serialization gradle plugin adds its own consumer rules, and the whole-app keep
 # above already covers our @Serializable classes + generated $$serializer companions.

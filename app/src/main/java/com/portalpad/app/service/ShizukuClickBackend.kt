@@ -94,6 +94,12 @@ class ShizukuClickBackend(private val context: Context) : BoundShellBackend {
         it.injectKeyPress(keyCode, displayId)
         true
     }
+    override fun injectKey(keyCode: Int, action: Int, metaState: Int, displayId: Int): Boolean = svcCall {
+        // deviceId -1 → service uses a real keyboard device id so the char map
+        // composes keycode + meta into the right character.
+        it.injectKey(keyCode, action, metaState, displayId, -1)
+        true
+    }
     /** Press a key tagged as gamepad input (SOURCE_GAMEPAD | SOURCE_JOYSTICK). */
     override fun gamepadKey(displayId: Int, keyCode: Int): Boolean = svcCall {
         it.injectGamepadKeyPress(keyCode, displayId)
@@ -120,6 +126,7 @@ class ShizukuClickBackend(private val context: Context) : BoundShellBackend {
     override fun stopSurfaceMirror(glassesId: Int) { svcCall { it.stopSurfaceMirror(glassesId); true } }
 
     override fun moveFocusedTaskToDisplay(displayId: Int): Boolean = svcCall { it.moveFocusedTaskToDisplay(displayId) }
+    override fun moveTaskToDisplay(taskId: Int, displayId: Int): Boolean = svcCall { it.moveTaskToDisplay(taskId, displayId) }
     override fun refocusTopTaskOnDisplay(displayId: Int): Boolean = svcCall { it.refocusTopTaskOnDisplay(displayId) }
     override fun getFocusedTaskDisplayId(): Int = svcCall(-1) { it.getFocusedTaskDisplayId() }
     override fun runCommand(cmd: String): String = svcCall("") { it.runCommand(cmd) }
@@ -144,6 +151,14 @@ class ShizukuClickBackend(private val context: Context) : BoundShellBackend {
     override fun streamLogcat(filter: String?): android.os.ParcelFileDescriptor? =
         svcCall<android.os.ParcelFileDescriptor?>(null) { it.streamLogcat(filter) }
     override fun stopLogcatStream() { svcCall { it.stopLogcatStream(); true } }
+
+    override fun startMouseCapture(grab: Boolean, nativeLibDir: String?, writeEnd: android.os.ParcelFileDescriptor): String =
+        svcCall("ERR not-bound") { it.startMouseCapture(grab, nativeLibDir, writeEnd) }
+    override fun stopMouseCapture() { svcCall { it.stopMouseCapture(); true } }
+
+    override fun injectScroll(x: Float, y: Float, vScroll: Float, hScroll: Float, displayId: Int) {
+        svcCall { it.injectScroll(x, y, vScroll, hScroll, displayId); true }
+    }
 
     // ─── helpers ────────────────────────────────────────────────────
 

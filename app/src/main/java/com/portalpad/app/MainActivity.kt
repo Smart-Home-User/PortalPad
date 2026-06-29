@@ -88,6 +88,27 @@ class MainActivity : PinnedDensityActivity() {
         installSplashScreen()
         super.onCreate(savedInstanceState)
         lockOrientationDefault()
+        // Mirror TrackpadActivity: when the user has opted to drive PortalPad over
+        // the lock screen (ALLOW_LOCKSCREEN), let the settings host show over the
+        // keyguard too. Without this, tapping the gear from the over-lock trackpad
+        // silently bounced to the lock screen, because MainActivity had no
+        // showWhenLocked flag. Same consent toggle, so no new exposure beyond what
+        // the user already accepted for the trackpad. NOTE: deeper SYSTEM screens
+        // (e.g. Android permission settings) opened from here are separate
+        // activities and still require unlocking — unavoidable, they're not ours.
+        val showOverLock = runCatching {
+            kotlinx.coroutines.runBlocking {
+                PortalPadApp.instance.prefs.bool(
+                    com.portalpad.app.data.PreferencesRepository.Keys.ALLOW_LOCKSCREEN,
+                    true,
+                ).first()
+            }
+        }.getOrDefault(true)
+        setShowWhenLocked(showOverLock)
+        // If the glasses are plugged in while the phone is locked, the desktop
+        // can't extend onto them (the system keyguard claims the display) — prompt
+        // the unlock so the user isn't stuck staring at two lock screens.
+        promptUnlockWhenDisplayAttachesLocked(enabled = showOverLock)
         setContent {
             // Apply the orientation preference live: when the user changes it in
             // Settings (which is hosted right here), this re-applies immediately

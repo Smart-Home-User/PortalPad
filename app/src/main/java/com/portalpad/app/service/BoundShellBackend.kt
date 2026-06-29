@@ -32,6 +32,13 @@ interface BoundShellBackend {
     fun longPress(displayId: Int, x: Float, y: Float, durationMs: Long = 700L): Boolean
     fun swipe(displayId: Int, sx: Float, sy: Float, ex: Float, ey: Float, durationMs: Long = 80L): Boolean
     fun key(displayId: Int, keyCode: Int): Boolean
+    /**
+     * Inject a single hardware-keyboard key edge (KeyEvent.ACTION_DOWN/UP) with
+     * modifier [metaState] on [displayId]. Used by the physical-keyboard relay:
+     * unlike [key] (a complete press, no meta), this forwards the literal down/up
+     * and meta so Shift/Ctrl/Alt, capitals, symbols and held keys compose.
+     */
+    fun injectKey(keyCode: Int, action: Int, metaState: Int, displayId: Int): Boolean
     fun gamepadKey(displayId: Int, keyCode: Int): Boolean
     fun pointer(action: Int, x: Float, y: Float, displayId: Int, source: Int, buttonState: Int, downTime: Long): Boolean
 
@@ -59,6 +66,7 @@ interface BoundShellBackend {
 
     // ─── Task / activity / shell ────────────────────────────────────────
     fun moveFocusedTaskToDisplay(displayId: Int): Boolean
+    fun moveTaskToDisplay(taskId: Int, displayId: Int): Boolean
     fun refocusTopTaskOnDisplay(displayId: Int): Boolean
     /** Display id of the focused root task (or -1). Reliable per-display focus signal. */
     fun getFocusedTaskDisplayId(): Int
@@ -79,4 +87,14 @@ interface BoundShellBackend {
     // ─── Diagnostics ────────────────────────────────────────────────────
     fun streamLogcat(filter: String? = null): ParcelFileDescriptor?
     fun stopLogcatStream()
+
+    /** Discrete mouse-wheel scroll (no fling) at (x,y) on [displayId]. */
+    fun injectScroll(x: Float, y: Float, vScroll: Float, hScroll: Float, displayId: Int)
+
+    // ─── Physical mouse capture (Phase 1) ───────────────────────────────
+    /** Start privileged evdev capture; deltas are written to [writeEnd].
+     *  Returns a status string (device + grab result), or "ERR ..." on failure. */
+    fun startMouseCapture(grab: Boolean, nativeLibDir: String?, writeEnd: ParcelFileDescriptor): String
+    /** Stop the native read loop, ungrab, and close the device. */
+    fun stopMouseCapture()
 }

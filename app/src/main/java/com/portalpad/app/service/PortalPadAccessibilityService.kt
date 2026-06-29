@@ -128,6 +128,11 @@ class PortalPadAccessibilityService : AccessibilityService() {
         // the VD), and only when an external display is actually present.
         if (app.injector.imeOnExternalEnabled) return
         if (app.externalDisplayId.value == null) return
+        // With a physical keyboard connected, keystrokes route straight to the
+        // focused field on the glasses — so the phone relay page is redundant
+        // (and can't track your typing, since none of it reaches the page). Skip
+        // the auto-popup. The manual keyboard button still opens it on demand.
+        if (hasHardwareKeyboard()) { Log.i(TAG, "DIAG skip: hardware keyboard present"); return }
         // Don't re-trigger while the relay is already showing. Selection-change events
         // fire as we inject text into the glasses field during typing, and without
         // this each keystroke's SELCHG would try to relaunch the relay.
@@ -241,6 +246,22 @@ class PortalPadAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** True when a real (non-virtual) alphabetic keyboard is enumerated — a
+     *  connected Bluetooth/USB keyboard. The ALPHABETIC + non-virtual checks
+     *  exclude the soft-IME virtual device and plain mice (which report
+     *  KEYBOARD_TYPE_NONE), so this fires only for an actual hardware keyboard. */
+    private fun hasHardwareKeyboard(): Boolean = runCatching {
+        val im = getSystemService(android.content.Context.INPUT_SERVICE)
+            as? android.hardware.input.InputManager ?: return false
+        im.inputDeviceIds.any { id ->
+            val d = im.getInputDevice(id) ?: return@any false
+            !d.isVirtual &&
+                d.keyboardType == android.view.InputDevice.KEYBOARD_TYPE_ALPHABETIC &&
+                (d.sources and android.view.InputDevice.SOURCE_KEYBOARD) ==
+                android.view.InputDevice.SOURCE_KEYBOARD
+        }
+    }.getOrDefault(false)
+
     /** Opens the relay for [node] (a focused editable field on the glasses). Shared by
      *  the event path and the click-triggered probe. Sets the launch timestamp and
      *  retains the node so the relay can delete via ACTION_SET_TEXT. */
@@ -294,6 +315,7 @@ class PortalPadAccessibilityService : AccessibilityService() {
             val app = applicationContext as? PortalPadApp ?: return
             if (!app.injector.autoOpenRelayEnabled || app.injector.imeOnExternalEnabled) return
             if (app.externalDisplayId.value == null || app.relayOpen) return
+            if (hasHardwareKeyboard()) return
             if (SystemClock.elapsedRealtime() - lastLaunchAt < 2000) return
             val node = findFocusedEditableOnVd(vd, pkg) ?: return
             Log.i(TAG, "DIAG probe FOUND editable (pkg=$pkg) → opening relay")

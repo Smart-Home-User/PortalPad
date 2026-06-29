@@ -25,6 +25,7 @@ class PreferencesRepository(private val context: Context) {
         val AUTO_LAUNCH_INTERFACE = stringPreferencesKey("auto_launch_interface") // "air_mouse" | "trackpad" | "remote"
         val LAST_FOREGROUND_APP = stringPreferencesKey("last_foreground_app")  // JSON AppEntry (for Last-app restore)
         val LAST_SESSION = stringPreferencesKey("last_session")        // JSON SavedSession (open apps + bounds)
+        val SESSIONS_BY_WIDTH = stringPreferencesKey("sessions_by_width") // JSON SavedSessions (per-resolution layout memory)
         val OFFER_RESTORE_ON_RECONNECT = booleanPreferencesKey("offer_restore_on_reconnect") // auto-popup on trackpad open
         val BACK_BUTTON_STYLE = stringPreferencesKey("back_button_style")  // JSON ButtonAppearance
         val HOME_BUTTON_STYLE = stringPreferencesKey("home_button_style")  // JSON ButtonAppearance
@@ -176,6 +177,24 @@ class PreferencesRepository(private val context: Context) {
         // because its deltas are ~100× larger than trackpad pixels).
         val AIR_MOUSE_ACCEL = androidx.datastore.preferences.core.floatPreferencesKey("air_mouse_accel")
         val AIR_MOUSE_INVERT_X = booleanPreferencesKey("air_mouse_invert_x")
+        // External (Bluetooth/USB) physical-mouse sensitivity — a linear multiplier
+        // applied to its raw evdev deltas. Separate from trackpad/air-mouse because
+        // it's a distinct input source the user tunes independently.
+        val EXT_MOUSE_SENSITIVITY = androidx.datastore.preferences.core.floatPreferencesKey("ext_mouse_sensitivity")
+        // External-mouse wheel: its own scroll-speed multiplier and direction,
+        // independent of the trackpad's scroll settings.
+        val EXT_MOUSE_SCROLL_SPEED = androidx.datastore.preferences.core.floatPreferencesKey("ext_mouse_scroll_speed")
+        val EXT_MOUSE_NATURAL_SCROLL = booleanPreferencesKey("ext_mouse_natural_scroll")
+        // Whether to exclusively grab (EVIOCGRAB) the mouse — suppresses the
+        // phone's own pointer. Off = shared (both cursors move); useful where the
+        // grab is denied or the user wants the mouse on the phone too.
+        val EXT_MOUSE_GRAB = booleanPreferencesKey("ext_mouse_grab")
+        // User opted into the external mouse (persisted). Drives auto-resume:
+        // re-arm capture on display/Bluetooth connect without re-toggling.
+        val EXT_MOUSE_ENABLED = booleanPreferencesKey("ext_mouse_enabled")
+        // One-time hint: shown the first time the trackpad arrange button is
+        // tapped, teaching the long-press (arrange in order) gesture.
+        val ARRANGE_LONGPRESS_HINT_SEEN = booleanPreferencesKey("arrange_longpress_hint_seen")
         val AIR_MOUSE_INVERT_Y = booleanPreferencesKey("air_mouse_invert_y")
         val SCREEN_OFF_EXPLAINED = booleanPreferencesKey("screen_off_explained")
         // Start-setup page: did the user say they'll use media controls / the
@@ -183,6 +202,9 @@ class PreferencesRepository(private val context: Context) {
         val SETUP_WANTS_NOTIF_ACCESS = stringPreferencesKey("setup_wants_notif_access")
         val SETUP_WANTS_VOICE_SEARCH = stringPreferencesKey("setup_wants_voice_search")
         val SETUP_WANTS_BACKGROUND = stringPreferencesKey("setup_wants_background")
+        // Setup: required Yes/No answer for the external-mouse question ("" = unanswered,
+        // so it blocks setup completion until the user picks). Drives EXT_MOUSE_ENABLED.
+        val SETUP_MOUSE_ANSWER = stringPreferencesKey("setup_mouse_answer")
         val SETUP_WANTS_ACCESSIBILITY = stringPreferencesKey("setup_wants_accessibility")
         val SETUP_WANTS_PHONE_STATE = stringPreferencesKey("setup_wants_phone_state")
         val PROG_KEY_NAME_RED = stringPreferencesKey("prog_key_name_red")
@@ -515,6 +537,42 @@ class PreferencesRepository(private val context: Context) {
     }
     suspend fun setLastSession(session: SavedSession) = context.dataStore.edit {
         it[Keys.LAST_SESSION] = json.encodeToString(session)
+    }
+
+    /** Per-resolution layout memory: a [SavedSession] per canvas width. */
+    val sessionsByWidth: Flow<SavedSessions> = context.dataStore.data.map { p ->
+        p[Keys.SESSIONS_BY_WIDTH]?.let {
+            runCatching { json.decodeFromString<SavedSessions>(it) }.getOrNull()
+        } ?: SavedSessions()
+    }
+
+    suspend fun setSessionsByWidth(sessions: SavedSessions) = context.dataStore.edit {
+        it[Keys.SESSIONS_BY_WIDTH] = json.encodeToString(sessions)
+    }
+
+    /** Store/overwrite the remembered layout for a single canvas [width]. */
+    suspend fun putSessionForWidth(width: Int, session: SavedSession) {
+        if (width <= 0) return
+        val cur = sessionsByWidth.first().byWidth
+        setSessionsByWidth(SavedSessions(cur + (width to session)))
+    }
+
+    /**
+     * Pick the layout to restore for a canvas of [w]x[h], plus the scale to apply.
+     * If this width has a remembered layout, return it for an EXACT restore (1f).
+     * Otherwise seed from the most-recent layout (last session, else newest slot),
+     * scaled from its canvas to this one. Empty session = nothing to restore.
+     */
+    suspend fun sessionForCanvas(w: Int, h: Int): Triple<SavedSession, Float, Float> {
+        val map = sessionsByWidth.first().byWidth
+        map[w]?.takeIf { it.windows.isNotEmpty() }?.let { return Triple(it, 1f, 1f) }
+        val last = lastSession.first()
+        val seed = last.takeIf { it.windows.isNotEmpty() }
+            ?: map.values.filter { it.windows.isNotEmpty() }.maxByOrNull { it.savedAtMillis }
+            ?: return Triple(SavedSession(), 1f, 1f)
+        val sx = if (seed.canvasWidth > 0) w.toFloat() / seed.canvasWidth else 1f
+        val sy = if (seed.canvasHeight > 0) h.toFloat() / seed.canvasHeight else 1f
+        return Triple(seed, sx, sy)
     }
 
     val dockConfig: Flow<DockConfig> = context.dataStore.data.map { p ->

@@ -122,4 +122,21 @@ data class SavedWindow(
 data class SavedSession(
     val windows: List<SavedWindow> = emptyList(),
     val savedAtMillis: Long = 0L,
+    // Canvas size (px) the windows were captured at. 0 = unknown (older saves).
+    // Restore compares width to the live canvas: if they differ, the saved
+    // absolute bounds won't fit, so the windows are rescaled proportionally.
+    val canvasWidth: Int = 0,
+    val canvasHeight: Int = 0,
+)
+
+/**
+ * Per-resolution layout memory: one [SavedSession] kept per canvas width, so each
+ * display size (standard 1920, ultrawide 3840, 21:9 2520, …) remembers its own
+ * window layout independently — like a desktop restoring each monitor's windows.
+ * On landing at a width with a remembered layout we restore it exactly; a width
+ * never seen before is seeded by scaling the most-recent layout.
+ */
+@kotlinx.serialization.Serializable
+data class SavedSessions(
+    val byWidth: Map<Int, SavedSession> = emptyMap(),
 )

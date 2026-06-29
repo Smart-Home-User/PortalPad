@@ -100,6 +100,8 @@ class RootClickBackend(private val context: Context) : BoundShellBackend {
     override fun swipe(displayId: Int, sx: Float, sy: Float, ex: Float, ey: Float, durationMs: Long): Boolean =
         svcCall { it.injectSwipe(displayId, sx, sy, ex, ey, durationMs); true }
     override fun key(displayId: Int, keyCode: Int): Boolean = svcCall { it.injectKeyPress(keyCode, displayId); true }
+    override fun injectKey(keyCode: Int, action: Int, metaState: Int, displayId: Int): Boolean =
+        svcCall { it.injectKey(keyCode, action, metaState, displayId, -1); true }
     override fun gamepadKey(displayId: Int, keyCode: Int): Boolean = svcCall { it.injectGamepadKeyPress(keyCode, displayId); true }
     override fun pointer(action: Int, x: Float, y: Float, displayId: Int, source: Int, buttonState: Int, downTime: Long): Boolean =
         svcCall { it.injectPointer(action, x, y, displayId, source, buttonState, downTime); true }
@@ -122,6 +124,7 @@ class RootClickBackend(private val context: Context) : BoundShellBackend {
 
     // ─── task / shell ───────────────────────────────────────────────
     override fun moveFocusedTaskToDisplay(displayId: Int): Boolean = svcCall { it.moveFocusedTaskToDisplay(displayId) }
+    override fun moveTaskToDisplay(taskId: Int, displayId: Int): Boolean = svcCall { it.moveTaskToDisplay(taskId, displayId) }
     override fun refocusTopTaskOnDisplay(displayId: Int): Boolean = svcCall { it.refocusTopTaskOnDisplay(displayId) }
     override fun getFocusedTaskDisplayId(): Int = svcCall(-1) { it.getFocusedTaskDisplayId() }
     override fun runCommand(cmd: String): String = svcCall("") { it.runCommand(cmd) }
@@ -142,6 +145,14 @@ class RootClickBackend(private val context: Context) : BoundShellBackend {
     override fun streamLogcat(filter: String?): android.os.ParcelFileDescriptor? =
         svcCall<android.os.ParcelFileDescriptor?>(null) { it.streamLogcat(filter) }
     override fun stopLogcatStream() { svcCall { it.stopLogcatStream(); true } }
+
+    override fun startMouseCapture(grab: Boolean, nativeLibDir: String?, writeEnd: android.os.ParcelFileDescriptor): String =
+        svcCall("ERR not-bound") { it.startMouseCapture(grab, nativeLibDir, writeEnd) }
+    override fun stopMouseCapture() { svcCall { it.stopMouseCapture(); true } }
+
+    override fun injectScroll(x: Float, y: Float, vScroll: Float, hScroll: Float, displayId: Int) {
+        svcCall { it.injectScroll(x, y, vScroll, hScroll, displayId); true }
+    }
 
     // ─── helpers ────────────────────────────────────────────────────
     private inline fun <T> svcCall(default: T, block: (IShellService) -> T): T {

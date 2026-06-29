@@ -97,24 +97,52 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
      * resizeableActivity=false still open in a window (many do; without this
      * they'd silently launch fullscreen).
      */
+    // The user's enable_freeform_support value captured BEFORE PortalPad first
+    // turned it on this process — so we can restore their own choice (they may have
+    // set it via Developer Options). Null = we haven't enabled freeform this process.
+    // force_resizable_activities is deliberately NOT remembered: we own it outright,
+    // since its only purpose is windowing and leaving it on system-wide crashes
+    // SystemUI's split-screen coordinator on unrelated app launches.
+    @Volatile private var priorEnableFreeform: String? = null
+
     fun enableFreeform(): Boolean = runCatching {
         if (!isReady) return false
+        // Capture the user's prior enable_freeform_support exactly once, before we
+        // change it, so disableFreeform can put it back to what they had.
+        if (priorEnableFreeform == null) {
+            priorEnableFreeform = runCatching {
+                access.execShell("settings get global enable_freeform_support").trim()
+            }.getOrDefault("0").let { if (it == "1") "1" else "0" }
+        }
         val o1 = access.execShell("settings put global enable_freeform_support 1")
         val o2 = access.execShell("settings put global force_resizable_activities 1")
         // Some ROMs also gate on this development setting; harmless if absent.
         runCatching { access.execShell("settings put global force_resizable 1") }
-        Log.d(TAG, "enableFreeform: o1=$o1 o2=$o2")
+        Log.d(TAG, "enableFreeform: o1=$o1 o2=$o2 prior=$priorEnableFreeform")
         !o1.containsError() && !o2.containsError()
     }.getOrElse {
         Log.e(TAG, "enableFreeform failed", it); false
     }
 
-    /** Best-effort revert of [enableFreeform]. */
+    /**
+     * Revert [enableFreeform]. force_resizable_activities is forced OFF — PortalPad
+     * owns it, and leaving it on globally crashes SystemUI's split-screen
+     * coordinator on later app launches (random black-screen). enable_freeform_
+     * support is restored to the user's prior value, but ONLY if we actually turned
+     * it on this process; otherwise their setting (e.g. Developer Options) is left
+     * untouched. Safe and idempotent.
+     */
     fun disableFreeform() {
         if (!isReady) return
         runCatching {
-            access.execShell("settings put global enable_freeform_support 0")
             access.execShell("settings put global force_resizable_activities 0")
+            runCatching { access.execShell("settings put global force_resizable 0") }
+            val prior = priorEnableFreeform
+            if (prior != null) {
+                access.execShell("settings put global enable_freeform_support $prior")
+                priorEnableFreeform = null
+            }
+            Log.d(TAG, "disableFreeform: force_resizable->0; enable_freeform=${prior ?: "untouched"}")
         }
     }
 
@@ -132,6 +160,7 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         component: String,
         displayId: Int,
         bounds: WindowBounds,
+        forceNewTask: Boolean = false,
     ): Boolean = runCatching {
         if (!isReady) return false
         // Enforce the max-window cap at this single chokepoint so EVERY launch
@@ -147,20 +176,44 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
             }
         }.getOrDefault(5).coerceIn(1, 8)
         val openCount = countExternalWindows()
-        Log.d(TAG, "launchFreeform: openCount=$openCount maxWindows=$maxWindows for $component")
-        if (openCount >= maxWindows) {
+        // A flap recovery is RE-opening windows the user already had — never block
+        // it on the window cap. Without this, a transient extra during recovery
+        // (e.g. a duplicate same-app window briefly in flight) could push the count
+        // to the cap and knock out a DIFFERENT app's relaunch (observed: YouTube
+        // dropped while a 3rd Chrome was momentarily live). The per-app cap-of-2
+        // collector trims any genuine excess once recovery finishes.
+        val recovering = runCatching { PortalPadApp.instance.isFlapRecovering() }.getOrDefault(false)
+        Log.d(TAG, "launchFreeform: openCount=$openCount maxWindows=$maxWindows recovering=$recovering for $component")
+        if (!recovering && openCount >= maxWindows) {
             Log.d(TAG, "launchFreeform BLOCKED: $openCount/$maxWindows windows open (cap reached) — $component")
             return false
         }
+        // When restoring a SECOND window of an app that's already live, a plain
+        // launch just refocuses the existing window. Setting FLAG_ACTIVITY_NEW_TASK
+        // (0x10000000) | FLAG_ACTIVITY_MULTIPLE_TASK (0x08000000) = 0x18000000 forces
+        // a distinct task so the duplicate window actually appears. NOTE: pass the
+        // numeric `-f` flags — this platform's `am` rejects the named
+        // `--activity-new-task` option. (This is the same flag combo Android itself
+        // uses when you open a 2nd window normally.) The recreated window is blank —
+        // the original was destroyed by the display re-enumeration and can't be
+        // recovered — but the layout slot is filled instead of left empty.
+        val newTaskFlags = if (forceNewTask) " -f 0x18000000" else ""
         // WINDOWING_MODE_FREEFORM = 5.
         val out = access.execShell(
-            "am start --display $displayId --windowingMode 5 " +
+            "am start --display $displayId --windowingMode 5$newTaskFlags " +
                 "-a android.intent.action.MAIN " +
                 "-c android.intent.category.LAUNCHER " +
                 "-n '$component'"
         )
-        Log.d(TAG, "launchFreeform $component disp=$displayId → $out")
+        Log.d(TAG, "launchFreeform $component disp=$displayId forceNewTask=$forceNewTask → $out")
         if (out.containsError()) {
+            if (forceNewTask) {
+                // A forced-new-task launch that errors must NOT silently fall back to
+                // a plain launch — that would just refocus the existing window and
+                // mask the failure (the duplicate we wanted never appears). Surface it.
+                Log.w(TAG, "launchFreeform forceNewTask FAILED for $component (no flagless fallback) → $out")
+                return false
+            }
             // Fallback: plain launch (lands fullscreen), then move into freeform
             // by task id below. Better a fullscreen window than nothing.
             access.startActivityOnDisplay(component, displayId)
@@ -269,6 +322,79 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         PortalPadApp.instance.signalWindowsChanged()
     }
 
+    /**
+     * Like [resize], but first forces the task into freeform windowing mode. A
+     * window maximized through Android's caption bar (a system action PortalPad
+     * doesn't track) is in FULLSCREEN mode, and a plain `am task resize` on a
+     * fullscreen-mode task is ignored — the window stays maximized. Demoting it
+     * to freeform first makes the resize apply. Used by the arrange/stack actions
+     * so a caption-bar-maximized window participates instead of sitting maximized
+     * in the background. No-op cost on a window that's already freeform (the
+     * set-windowing-mode call just confirms the current mode).
+     */
+    /**
+     * Resize a window into [bounds] as part of an arrange/stack, handling a
+     * window that was maximized through Android's caption bar.
+     *
+     * Such a window is in a system fullscreen state that silently ignores
+     * `am task resize` (confirmed on-device: the bounds don't change). The in-
+     * place windowing-mode commands don't work on every device either. The one
+     * primitive that reliably produces a freeform window here is the launch path
+     * (`am start --windowingMode 5`), so when a window resists the resize we
+     * relaunch it into freeform and resize again.
+     *
+     * To keep the common case fast and side-effect-free, we only take that path
+     * for a window that ENTERED the arrange already filling the display (the only
+     * kind that resists) AND only after a plain resize provably failed — so a
+     * normal freeform window is never relaunched, and we never relaunch when the
+     * intended result is itself full-screen.
+     */
+    fun resizeToFreeform(task: RunningTask, bounds: WindowBounds, displayW: Int, displayH: Int) {
+        // Plain resize first — works for every normal freeform window.
+        resize(task.taskId, bounds)
+
+        if (displayW <= 0 || displayH <= 0) return
+        fun fills(b: WindowBounds?) =
+            b != null && b.width >= displayW * 0.92f && b.height >= displayH * 0.92f
+        // Only a window that started maximized can resist; and never relaunch if
+        // the target bounds are themselves full-screen (nothing to un-maximize).
+        if (!fills(task.bounds) || fills(bounds)) return
+
+        Thread.sleep(80) // let the resize settle before we re-read
+        if (!fills(taskBounds(task.taskId))) return // resize took — done
+
+        // Resize was ignored: the window is still maximized. Relaunch it into a
+        // freeform window (proven path), then resize into its slot.
+        val displayId = task.displayId.takeIf { it >= 0 }
+            ?: PortalPadApp.instance.externalDisplayId.value ?: return
+        val component = task.topActivity
+        runCatching {
+            if (component != null) {
+                val out = access.execShell(
+                    "am start --display $displayId --windowingMode 5 " +
+                        "-a android.intent.action.MAIN " +
+                        "-c android.intent.category.LAUNCHER " +
+                        "-n '$component'"
+                )
+                if (out.containsError()) access.startActivityOnDisplay(task.packageName, displayId)
+            } else {
+                access.startActivityOnDisplay(task.packageName, displayId)
+            }
+        }
+        Thread.sleep(LAUNCH_SETTLE_MS)
+        // The task id can change after a relaunch — re-find by package.
+        val newId = runCatching {
+            listTasks(displayId).firstOrNull { it.packageName == task.packageName }?.taskId
+        }.getOrNull() ?: task.taskId
+        resize(newId, bounds)
+    }
+
+    /** Current bounds of [taskId] from a live task enumeration, or null. */
+    private fun taskBounds(taskId: Int): WindowBounds? = runCatching {
+        listTasks(-1).firstOrNull { it.taskId == taskId }?.bounds
+    }.getOrNull()
+
+
     /** "Stack windows": gather every open window into a tidy cascade in one
      *  spot — same size, each offset slightly down-right from the last so every
      *  window's edge/caption peeks out (you can see and tap any of them). Uses
@@ -294,7 +420,7 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         windows.forEachIndexed { i, w ->
             val left = (startX + step * i).coerceAtMost(displayW - winW)
             val top = (startY + step * i).coerceAtMost(displayH - winH)
-            runCatching { resize(w.taskId, WindowBounds(left, top, left + winW, top + winH)) }
+            runCatching { resizeToFreeform(w, WindowBounds(left, top, left + winW, top + winH), displayW, displayH) }
             Thread.sleep(40)
         }
         // The maximize state is no longer meaningful once windows are cascaded.
@@ -539,22 +665,51 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
      */
     fun snapshotSession(displayId: Int): com.portalpad.app.data.SavedSession? {
         val windows = runCatching {
-            listTasks(displayId).filter { rt ->
+            val raw = listTasks(displayId).filter { rt ->
                 !rt.packageName.contains("launcher", ignoreCase = true) &&
                     !rt.packageName.contains("nexuslauncher", ignoreCase = true) &&
                     rt.packageName != "com.portalpad.app"
-            }.map { rt ->
+            }
+            Log.d(TAG, "snapshotSession: raw tasks=${raw.size} [${raw.groupingBy { it.packageName }.eachCount()}]")
+            raw.mapNotNull { rt ->
                 val b = rt.bounds
+                // Skip windows whose bounds are null or degenerate (a window caught
+                // mid-transition). Saving 0,0,0,0 here would later be restored as a
+                // full-canvas rectangle — a window stuck MAXIMIZED behind the tiled
+                // ones. The debounced snapshotter re-captures a clean frame shortly
+                // after, so dropping a transient now is harmless.
+                if (b == null || b.right <= b.left || b.bottom <= b.top) {
+                    Log.d(TAG, "snapshotSession: SKIP ${rt.packageName} task=${rt.taskId} bad-bounds=$b")
+                    return@mapNotNull null
+                }
                 com.portalpad.app.data.SavedWindow(
                     packageName = rt.packageName,
                     component = rt.topActivity,
-                    left = b?.left ?: 0, top = b?.top ?: 0,
-                    right = b?.right ?: 0, bottom = b?.bottom ?: 0,
+                    left = b.left, top = b.top,
+                    right = b.right, bottom = b.bottom,
                 )
             }
         }.getOrDefault(emptyList())
         if (windows.isEmpty()) return null
-        return com.portalpad.app.data.SavedSession(windows, System.currentTimeMillis())
+        Log.d(TAG, "snapshotSession: saved ${windows.size} windows [${windows.groupingBy { it.packageName }.eachCount()}]")
+        // Record the canvas width these bounds were captured against, so restore
+        // can detect a resolution change (e.g. ultrawide → standard on replug) and
+        // re-tile instead of replaying bounds that no longer fit.
+        val canvasWidth = runCatching {
+            val dm = PortalPadApp.instance
+                .getSystemService(android.content.Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager
+            val disp = dm.getDisplay(displayId)
+            val m = android.util.DisplayMetrics().also { disp?.getRealMetrics(it) }
+            m.widthPixels
+        }.getOrDefault(0)
+        val canvasHeight = runCatching {
+            val dm = PortalPadApp.instance
+                .getSystemService(android.content.Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager
+            val disp = dm.getDisplay(displayId)
+            val m = android.util.DisplayMetrics().also { disp?.getRealMetrics(it) }
+            m.heightPixels
+        }.getOrDefault(0)
+        return com.portalpad.app.data.SavedSession(windows, System.currentTimeMillis(), canvasWidth, canvasHeight)
     }
 
     /**
@@ -570,29 +725,180 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         displayH: Int,
     ): Int {
         var launched = 0
+        // Don't relaunch apps already live on the display. On a physical replug the
+        // platform re-homes surviving apps itself; relaunching them here spawns a
+        // duplicate (e.g. a 2nd Chrome window behind the arranged ones). Only
+        // genuinely-missing apps get (re)launched; survivors are left for the
+        // caller to re-tile in place.
+        // Count how many instances of each package are already live on the
+        // display. A surviving window only "covers" ONE saved window of that
+        // package — so with two saved Chrome windows and one live Chrome, the
+        // second is still relaunched instead of being skipped as a duplicate.
+        // (The old set-of-package-names dedup collapsed same-package windows,
+        // silently dropping the 2nd Chrome on a resolution flap.)
+        val liveCounts = runCatching { listExternalTasks() }
+            .getOrDefault(emptyList())
+            .groupingBy { it.packageName }.eachCount().toMutableMap()
+        // Track how many windows of each package will exist as we go (survivors +
+        // what we relaunch). When this is already >0 for an app, a plain launch
+        // would refocus the existing window instead of making a new one, so we
+        // force a fresh task to actually recreate the duplicate window.
+        val established = liveCounts.toMutableMap()
         // `session.windows` is stored in `am stack list` order, which is
         // front-to-back (most-recently-focused first). Each launch comes up on
         // top, so to reproduce the original stacking we launch BACK-to-front:
         // reversed() puts the frontmost app last, leaving it on top.
         for (w in session.windows.reversed()) {
+            val survivors = liveCounts[w.packageName] ?: 0
+            if (survivors > 0) {
+                // A live instance already satisfies this saved window — leave it
+                // for the caller to re-tile in place; don't spawn a duplicate.
+                liveCounts[w.packageName] = survivors - 1
+                continue
+            }
             val bounds = if (w.right > w.left && w.bottom > w.top) w.bounds
             else WindowBounds.restored(displayW, displayH)
             val comp = w.component
+            // If this app already has a window (a survivor, or one relaunched
+            // earlier in this pass), force a new task so the duplicate appears
+            // instead of refocusing the existing one.
+            val needNewTask = (established[w.packageName] ?: 0) > 0
             val ok = runCatching {
                 if (!comp.isNullOrBlank()) {
-                    launchFreeform(comp, displayId, bounds)
+                    launchFreeform(comp, displayId, bounds, forceNewTask = needNewTask)
                 } else {
                     // No component recorded — resolve the package's launcher activity.
                     val pm = PortalPadApp.instance.packageManager
                     val intentComp = pm.getLaunchIntentForPackage(w.packageName)?.component?.flattenToShortString()
-                    if (intentComp != null) launchFreeform(intentComp, displayId, bounds) else false
+                    if (intentComp != null) launchFreeform(intentComp, displayId, bounds, forceNewTask = needNewTask) else false
                 }
             }.getOrDefault(false)
-            if (ok) launched++
+            if (ok) {
+                launched++
+                established[w.packageName] = (established[w.packageName] ?: 0) + 1
+            }
             // Small gap so each launch settles before the next (matches arrange).
             runCatching { Thread.sleep(120) }
         }
         return launched
+    }
+
+    /**
+     * Re-apply a saved session's window bounds to the LIVE tasks already on
+     * [displayId] — WITHOUT relaunching anything (so a playing video keeps
+     * playing). Used after a flap-recovery's move-first re-homes the apps: that
+     * preserves the live tasks but drops them in a default/minimized state, so
+     * this re-tiles them to the arrangement the user had before the disconnect.
+     *
+     * Matches each saved window to a running task by component (preferred) or
+     * package, greedily, so duplicate packages don't double-map. Returns the
+     * number of windows re-tiled.
+     */
+    fun retileToSaved(
+        session: com.portalpad.app.data.SavedSession,
+        displayId: Int,
+        displayW: Int,
+        displayH: Int,
+        // When true, a survivor stuck in FULLSCREEN mode is CLOSED and relaunched
+        // into freeform at its saved bounds — the only thing that reliably tiles it
+        // on this device (live resize/mode-change is ignored), at the cost of the
+        // app's live state. The move-first path passes false so a preserved live
+        // task (e.g. a playing video) is never killed.
+        relaunchFullscreen: Boolean = false,
+        // Scale factor applied to each saved bound before tiling. Used when
+        // restoring onto a canvas of a different size than the session was saved
+        // on (e.g. ultrawide → standard): scaling the SAVED bounds keeps targets
+        // inside the new canvas, so the platform never clamps an oversized target
+        // and we never have to re-read mangled bounds. 1f = no change.
+        scaleX: Float = 1f,
+        scaleY: Float = 1f,
+    ): Int {
+        if (!isReady) return 0
+        val live = runCatching { listExternalTasks() }.getOrDefault(emptyList())
+        if (live.isEmpty()) return 0
+        val used = HashSet<Int>()
+        var applied = 0
+        // Process BACK-to-front (reversed): session.windows is `am stack list`
+        // order = front-to-back, and every step here fronts the window it touches
+        // (a relaunch comes up on top; an in-place focus moves-to-front). Iterating
+        // back-to-front means the FRONTMOST window is handled last and ends on top,
+        // reproducing the original stacking — matching restoreSession's order.
+        // (Forward iteration fronted the backmost window last, inverting the stack.)
+        for (w in session.windows.reversed()) {
+            val task = live.firstOrNull { t ->
+                t.taskId !in used && (
+                    (!w.component.isNullOrBlank() && t.topActivity?.equals(w.component, ignoreCase = true) == true) ||
+                        t.packageName.equals(w.packageName, ignoreCase = true)
+                )
+            } ?: continue
+            used += task.taskId
+            val rawBounds = if (w.right > w.left && w.bottom > w.top) w.bounds
+            else WindowBounds.restored(displayW, displayH)
+            // Scale the saved bound to the live canvas when requested, clamped so it
+            // always stays a valid in-bounds rect (keeps a different-size restore
+            // from producing off-screen targets the platform would then clamp).
+            val bounds = if (scaleX != 1f || scaleY != 1f) {
+                val nl = (rawBounds.left * scaleX).toInt().coerceIn(0, (displayW - 1).coerceAtLeast(0))
+                val nt = (rawBounds.top * scaleY).toInt().coerceIn(0, (displayH - 1).coerceAtLeast(0))
+                val nr = (rawBounds.right * scaleX).toInt().coerceIn(nl + 1, displayW)
+                val nb = (rawBounds.bottom * scaleY).toInt().coerceIn(nt + 1, displayH)
+                WindowBounds(nl, nt, nr, nb)
+            } else rawBounds
+            val cur = task.bounds
+            // A survivor the platform re-homed in FULLSCREEN windowing mode fills
+            // the display and (proven on-device) ignores live resize + windowing-
+            // mode changes — it can't be tiled in place. Detect by full-display
+            // bounds (or unknown bounds).
+            val isFullscreen = cur == null || (
+                cur.left <= 2 && cur.top <= 2 &&
+                    cur.right >= displayW - 2 && cur.bottom >= displayH - 2
+            )
+            android.util.Log.d(
+                "PortalPadSleep",
+                "RECOVERY retile pkg=${task.packageName} task=${task.taskId} " +
+                    "cur=${cur?.let { "[${it.left},${it.top}][${it.right},${it.bottom}]" } ?: "null"} " +
+                    "target=[${bounds.left},${bounds.top}][${bounds.right},${bounds.bottom}] " +
+                    "fullscreen=$isFullscreen relaunch=${isFullscreen && relaunchFullscreen}",
+            )
+            if (isFullscreen && relaunchFullscreen) {
+                // Close + relaunch fresh into freeform. A brand-new --windowingMode 5
+                // task comes up freeform reliably (that's how every normal launch
+                // works here), so the resize inside launchFreeform actually sticks.
+                // (Tested alternatives — in-place resize, and a move-to-phone-and-back
+                // bounce — both FAILED to un-stick a re-homed fullscreen window on this
+                // device, and the bounce additionally spawned duplicate tasks. So the
+                // close+relaunch is the only reliable tiling path here. Its cost is that
+                // the relaunched window loses its in-app state, e.g. Chrome's page.)
+                val comp = w.component?.takeIf { it.isNotBlank() }
+                    ?: runCatching {
+                        PortalPadApp.instance.packageManager
+                            .getLaunchIntentForPackage(w.packageName)?.component?.flattenToShortString()
+                    }.getOrNull()
+                if (comp != null) {
+                    close(task.taskId)
+                    // Let the removal settle — also frees the window-cap slot so the
+                    // relaunch below isn't blocked by the max-windows check.
+                    runCatching { Thread.sleep(350) }
+                    runCatching { launchFreeform(comp, displayId, bounds) }
+                    applied++
+                    runCatching { Thread.sleep(120) }
+                    continue
+                }
+                // No launchable component — fall through to a best-effort in-place
+                // attempt (better than leaving it fullscreen, even if it won't stick).
+            }
+            // Already-freeform window (or in-place fallback): resize in place,
+            // preserving the app's live state.
+            setWindowingModeFreeform(task.taskId)
+            runCatching { Thread.sleep(120) }
+            runCatching { resize(task.taskId, bounds) }
+            clearMinimized(task.taskId)
+            focus(task.taskId)
+            applied++
+            runCatching { Thread.sleep(120) }
+        }
+        if (applied > 0) PortalPadApp.instance.signalWindowsChanged()
+        return applied
     }
 
 

@@ -141,6 +141,9 @@ class TrackpadActivity : PinnedDensityActivity() {
             }
         }.getOrDefault(true)
         setShowWhenLocked(showOverLock)
+        // Same as MainActivity: if the glasses attach while locked, prompt unlock —
+        // the desktop can't extend onto them until the phone is unlocked.
+        promptUnlockWhenDisplayAttachesLocked(enabled = showOverLock)
 
         val initialMode = intent.getStringExtra(EXTRA_MODE) ?: MODE_TRACKPAD
         setContent {
@@ -169,6 +172,13 @@ class TrackpadActivity : PinnedDensityActivity() {
             // Pending auto-finish; armed when the display goes null, cancelled if it
             // comes back within the grace window.
             var finishJob: kotlinx.coroutines.Job? = null
+            // When the display went null (elapsedRealtime). Lets a re-armed finish
+            // (after the activity was backgrounded mid-countdown and returned) wait
+            // only the REMAINING grace instead of a fresh full window — so coming
+            // back to a still-disconnected trackpad completes the return promptly
+            // rather than sitting on a stuck banner. Reset to 0 when the display
+            // returns. Lives in the outer launch scope so it survives stop/start.
+            var goneAt = 0L
             // A phone screen-off briefly drops the external display to null, then the
             // service's flap-recovery re-creates it (~3s in practice; see
             // PortalPadSleep "REBUILD-FLAP"). Without a grace window the trackpad
@@ -184,6 +194,7 @@ class TrackpadActivity : PinnedDensityActivity() {
                         // (Re)attached — the prior null was a flap, not an unplug.
                         finishJob?.cancel()
                         finishJob = null
+                        goneAt = 0L
                     } else if (sawDisplay) {
                         // ── ANR guard (synchronous, fastest path) ──
                         // The external display held window focus; with it gone, this
@@ -202,9 +213,20 @@ class TrackpadActivity : PinnedDensityActivity() {
                         // ever sets focusable=true, so it can't fight recovery,
                         // which hands focus back to the display via the watcher.)
                         setWindowFocusable(true)
-                        if (finishJob == null) {
+                        if (goneAt == 0L) goneAt = android.os.SystemClock.elapsedRealtime()
+                        // Re-arm if there's no LIVE finish pending. After the activity
+                        // was backgrounded mid-countdown, the old finishJob was
+                        // cancelled (not nulled) — so a `== null` check would wrongly
+                        // see it as still pending and never re-arm, leaving the banner
+                        // stuck. `isActive != true` covers null AND cancelled/done.
+                        if (finishJob?.isActive != true) {
                             finishJob = watcherScope.launch {
-                                kotlinx.coroutines.delay(goneGraceMs)
+                                // Only wait the grace time still remaining since the
+                                // display first went away — so returning after the
+                                // window already elapsed finishes right away.
+                                val elapsed = android.os.SystemClock.elapsedRealtime() - goneAt
+                                val remaining = (goneGraceMs - elapsed).coerceAtLeast(0L)
+                                kotlinx.coroutines.delay(remaining)
                                 // Re-check against the live value (the flow may not
                                 // re-emit while it stays null).
                                 if (app.externalDisplayId.value == null) {
@@ -533,6 +555,11 @@ private fun RestoreSessionOffer() {
         if (decided) return@LaunchedEffect
         decided = true
         val displayId = app.externalDisplayId.value ?: return@LaunchedEffect
+        // A flap auto-recovery (quick unplug/replug) is already restoring this
+        // session on the external display — don't pop a phone dialog asking to do
+        // what's already underway. Cold reconnects don't set this, so the offer
+        // still appears there.
+        if (app.isFlapRecovering()) return@LaunchedEffect
         // User can disable the auto-popup (manual Settings button still works).
         val offerEnabled = runCatching {
             app.prefs.bool(com.portalpad.app.data.PreferencesRepository.Keys.OFFER_RESTORE_ON_RECONNECT, default = true)
@@ -660,6 +687,7 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
     val isTrackpadMode = viewMode != com.portalpad.app.ui.trackpad.TrackpadViewMode.REMOTE
     var showAppDrawer by remember { mutableStateOf(false) }
     var showQuickWheel by remember { mutableStateOf(false) }
+    var showWindowWheel by remember { mutableStateOf(false) }
     // Quick Wheel ring contents (the bottom-bar drawer icon opens the wheel when
     // any slot is filled, else it falls straight through to the full drawer).
     val wheelSlots = app.prefs.wheelSlots.collectAsState(
@@ -1232,9 +1260,19 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
         // Click buttons only make sense in trackpad mode.
         if (isTrackpadMode) {
             Spacer(Modifier.height(10.dp))
+            // Arrange button only appears when desktop windows is on (nothing to
+            // arrange otherwise); the click buttons reflow to full width when off.
+            val desktopMode by app.prefs
+                .bool(com.portalpad.app.data.PreferencesRepository.Keys.DESKTOP_MODE_ENABLED, false)
+                .collectAsState(initial = false)
             TrackpadClickButtons(
                 onLeftClick = { injector.leftClick() },
                 onRightClick = { injector.rightClick() },
+                showArrange = desktopMode,
+                // Tap opens the radial window-actions menu (arrange evenly is its
+                // one-tap center). Long-press mirrors tap, so the gesture is gone.
+                onArrange = { showWindowWheel = true },
+                onArrangeLongPress = { showWindowWheel = true },
             )
         }
 
@@ -1443,6 +1481,12 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
         )
     }
 
+    if (showWindowWheel) {
+        com.portalpad.app.ui.trackpad.WindowRadialOverlay(
+            onDismiss = { showWindowWheel = false },
+        )
+    }
+
     longPressMenuTarget?.let { target ->
         ButtonLongPressMenu(
             target = target,
@@ -1472,6 +1516,18 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
             },
             onDismiss = { longPressMenuTarget = null },
         )
+    }
+
+    // When the external display disconnects, dismiss the radial + app-drawer
+    // overlays. They're Dialogs (their own window, above the activity) and they
+    // act on the external display's windows/apps — useless once it's gone — so
+    // otherwise they sit ON TOP of the DisconnectBanner below and hide it.
+    // Closing them lets the banner (rendered in the activity) come through.
+    androidx.compose.runtime.LaunchedEffect(externalDisplayId) {
+        if (externalDisplayId == null) {
+            showWindowWheel = false
+            showQuickWheel = false
+        }
     }
 
     // External-display disconnect banner. Purely visual: the actual return to the

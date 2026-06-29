@@ -95,6 +95,12 @@ app/src/main/java/com/portalpad/app/
 └── diag/                        -- in-app log viewer for troubleshooting
 ```
 
+## Installing
+
+PortalPad is distributed as a sideloaded APK, not through the Play Store, so the first time you install it **Google Play Protect will warn you** and may block the install ("app was blocked" or "unsafe app"). This is normal for any app installed outside the Play Store and isn't specific to PortalPad. To proceed, tap **More details → Install anyway** on the warning. If the install is blocked outright, open the Play Store → your profile icon → **Play Protect → Settings** and temporarily turn off "Scan apps with Play Protect," install PortalPad, then turn it back on.
+
+The APK is signed with a stable release key, so updates install over the top without uninstalling.
+
 ## Building
 
 The easiest way is **Android Studio**:

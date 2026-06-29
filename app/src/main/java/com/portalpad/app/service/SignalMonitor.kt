@@ -341,7 +341,14 @@ class SignalMonitor(private val context: Context) {
             addAction(android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED)
         }
         val r = object : android.content.BroadcastReceiver() {
-            override fun onReceive(c: Context?, i: android.content.Intent?) { recountBluetooth() }
+            override fun onReceive(c: Context?, i: android.content.Intent?) {
+                recountBluetooth()
+                // A device connected (e.g. the mouse turned on after the glasses
+                // were already up) — let the external mouse auto-resume if opted in.
+                if (i?.action == android.bluetooth.BluetoothDevice.ACTION_ACL_CONNECTED) {
+                    runCatching { com.portalpad.app.PortalPadApp.instance.btMouse.maybeAutoArm() }
+                }
+            }
         }
         btReceiver = r
         runCatching { context.registerReceiver(r, filter) }

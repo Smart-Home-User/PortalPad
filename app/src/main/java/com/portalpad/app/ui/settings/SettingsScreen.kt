@@ -2272,6 +2272,14 @@ private fun StartSetupPage(
         "yes" -> accessibilityEnabledNow
         else -> false
     }
+    // External mouse — a deliberate Yes/No the user must answer in setup. It grabs
+    // their physical mouse exclusively, so it shouldn't switch on silently. Unset
+    // ("") until they choose, so it blocks completion like the permission items; the
+    // answer drives EXT_MOUSE_ENABLED (the same pref the Controls toggle uses).
+    val mouseAnswer by app.prefs
+        .string(com.portalpad.app.data.PreferencesRepository.Keys.SETUP_MOUSE_ANSWER, "")
+        .collectAsState(initial = "")
+    val mouseResolved = mouseAnswer == "yes" || mouseAnswer == "no"
     val canContinue = overlayGranted && privilegeReady && secureOverlayOk == true &&
         notifResolved && voiceResolved && batteryResolved && phoneStateResolved &&
         accessibilityResolved
@@ -2402,8 +2410,9 @@ private fun StartSetupPage(
                 voiceResolved,
                 batteryResolved,
                 phoneStateResolved,
+                mouseResolved,
             ).count { it }
-            val total = 8
+            val total = 9
             val target = doneCount / total.toFloat()
             val animated by androidx.compose.animation.core.animateFloatAsState(
                 targetValue = target,
@@ -2967,6 +2976,49 @@ private fun StartSetupPage(
                             }
                         } else null,
                     )
+                }
+            }
+
+            SectionCard(title = "External mouse") {
+                Row(
+                    verticalAlignment = Alignment.Top,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    SetupAnswerIcon(mouseAnswer, mouseAnswer == "yes")
+                    Text(
+                        "Do you use a physical mouse with your external display?",
+                        color = AbOnSurface,
+                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+                Text(
+                    "Lets a Bluetooth or USB mouse drive the cursor on your external display, " +
+                        "even with the phone screen blanked. You can change this any time under " +
+                        "Controls. Pick No if you don't use one.",
+                    color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    SetupChoiceChip("Yes", selected = mouseAnswer == "yes") {
+                        scope.launch {
+                            app.prefs.setString(
+                                com.portalpad.app.data.PreferencesRepository.Keys.SETUP_MOUSE_ANSWER, "yes",
+                            )
+                            app.prefs.setBool(
+                                com.portalpad.app.data.PreferencesRepository.Keys.EXT_MOUSE_ENABLED, true,
+                            )
+                        }
+                    }
+                    SetupChoiceChip("No", selected = mouseAnswer == "no") {
+                        scope.launch {
+                            app.prefs.setString(
+                                com.portalpad.app.data.PreferencesRepository.Keys.SETUP_MOUSE_ANSWER, "no",
+                            )
+                            app.prefs.setBool(
+                                com.portalpad.app.data.PreferencesRepository.Keys.EXT_MOUSE_ENABLED, false,
+                            )
+                        }
+                    }
                 }
             }
 
@@ -4295,6 +4347,9 @@ private fun ButtonsTab(onPickHome: () -> Unit, onPickBack: () -> Unit, scrollToT
                     default = false,
                 )
             }
+            collapsible("External mouse (Beta)") {
+                ExternalMouseControls()
+            }
         }
         SectionCard(title = "Three-Finger Swipes") {
             Text(
@@ -4572,6 +4627,133 @@ private fun RequirementBadge(req: Requirement) {
  * The actual hide/show logic lives in PortalPadForegroundService; this is just the
  * controls.
  */
+@Composable
+private fun ExternalMouseControls() {
+    val app = PortalPadApp.instance
+    val scope = rememberCoroutineScope()
+    val keys = PreferencesRepository.Keys
+
+    Text(
+        "Use a physical mouse \u2014 Bluetooth or USB \u2014 to drive the cursor on your " +
+            "external display. Move, click, right-click, scroll, and drag to move or " +
+            "select. Works with the screen blanked via Extinguish.",
+        color = AbOnSurfaceMuted,
+        style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+    )
+
+    // Enable + status. The toggle reflects the persisted opt-in (which also
+    // drives auto-resume on display/Bluetooth connect); enable()/disable() apply
+    // it immediately. Initial mirrors live state so an already-armed session reads
+    // correctly on open.
+    val mouseOn by app.prefs.bool(keys.EXT_MOUSE_ENABLED, false)
+        .collectAsState(initial = app.btMouse.running)
+    var status by remember { mutableStateOf(app.btMouse.lastStatus) }
+    val grab by app.prefs.bool(keys.EXT_MOUSE_GRAB, true).collectAsState(initial = true)
+
+    val statusLabel = when {
+        !mouseOn -> "Off"
+        status.startsWith("OK") ->
+            if (status.contains("grab=OK")) "Connected \u2014 pointer grabbed"
+            else "Connected \u2014 shared (grab off)"
+        else -> status
+    }
+
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text("Enable", color = AbOnSurface, style = MaterialTheme.typography.bodyLarge)
+            Text(statusLabel, color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodySmall)
+        }
+        Spacer(Modifier.width(12.dp))
+        Switch(
+            checked = mouseOn,
+            onCheckedChange = { on ->
+                scope.launch { app.prefs.setBool(keys.EXT_MOUSE_ENABLED, on) }
+                status = if (on) app.btMouse.enable(grab) else { app.btMouse.disable(); "stopped" }
+            },
+        )
+    }
+
+    // Sensitivity
+    val sens by app.prefs.float(keys.EXT_MOUSE_SENSITIVITY, 2.5f).collectAsState(initial = 2.5f)
+    Text(
+        "Mouse sensitivity: ${"%.1f".format(sens)}\u00d7",
+        color = AbOnSurfaceMuted,
+        style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier.padding(horizontal = 8.dp),
+    )
+    Slider(
+        value = sens,
+        onValueChange = { v -> scope.launch { app.prefs.setFloat(keys.EXT_MOUSE_SENSITIVITY, v) } },
+        valueRange = 0.5f..6f,
+        colors = sliderColors(),
+        modifier = Modifier.padding(horizontal = 8.dp),
+    )
+
+    // Scroll speed
+    val scrollSpd by app.prefs.float(keys.EXT_MOUSE_SCROLL_SPEED, 1.0f).collectAsState(initial = 1.0f)
+    Text(
+        "Scroll speed: ${"%.2f".format(scrollSpd)}\u00d7",
+        color = AbOnSurfaceMuted,
+        style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier.padding(horizontal = 8.dp),
+    )
+    Slider(
+        value = scrollSpd,
+        onValueChange = { v -> scope.launch { app.prefs.setFloat(keys.EXT_MOUSE_SCROLL_SPEED, v) } },
+        valueRange = 0.25f..4f,
+        colors = sliderColors(),
+        modifier = Modifier.padding(horizontal = 8.dp),
+    )
+
+    // Reverse scroll direction
+    ToggleRowWithDesc(
+        label = "Reverse scroll direction",
+        desc = "Flip the wheel direction if your mouse scrolls the opposite way.",
+        key = keys.EXT_MOUSE_NATURAL_SCROLL,
+        default = false,
+    )
+
+    // Exclusive grab — re-applies immediately if the mouse is on.
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text("Exclusive grab", color = AbOnSurface, style = MaterialTheme.typography.bodyLarge)
+            Text(
+                "Capture the mouse so only the external cursor moves. Turn off if your " +
+                    "device won't grab, or to keep using the mouse on the phone too.",
+                color = AbOnSurfaceMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        Spacer(Modifier.width(12.dp))
+        Switch(
+            checked = grab,
+            onCheckedChange = { on ->
+                scope.launch { app.prefs.setBool(keys.EXT_MOUSE_GRAB, on) }
+                if (mouseOn) status = app.btMouse.enable(on)
+            },
+        )
+    }
+
+    // Reconnect — re-runs discovery (the device's event node can change).
+    androidx.compose.material3.TextButton(
+        onClick = { if (mouseOn) status = app.btMouse.enable(grab) },
+        modifier = Modifier.padding(horizontal = 4.dp),
+    ) {
+        Text(if (mouseOn) "Reconnect" else "Reconnect (enable first)")
+    }
+}
+
 @Composable
 private fun MediaCursorHideSection() {
     val app = PortalPadApp.instance

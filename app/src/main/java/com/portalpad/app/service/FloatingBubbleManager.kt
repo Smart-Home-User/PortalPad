@@ -20,6 +20,8 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.graphics.toColorInt
 import com.portalpad.app.MainActivity
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import com.portalpad.app.PortalPadApp
 import com.portalpad.app.R
 import com.portalpad.app.TrackpadActivity
@@ -172,9 +174,9 @@ class FloatingBubbleManager(private val context: Context) {
                 MotionEvent.ACTION_UP -> {
                     handler.removeCallbacks(longPressRunnable)
                     if (!moved && !longPressFired) {
-                        // simple tap → open trackpad
+                        // simple tap → resume where the user left off (see launchFromBubbleTap)
                         runCatching { PortalPadApp.instance.injector.buzz(longPress = false) }
-                        launchTrackpad(TrackpadActivity.MODE_TRACKPAD)
+                        launchFromBubbleTap()
                     } else if (moved) {
                         snapToNearestEdge(view, params)
                     }
@@ -309,6 +311,44 @@ class FloatingBubbleManager(private val context: Context) {
             runCatching { windowManager.removeView(it) }
         }
         menuView = null
+    }
+
+    /**
+     * Tapping the bubble resumes where the user left off, context-aware:
+     *  - No external display attached → open the app's home screen (MainActivity).
+     *    A trackpad/air-mouse/remote surface would control nothing without the
+     *    display, and launching the trackpad on the phone just flashes the
+     *    "Restore last session?" prompt before the activity self-closes.
+     *  - External display attached → reopen the LAST interface the user was in
+     *    (Remote if they were last in Remote, otherwise Trackpad — which itself
+     *    restores the last Trackpad/Air-Mouse tab), so they resume immediately.
+     */
+    private fun launchFromBubbleTap() {
+        val app = PortalPadApp.instance
+        val resolved = runCatching { app.resolveLiveExternalDisplayId() }.getOrNull()
+        val hasDisplay = resolved != null
+        android.util.Log.d(
+            "PortalPadBubble",
+            "tap: resolvedExternalDisplay=$resolved cached=${app.externalDisplayId.value} " +
+                "→ ${if (hasDisplay) "resume-interface" else "open-home"}",
+        )
+        if (!hasDisplay) {
+            launchSettings() // MainActivity = app home / connect screen
+            return
+        }
+        val wasRemote = runCatching {
+            kotlinx.coroutines.runBlocking {
+                app.prefs.bool(
+                    com.portalpad.app.data.PreferencesRepository.Keys.LAST_MODE_WAS_REMOTE,
+                    default = false,
+                ).first()
+            }
+        }.getOrDefault(false)
+        // Rebuild the external session before launching — the service may have
+        // outlived the last activity (recents-swipe) and left it half-wired, which
+        // makes a freshly launched interface flash on the glasses and die.
+        runCatching { PortalPadForegroundService.instance?.reconcileExternalForBubbleLaunch() }
+        launchTrackpad(if (wasRemote) TrackpadActivity.MODE_MEDIA else TrackpadActivity.MODE_TRACKPAD)
     }
 
     private fun launchTrackpad(mode: String) {

@@ -6,6 +6,7 @@ import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.os.Binder
 import android.os.IBinder
+import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
@@ -147,6 +148,30 @@ class ShellUserService : IShellService.Stub {
             event.recycle()
         } catch (t: Throwable) {
             Log.e(TAG, "Inject failed", t)
+        }
+    }
+
+    override fun injectScroll(x: Float, y: Float, vScroll: Float, hScroll: Float, displayId: Int) {
+        if (reflectionBroken) return
+        val now = SystemClock.uptimeMillis()
+        val props = MotionEvent.PointerProperties().apply {
+            id = 0; toolType = MotionEvent.TOOL_TYPE_MOUSE
+        }
+        val coords = MotionEvent.PointerCoords().apply {
+            this.x = x; this.y = y
+            setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll)
+            if (hScroll != 0f) setAxisValue(MotionEvent.AXIS_HSCROLL, hScroll)
+        }
+        try {
+            val event = MotionEvent.obtain(
+                now, now, MotionEvent.ACTION_SCROLL, 1, arrayOf(props), arrayOf(coords),
+                0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_MOUSE, 0,
+            )
+            setDisplayId(event, displayId)
+            injectInputEventMethod?.invoke(inputManager, event, injectModeAsync)
+            event.recycle()
+        } catch (t: Throwable) {
+            Log.e(TAG, "Scroll inject failed", t)
         }
     }
 
@@ -1327,6 +1352,28 @@ class ShellUserService : IShellService.Stub {
 
     // ─── Task management ────────────────────────────────────────────────
 
+    override fun moveTaskToDisplay(taskId: Int, displayId: Int): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val atm = Class.forName("android.app.ActivityTaskManager")
+                .getMethod("getService").invoke(null) ?: return false
+            for (methodName in listOf("moveRootTaskToDisplay", "moveStackToDisplay", "moveTaskToDisplay")) {
+                runCatching {
+                    val m = atm.javaClass.getMethod(methodName, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                    m.invoke(atm, taskId, displayId)
+                    Log.d(TAG, "moveTaskToDisplay: $methodName ok task=$taskId display=$displayId")
+                    return@moveTaskToDisplay true
+                }
+            }
+            Log.w(TAG, "moveTaskToDisplay: no working method for task=$taskId display=$displayId")
+            false
+        } catch (t: Throwable) {
+            Log.e(TAG, "moveTaskToDisplay failed task=$taskId display=$displayId", t); false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
     override fun moveFocusedTaskToDisplay(displayId: Int): Boolean {
         val id = Binder.clearCallingIdentity()
         return try {
@@ -1666,13 +1713,127 @@ class ShellUserService : IShellService.Stub {
         logcatThread = null
     }
 
+    // ─── Physical mouse capture (Phase 1) ───────────────────────────────
+    @Volatile private var mouseFd: Int = -1
+    @Volatile private var mouseWriteFd: Int = -1
+    @Volatile private var mouseThread: Thread? = null
+
+    override fun startMouseCapture(grab: Boolean, nativeLibDir: String?, writeEnd: ParcelFileDescriptor?): String {
+        // One session at a time — tear down any prior capture first.
+        stopMouseCapture()
+        if (writeEnd == null) return "ERR no-pipe"
+        if (!NativeMouse.ensureLoaded(nativeLibDir)) {
+            runCatching { writeEnd.close() }
+            return "ERR native-lib-not-loaded: ${NativeMouse.loadError}"
+        }
+        val path = findMouseEventPath()
+        if (path == null) {
+            runCatching { writeEnd.close() }
+            return "ERR no-mouse-found"
+        }
+        val fd = NativeMouse.nativeOpen(path)
+        if (fd < 0) {
+            runCatching { writeEnd.close() }
+            return "ERR open device=$path errno=${-fd}"
+        }
+        val grabResult = if (grab) NativeMouse.nativeGrab(fd) else 0
+        // Take ownership of the write fd so it outlives this binder call.
+        val wfd = writeEnd.detachFd()
+        mouseFd = fd
+        mouseWriteFd = wfd
+        val t = Thread({
+            val reason = runCatching { NativeMouse.nativeRunLoop(fd, wfd) }.getOrDefault(-1)
+            Log.i(TAG, "mouse read loop ended reason=$reason")
+            runCatching { NativeMouse.nativeUngrabClose(fd) }
+            runCatching { android.os.ParcelFileDescriptor.adoptFd(wfd).close() }
+            if (mouseFd == fd) { mouseFd = -1; mouseWriteFd = -1; mouseThread = null }
+        }, "PortalPadMouseLoop")
+        t.isDaemon = true
+        mouseThread = t
+        t.start()
+
+        val grabStr = when {
+            !grab -> "skipped"
+            grabResult == 0 -> "OK"
+            else -> "FAILED(errno=${-grabResult})"
+        }
+        val status = "OK device=$path grab=$grabStr"
+        Log.i(TAG, "startMouseCapture → $status")
+        return status
+    }
+
+    override fun stopMouseCapture() {
+        if (mouseFd == -1 && mouseThread == null) return
+        runCatching { NativeMouse.nativeStop() }
+        runCatching { mouseThread?.join(500) }
+        mouseThread = null
+        mouseFd = -1
+        mouseWriteFd = -1
+    }
+
+    /**
+     * Find a connected physical pointer device.
+     *
+     * We parse `getevent -pl` rather than /proc/bus/input/devices because Samsung's
+     * SELinux policy denies the shell domain read access to that proc file (it
+     * returns EACCES), while `getevent` is permitted. A mouse advertises REL_X and
+     * REL_Y; keyboards and touchpads don't, so requiring both cleanly selects the
+     * pointer node of a combo keyboard+mouse device (leaving the keyboard node
+     * ungrabbed). The eventN number isn't stable across reboots, so we always
+     * resolve it fresh.
+     *
+     * `getevent -pl` output looks like:
+     *   add device 1: /dev/input/event12
+     *     name:     "X1 keyboard Mouse"
+     *     events:
+     *       KEY (0001): BTN_MOUSE  BTN_RIGHT  BTN_MIDDLE
+     *       REL (0002): REL_X  REL_Y  REL_WHEEL  REL_WHEEL_HI_RES
+     */
+    private fun findMouseEventPath(): String? {
+        val out = runCatching {
+            val p = ProcessBuilder("getevent", "-pl")
+                .redirectErrorStream(true)
+                .start()
+            val text = p.inputStream.bufferedReader().readText()
+            runCatching { p.waitFor() }
+            text
+        }.getOrNull() ?: return null
+
+        var curPath: String? = null
+        var curHasRelX = false
+        var curHasRelY = false
+
+        fun matches(): String? =
+            if (curPath != null && curHasRelX && curHasRelY) curPath else null
+
+        for (raw in out.lineSequence()) {
+            val line = raw.trim()
+            val dev = Regex("add device \\d+:\\s*(/dev/input/event\\d+)").find(line)
+            if (dev != null) {
+                // New device block starts — check the one we just finished.
+                matches()?.let { return it }
+                curPath = dev.groupValues[1]
+                curHasRelX = false
+                curHasRelY = false
+                continue
+            }
+            if (curPath != null && line.startsWith("REL")) {
+                if (line.contains("REL_X")) curHasRelX = true
+                if (line.contains("REL_Y")) curHasRelY = true
+            }
+        }
+        return matches()
+    }
+
     companion object {
         private const val TAG = "ShellUserService"
-        /** Strict allowlist — silences everything except PortalPad tags. */
-        private const val DEFAULT_LOGCAT_FILTER =
-            "PortalPad:V InputInjector:V CursorOverlay:V DockOverlay:V " +
-                "PortalPadFgService:V PortalPadA11y:V ShellInputBridge:V " +
-                "ShellUserService:V ShizukuClickBackend:V AirGlassesSession:V " +
-                "Gesture:V AndroidRuntime:E VDMirror:V Screenshot:V *:S"
+        /**
+         * Strict allowlist — silences everything except PortalPad's own tags.
+         * Built from the shared [com.portalpad.app.diag.LogTags.PORTALPAD_TAGS]
+         * so it can't drift from the root-path filter; AndroidRuntime:E keeps
+         * crash stacks, *:S silences all other apps' logs.
+         */
+        private val DEFAULT_LOGCAT_FILTER =
+            com.portalpad.app.diag.LogTags.PORTALPAD_TAGS + "AndroidRuntime:E *:S"
     }
 }

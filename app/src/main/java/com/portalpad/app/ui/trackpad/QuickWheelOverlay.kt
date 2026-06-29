@@ -120,6 +120,7 @@ fun QuickWheelOverlay(
         Box(
             Modifier
                 .fillMaxSize()
+                .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.45f))
                 .navigationBarsPadding()
                 .pointerInput(Unit) { detectTapGestures { onDismiss() } },
             contentAlignment = Alignment.BottomCenter,
@@ -214,8 +215,14 @@ fun QuickWheelOverlay(
                                 detectTapGestures(
                                     onTap = {
                                         when {
-                                            slot == null -> onAssignSlot(i)
-                                            preview == i -> onLaunchSlot(slot)   // 2nd tap → launch
+                                            slot == null -> {
+                                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                onAssignSlot(i)
+                                            }
+                                            preview == i -> {                    // 2nd tap → launch
+                                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                onLaunchSlot(slot)
+                                            }
                                             else -> {                            // 1st tap → latch name
                                                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                                 preview = i

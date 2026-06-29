@@ -841,6 +841,43 @@ class InputInjector(
         }
     }
 
+    /**
+     * Mouse-wheel scroll via a discrete ACTION_SCROLL event at the cursor — no
+     * fling/momentum, unlike [scrollPixels]'s swipe. [vNotches] +1 = up.
+     */
+    fun wheelScroll(vNotches: Float) = safe {
+        val be = PortalPadApp.instance.activeBoundBackend ?: return@safe
+        if (!be.isReady) return@safe
+        be.injectScroll(cursorX, cursorY, vNotches, 0f, displayId)
+    }
+
+    /**
+     * Scroll by an explicit pixel delta from the cursor, WITHOUT the trackpad's
+     * scrollSpeed / invertScroll (the external mouse manages its own speed and
+     * direction). A positive [dy] swipes the finger downward, which scrolls page
+     * content UP (toward the top) — matching a standard mouse wheel-up.
+     */
+    fun scrollPixels(dx: Float, dy: Float) = safe {
+        val cx = cursorX.toInt(); val cy = cursorY.toInt()
+        val endX = (cx + dx).toInt().coerceIn(0, displayWidth - 1)
+        val endY = (cy + dy).toInt().coerceIn(0, displayHeight - 1)
+        val travel = kotlin.math.hypot((endX - cx).toDouble(), (endY - cy).toDouble())
+        if (travel < 8.0) return@safe
+        when (val backend = PortalPadApp.instance.clickBackend) {
+            is ClickBackend.ShizukuUserService -> {
+                if (!backend.backend.isReady) return@safe
+                backend.backend.swipe(
+                    displayId, cx.toFloat(), cy.toFloat(),
+                    endX.toFloat(), endY.toFloat(), durationMs = 80L,
+                )
+            }
+            is ClickBackend.Shell -> {
+                if (!backend.access.isReady) return@safe
+                backend.access.execShell("input ${displayFlag()}swipe $cx $cy $endX $endY 80")
+            }
+        }
+    }
+
     // ── Remote D-pad "Scroll" mode ────────────────────────────────────────
     // In Scroll mode the remote's D-pad arrows fire a directional swipe anchored
     // at the centre of the external display (for apps that ignore D-pad keys),
@@ -1023,6 +1060,40 @@ class InputInjector(
                     "inject=${(doneNs - startNs) / 1_000_000}ms " +
                     "total=${(doneNs - tapNs) / 1_000_000}ms",
             )
+        }
+    }
+
+    /**
+     * Inject a raw hardware-keyboard key edge on the external display for the
+     * physical-keyboard relay (the combo device captured by the mouse pipeline).
+     * Forwards the literal DOWN/UP and [metaState] (Shift/Ctrl/Alt) so capitals,
+     * symbols and chords compose. No haptic (unlike pressKey — this fires once per
+     * keystroke), no IME re-pin. No-op when there's no external display.
+     */
+    fun injectKeyEvent(keycode: Int, down: Boolean, metaState: Int) = safe {
+        val targetDisplay = displayId
+        if (targetDisplay != 0) {
+            val action = if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP
+            keyExecutor.execute {
+                try {
+                    when (val backend = PortalPadApp.instance.clickBackend) {
+                        is ClickBackend.ShizukuUserService -> {
+                            if (backend.backend.isReady) {
+                                backend.backend.injectKey(keycode, action, metaState, targetDisplay)
+                            }
+                        }
+                        is ClickBackend.Shell -> {
+                            // Shell `input keyevent` can't carry meta or split down/up;
+                            // emit a plain press on DOWN only (degraded fallback).
+                            if (down && access.isReady) {
+                                access.execShell("input ${displayFlag()}keyevent $keycode")
+                            }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "injectKeyEvent failed keycode=$keycode down=$down", t)
+                }
+            }
         }
     }
 
