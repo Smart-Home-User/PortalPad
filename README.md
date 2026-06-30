@@ -4,6 +4,12 @@ PortalPad turns your Android phone into a **trackpad, air mouse, and TV-style re
 
 It's built with Jetpack Compose, and uses Android's Virtual Display plus Shizuku (or root) to inject input and manage the external display.
 
+![PortalPad's phone interface: Start / Workspace / Controls, plus the Trackpad and Remote modes](docs/images/PortalPadSetupTrackPadRemoteInterface.webp)
+
+![The external display: top bar, customizable wallpaper, and the macOS-style dock](docs/images/ExternalDisplayDescriptions.webp)
+
+![Desktop windows tiled on an ultrawide external display: arrange evenly, arrange in order, stack, and more](docs/images/PortalPadUltrawideTiled.webp)
+
 ## Requirements
 
 - **A compatible Android device with USB-C DisplayPort Alt Mode** (Android 11 / API 30 or newer). This is what lets the phone drive an external display. Most AR glasses appear to the phone as a normal USB-C DisplayPort screen. Performance varies by device.
@@ -18,6 +24,8 @@ Connect an external display (or pair AR glasses), and PortalPad gives you three 
 - **Air Mouse** — point and move the cursor by tilting the phone (uses the gyroscope; sensitivity and smoothing are adjustable).
 - **Remote** — a D-pad with OK/select, media controls (play/pause, next/previous, rewind/fast-forward), volume up/down with a live level, and four buttons you can program.
 
+You can also connect a **physical Bluetooth or USB mouse** to drive the cursor on the external display directly.
+
 On the external display itself, there's a dock (like the macOS dock) for launching apps, organizing them into folders, and renaming them. A searchable app drawer on the phone lets you add any installed app to that dock.
 
 ## Features
@@ -25,6 +33,7 @@ On the external display itself, there's a dock (like the macOS dock) for launchi
 **Input and control**
 
 - Three input modes (Trackpad, Air Mouse, Remote) in one app, switchable from the top bar.
+- **Physical mouse support** — connect a Bluetooth or USB mouse to move the cursor and click on the external display directly.
 - Adjustable input feel: cursor speed, scroll speed, scroll direction, and air-mouse sensitivity, smoothing, and axis inversion.
 - A bottom row of Back / Home / App Drawer buttons. Long-pressing Home offers "Recenter cursor."
 - Four programmable buttons on the Remote tab. Long-press one to assign an app, activity, or shortcut to launch, or to rename it. Unassigned, a button does nothing when tapped.
@@ -40,13 +49,22 @@ On the external display itself, there's a dock (like the macOS dock) for launchi
 
 **Window management** (desktop-windows mode)
 
-- Controls run from a top bar on the external display, with phone-side lists for precision:
-  - **Maximize** — pick any open window from a list on the phone to bring it full-screen and to the front.
-  - **Minimize** — pick windows from a list to minimize, one at a time.
-  - **Stack** — gather every open window into a neat cascade in one spot.
-- Plus per-window tiling and minimize/restore.
+- A top bar on the external display, plus a **radial menu** you can open from the Trackpad and Air Mouse interfaces (right-click), give you quick window actions:
+  * **Arrange evenly** — tile every open window into even columns.
+  * **Arrange in order** — tile windows in a chosen order.
+  * **Stack** — gather every open window into a neat cascade in one spot.
+  * **Maximize / Minimize / Close** — maximize a window to the front, minimize windows one at a time, or close them.
+- A window maximized from its title bar (Android's caption bar) joins the layout when you arrange or stack, instead of staying maximized in the background.
+- Phone-side lists are available for precision when you'd rather pick from a list than work on the display.
 - On the dock itself, an **open-windows bar** and a **minimized-windows bar** appear just above the dock while you're running windows. Tap either to expand a list on the external display — focus or close an open window, or restore a minimized one — without reaching for the phone. The two bars sit side by side when there's room and stack otherwise.
+- **Per-resolution window memory** — PortalPad remembers your window layout per display resolution, so switching between standard and ultrawide keeps each layout intact.
 - **Session save/restore** — PortalPad can remember your open windows and their positions, then reopen and re-arrange them after a disconnect or restart. It offers this on reconnect, from a top-bar button, or from Settings.
+
+**Customizable external display**
+
+- Set a **wallpaper** for standard and ultrawide resolutions independently (8 presets for standard, 2 for ultrawide, or upload your own for either). The matching wallpaper is shown automatically based on the detected resolution.
+- Customize the top-bar and dock background colors, plus custom folder icons.
+- The top bar auto-hides after a few seconds (adjustable up to 30s, or always-on); move the cursor to the top to bring it back.
 
 **Typing on the external screen**
 
@@ -60,7 +78,7 @@ On the external display itself, there's a dock (like the macOS dock) for launchi
 
 - **Cleaner external display** — PortalPad shows the external screen through its own virtual-display layer. The practical payoff: dropdowns (like Chrome's address-bar suggestions) and on-screen menus keep working correctly on the external screen as you move the cursor, instead of glitching or jumping back to the phone.
 - **Screen-off control (Extinguish)** — the power button on the Air Mouse, Trackpad, and Remote screens turns the phone's screen off while keeping the external display running (works with the Extinguish app).
-- **Screenshot button** — captures the external display and saves it for sharing.
+- **Screenshot and screen recording** — tap the capture button to screenshot the external display, or long-press to screen-record it.
 - **Smooth connect/disconnect** — a brief cover hides the attach/detach so it looks like a clean transition instead of a flash.
 
 ## How input works (Shizuku or root)
@@ -80,7 +98,7 @@ app/src/main/java/com/portalpad/app/
 ├── TrackpadActivity.kt          -- the full-screen Trackpad / Air Mouse / Remote UI
 ├── KeyboardRelayActivity.kt     -- the phone-side typing relay
 ├── ui/
-│   ├── trackpad/                -- trackpad surface, top bar, app drawer, scroll bar
+│   ├── trackpad/                -- trackpad surface, top bar, app drawer, scroll bar, radial menu
 │   ├── mediacontrols/           -- Remote tab: D-pad, media controls, volume, color buttons
 │   ├── dock/                    -- external-display dock, edit menus, rename, folders
 │   ├── settings/                -- settings tabs (Start/Setup, Display, Controls, Permissions, System)
@@ -88,18 +106,14 @@ app/src/main/java/com/portalpad/app/
 │   ├── common/                  -- shared UI pieces
 │   └── theme/                   -- Material 3 theme + brand colors (amber + violet)
 ├── service/                     -- foreground service, input injector, Shizuku backend,
-│                                   floating controls, air-mouse controller
-├── presentation/                -- overlays drawn on the external display (cursor, dock, nav)
+│                                   floating controls, air-mouse + physical-mouse controllers
+├── presentation/                -- overlays drawn on the external display (cursor, dock, nav,
+│                                   window arranger)
 ├── shizuku/                     -- Shizuku connection + service binding
 ├── data/                        -- saved preferences, dock model, backup/restore
-└── diag/                        -- in-app log viewer for troubleshooting
+├── diag/                        -- in-app log viewer for troubleshooting
+└── cpp/                         -- native helper for low-level mouse input
 ```
-
-## Installing
-
-PortalPad is distributed as a sideloaded APK, not through the Play Store, so the first time you install it **Google Play Protect will warn you** and may block the install ("app was blocked" or "unsafe app"). This is normal for any app installed outside the Play Store and isn't specific to PortalPad. To proceed, tap **More details → Install anyway** on the warning. If the install is blocked outright, open the Play Store → your profile icon → **Play Protect → Settings** and temporarily turn off "Scan apps with Play Protect," install PortalPad, then turn it back on.
-
-The APK is signed with a stable release key, so updates install over the top without uninstalling.
 
 ## Building
 
@@ -130,7 +144,7 @@ Most of these are optional and only asked for when you use the related feature.
 - `RECORD_AUDIO` — optional; voice search from the dock.
 - `CAMERA` — optional; toggles the phone's flashlight from the remote. (Android routes the flashlight through the camera permission; no photos are taken.)
 - `READ_PHONE_STATE` — optional; shows your mobile network type (5G/LTE) in the status area.
-- `BLUETOOTH` / `BLUETOOTH_CONNECT` — optional; counts connected Bluetooth devices for the status menu.
+- `BLUETOOTH` / `BLUETOOTH_CONNECT` — optional; counts connected Bluetooth devices for the status menu, and supports a connected Bluetooth mouse.
 - `RECEIVE_BOOT_COMPLETED` — optional; auto-starts the service after a reboot.
 - `ACCESS_NETWORK_STATE` — reads connectivity for the Wi-Fi/mobile status icons.
 - `WAKE_LOCK` — keeps the connection alive while driving the external display.
@@ -141,6 +155,7 @@ Most of these are optional and only asked for when you use the related feature.
 ## Known limitations
 
 - **DRM-protected streaming** (Netflix HD, Hulu, etc.) won't play on the external display. These services require HDCP-protected output, which PortalPad's virtual-display layer can't provide. Workaround: use your phone's normal screen-mirroring for DRM video.
+- **Switching resolutions relaunches fullscreen windows** — when the display re-enumerates on a resolution/aspect change, windows running fullscreen are closed and relaunched into place, which can lose in-app state (for example, the current page in a browser tab).
 
 ## License
 
