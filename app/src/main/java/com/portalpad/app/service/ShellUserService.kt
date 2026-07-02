@@ -288,6 +288,166 @@ class ShellUserService : IShellService.Stub {
         injectInternal(MotionEvent.ACTION_UP, ex, ey, displayId, now, now + durationMs, InputDevice.SOURCE_TOUCHSCREEN, 0)
     }
 
+    override fun injectPinch(
+        displayId: Int, cx: Float, cy: Float, startSpan: Float, endSpan: Float, durationMs: Long,
+    ) {
+        if (reflectionBroken) return
+        val now = SystemClock.uptimeMillis()
+        val src = InputDevice.SOURCE_TOUCHSCREEN
+        val props = arrayOf(
+            MotionEvent.PointerProperties().apply { id = 0; toolType = MotionEvent.TOOL_TYPE_FINGER },
+            MotionEvent.PointerProperties().apply { id = 1; toolType = MotionEvent.TOOL_TYPE_FINGER },
+        )
+        fun coordsFor(span: Float): Array<MotionEvent.PointerCoords> {
+            val half = span / 2f
+            return arrayOf(
+                MotionEvent.PointerCoords().apply { x = cx - half; y = cy; pressure = 1f; size = 1f },
+                MotionEvent.PointerCoords().apply { x = cx + half; y = cy; pressure = 1f; size = 1f },
+            )
+        }
+        fun send(action: Int, pointerCount: Int, eventTime: Long, c: Array<MotionEvent.PointerCoords>) {
+            try {
+                val ev = MotionEvent.obtain(
+                    now, eventTime, action, pointerCount,
+                    props.copyOfRange(0, pointerCount), c.copyOfRange(0, pointerCount),
+                    0, 0, 1f, 1f, 0, 0, src, 0,
+                )
+                setDisplayId(ev, displayId)
+                injectInputEventMethod?.invoke(inputManager, ev, injectModeAsync)
+                ev.recycle()
+            } catch (t: Throwable) {
+                Log.e(TAG, "injectPinch send failed (action=$action)", t)
+            }
+        }
+        val startC = coordsFor(startSpan)
+        // First pointer down, then the second (ACTION_POINTER_DOWN carries the
+        // new pointer's index in the high bits).
+        send(MotionEvent.ACTION_DOWN, 1, now, startC)
+        send(
+            MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+            2, now, startC,
+        )
+        val steps = (durationMs / 16L).coerceAtLeast(2L)
+        for (i in 1..steps) {
+            val t = i.toFloat() / steps.toFloat()
+            val span = startSpan + (endSpan - startSpan) * t
+            try { Thread.sleep(durationMs / steps) } catch (_: InterruptedException) { break }
+            send(MotionEvent.ACTION_MOVE, 2, now + (durationMs * i / steps), coordsFor(span))
+        }
+        val endC = coordsFor(endSpan)
+        send(
+            MotionEvent.ACTION_POINTER_UP or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+            2, now + durationMs, endC,
+        )
+        send(MotionEvent.ACTION_UP, 1, now + durationMs, endC)
+    }
+
+    // ─── Continuous pinch (stateful: gesture held open across calls) ─────────
+    private val pinchLock = Any()
+    @Volatile private var pinchActive = false
+    @Volatile private var pinchDeadline = 0L
+    @Volatile private var pinchLastSpan = 0f
+    private var pinchDownTime = 0L
+    private var pinchDisplayId = 0
+    private var pinchCx = 0f
+    private var pinchCy = 0f
+    private val pinchWatchdogMs = 500L
+    private val pinchWatchdogRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val pinchProps = arrayOf(
+        MotionEvent.PointerProperties().apply { id = 0; toolType = MotionEvent.TOOL_TYPE_FINGER },
+        MotionEvent.PointerProperties().apply { id = 1; toolType = MotionEvent.TOOL_TYPE_FINGER },
+    )
+
+    private fun pinchInject(action: Int, pointerCount: Int, eventTime: Long, span: Float) {
+        try {
+            val half = span / 2f
+            val coords = arrayOf(
+                MotionEvent.PointerCoords().apply { x = pinchCx - half; y = pinchCy; pressure = 1f; size = 1f },
+                MotionEvent.PointerCoords().apply { x = pinchCx + half; y = pinchCy; pressure = 1f; size = 1f },
+            )
+            val ev = MotionEvent.obtain(
+                pinchDownTime, eventTime, action, pointerCount,
+                pinchProps.copyOfRange(0, pointerCount), coords.copyOfRange(0, pointerCount),
+                0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0,
+            )
+            setDisplayId(ev, pinchDisplayId)
+            injectInputEventMethod?.invoke(inputManager, ev, injectModeAsync)
+            ev.recycle()
+        } catch (t: Throwable) {
+            Log.e(TAG, "pinchInject failed (action=$action)", t)
+        }
+    }
+
+    // Lift both pointers at the last known span. Caller must hold pinchLock.
+    private fun pinchReleaseLocked() {
+        if (!pinchActive) return
+        val t = SystemClock.uptimeMillis()
+        pinchInject(
+            MotionEvent.ACTION_POINTER_UP or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+            2, t, pinchLastSpan,
+        )
+        pinchInject(MotionEvent.ACTION_UP, 1, t, pinchLastSpan)
+        pinchActive = false
+    }
+
+    override fun pinchBegin(displayId: Int, cx: Float, cy: Float, span: Float) {
+        if (reflectionBroken) return
+        synchronized(pinchLock) {
+            // Close any stale session first so we never stack two gestures.
+            pinchReleaseLocked()
+            pinchDownTime = SystemClock.uptimeMillis()
+            pinchDisplayId = displayId
+            pinchCx = cx; pinchCy = cy
+            pinchLastSpan = span
+            pinchActive = true
+            pinchDeadline = pinchDownTime + pinchWatchdogMs
+            pinchInject(MotionEvent.ACTION_DOWN, 1, pinchDownTime, span)
+            pinchInject(
+                MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+                2, pinchDownTime, span,
+            )
+        }
+        startPinchWatchdog()
+    }
+
+    override fun pinchMove(span: Float) {
+        synchronized(pinchLock) {
+            if (!pinchActive) return
+            pinchLastSpan = span
+            pinchDeadline = SystemClock.uptimeMillis() + pinchWatchdogMs
+            pinchInject(MotionEvent.ACTION_MOVE, 2, SystemClock.uptimeMillis(), span)
+        }
+    }
+
+    override fun pinchEnd(span: Float) {
+        synchronized(pinchLock) {
+            if (!pinchActive) return
+            pinchLastSpan = span
+            pinchReleaseLocked()
+        }
+    }
+
+    // Auto-release if the client stops streaming (dropped IPC / lost focus), so a
+    // held-open gesture can never become a stuck phantom touch on the display.
+    private fun startPinchWatchdog() {
+        if (!pinchWatchdogRunning.compareAndSet(false, true)) return
+        Thread {
+            try {
+                while (pinchActive) {
+                    Thread.sleep(40)
+                    if (pinchActive && SystemClock.uptimeMillis() > pinchDeadline) {
+                        Log.w(TAG, "pinch watchdog: no update in ${pinchWatchdogMs}ms — force-releasing")
+                        synchronized(pinchLock) { pinchReleaseLocked() }
+                        break
+                    }
+                }
+            } catch (_: InterruptedException) {
+            } finally {
+                pinchWatchdogRunning.set(false)
+            }
+        }.apply { isDaemon = true; name = "pinch-watchdog" }.start()
+    }
+
     private fun setDisplayId(event: InputEvent, displayId: Int) {
         if (displayId == 0) return
         try {

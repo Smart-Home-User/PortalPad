@@ -14,6 +14,7 @@ import android.widget.TextView
 import androidx.core.graphics.toColorInt
 import com.portalpad.app.PortalPadApp
 import com.portalpad.app.data.AccessMode
+import com.portalpad.app.service.PortalPadAccessibilityService
 import com.portalpad.app.shizuku.ShizukuManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -75,19 +76,30 @@ class ShizukuWarningOverlay(
                 if (showCover) attachBanner() else removeBanner()
 
                 if (showSoft) {
+                    // Taps aren't actually paused anymore — they fall back to the
+                    // accessibility service if it's enabled. Message depends on
+                    // whether that fallback is available right now.
+                    val a11yReady = PortalPadAccessibilityService.instance != null
                     if (!softShown) {
                         softShown = true
                         GlassesToast.show(
                             PortalPadApp.instance,
                             display,
-                            "Cursor moves but taps are paused. Restart Shizuku to " +
-                                "restore them, or use the trackpad's bottom bar to " +
-                                "launch apps.",
+                            if (a11yReady)
+                                "Shizuku is off. Input now runs through the Accessibility " +
+                                    "service — taps and gestures still work, but hovering " +
+                                    "won't highlight. Restart Shizuku for full input."
+                            else
+                                "Shizuku is off. Enable PortalPad's Accessibility service to " +
+                                    "keep using input on the external display, or restart Shizuku.",
                             7000L,
-                            title = "Shizuku Disconnected",
+                            title = "Shizuku Off",
                         )
                     }
-                    attachChip()
+                    attachChip(
+                        if (a11yReady) "⚠ Shizuku off · using accessibility"
+                        else "⚠ Shizuku off · enable accessibility",
+                    )
                 } else {
                     softShown = false
                     removeChip()
@@ -210,7 +222,7 @@ class ShizukuWarningOverlay(
      * stays on screen for someone who looks up mid-session, after the one-shot
      * toast has faded. Removed on reconnect.
      */
-    private fun attachChip() {
+    private fun attachChip(chipText: String) {
         if (chipView != null) return
         val density = displayContext.resources.displayMetrics.density
         @Suppress("DEPRECATION")
@@ -221,7 +233,7 @@ class ShizukuWarningOverlay(
         val padVpx = (w * 0.010f).toInt()
 
         val chip = TextView(displayContext).apply {
-            text = "⚠ Shizuku off · taps paused"
+            text = chipText
             setTextColor("#FFB547".toColorInt())
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, textPx)
             gravity = Gravity.CENTER

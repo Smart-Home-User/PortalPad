@@ -31,6 +31,12 @@ interface BoundShellBackend {
     fun tap(displayId: Int, x: Float, y: Float): Boolean
     fun longPress(displayId: Int, x: Float, y: Float, durationMs: Long = 700L): Boolean
     fun swipe(displayId: Int, sx: Float, sy: Float, ex: Float, ey: Float, durationMs: Long = 80L): Boolean
+    /** Two-pointer pinch/zoom centered at (cx,cy). Default false = unsupported by this backend. */
+    fun injectPinch(displayId: Int, cx: Float, cy: Float, startSpan: Float, endSpan: Float, durationMs: Long): Boolean = false
+    /** Continuous pinch held open across calls (begin → move… → end). Default false = unsupported. */
+    fun pinchBegin(displayId: Int, cx: Float, cy: Float, span: Float): Boolean = false
+    fun pinchMove(span: Float): Boolean = false
+    fun pinchEnd(span: Float): Boolean = false
     fun key(displayId: Int, keyCode: Int): Boolean
     /**
      * Inject a single hardware-keyboard key edge (KeyEvent.ACTION_DOWN/UP) with

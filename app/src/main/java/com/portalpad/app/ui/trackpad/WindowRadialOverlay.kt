@@ -27,9 +27,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -85,10 +83,9 @@ fun WindowRadialOverlay(onDismiss: () -> Unit) {
     }
 
     var armed by remember { mutableStateOf<String?>(null) }
-    val haptics = LocalHapticFeedback.current
 
     fun fire(id: String) {
-        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+        com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = true)
         PortalPadForegroundService.runWindowAction(id)
         onDismiss()
     }
@@ -98,7 +95,7 @@ fun WindowRadialOverlay(onDismiss: () -> Unit) {
         if (armed == id) {
             fire(id)
         } else {
-            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+            com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = false)
             armed = id
         }
     }

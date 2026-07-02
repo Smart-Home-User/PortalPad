@@ -13,6 +13,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import androidx.core.graphics.toColorInt
+import com.portalpad.app.service.CursorType
 import com.portalpad.app.service.InputInjector
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -69,6 +70,9 @@ class CursorOverlay(
     // "Cursor smoothing" pref s as (1 - s): higher smoothing → lower alpha → more
     // glide. @Volatile since the pref collector and doFrame both touch it.
     @Volatile private var easeAlpha: Float = 1f
+    // Current cursor shape — the window is anchored differently for the arrow
+    // (hotspot at top-left) vs a resize glyph (centered on the point).
+    @Volatile private var currentType: CursorType = CursorType.ARROW
 
     fun show() {
         if (cursorView != null) return
@@ -197,6 +201,15 @@ class CursorOverlay(
                 view.setVisible(visible)
             }
         }
+        s.launch {
+            injector.cursorType.collect { type ->
+                currentType = type
+                view.setCursorType(type)
+                // Re-apply position so the centering offset takes effect at once,
+                // even if the cursor is momentarily still on the transition.
+                if (!lastAppliedX.isNaN()) moveTo(lastAppliedX, lastAppliedY)
+            }
+        }
         // Live "Cursor smoothing" pref (s): higher = smoother. alpha = 1 - s,
         // floored at 0.1 so it never fully stalls; default 0 → alpha 1 (snap/off,
         // no added latency).
@@ -263,10 +276,13 @@ class CursorOverlay(
         val view = cursorView ?: return
         val p = params ?: return
         if (!view.isAttachedToWindow) return
-        // The cursor's "hotspot" (the pointer tip) is at the view's (0, 0),
-        // so the window's top-left IS the display coordinate. No offset.
-        p.x = x.toInt()
-        p.y = y.toInt()
+        // The arrow's "hotspot" (the pointer tip) is at the view's (0, 0), so the
+        // window's top-left IS the display coordinate. A resize glyph is drawn at
+        // the view's centre instead, so shift the window up-left by half its size
+        // to keep the glyph centered on the true point.
+        val off = if (currentType == CursorType.ARROW) 0 else sizePx / 2
+        p.x = x.toInt() - off
+        p.y = y.toInt() - off
         try {
             windowManager.updateViewLayout(view, p)
         } catch (_: IllegalArgumentException) {
@@ -310,9 +326,27 @@ class CursorOverlay(
             color = "#33000000".toColorInt()
             style = Paint.Style.FILL
         }
+        // Resize double-arrow: white stroke over a thicker black stroke for the
+        // same white-on-black-outline look as the arrow.
+        private val resizeOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = "#FF000000".toColorInt()
+            style = Paint.Style.STROKE
+            strokeWidth = 5f
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        private val resizeStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = "#FFFFFFFF".toColorInt()
+            style = Paint.Style.STROKE
+            strokeWidth = 2.5f
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
 
         private val arrowPath = Path()
         private val shadowPath = Path()
+        private val resizePath = Path()
+        private var cursorType: CursorType = CursorType.ARROW
 
         fun setVisible(v: Boolean) {
             if (visible == v) return
@@ -320,9 +354,19 @@ class CursorOverlay(
             invalidate()
         }
 
+        fun setCursorType(t: CursorType) {
+            if (cursorType == t) return
+            cursorType = t
+            invalidate()
+        }
+
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             if (!visible) return
+            if (cursorType != CursorType.ARROW) {
+                drawResize(canvas, cursorType)
+                return
+            }
             // Draw the arrow with its tip at the view's top-left (0, 0).
             // The window position places this corner at the desired display
             // coordinate. No invalidate() needed for cursor moves — only on
@@ -332,6 +376,33 @@ class CursorOverlay(
             canvas.drawPath(shadowPath, shadowPaint)
             canvas.drawPath(arrowPath, fillPaint)
             canvas.drawPath(arrowPath, outlinePaint)
+        }
+
+        /** Double-headed resize arrow, centered near the cursor point and rotated
+         *  to the edge/corner. The ~10px hotspot offset is invisible against the
+         *  48px resize grab zone. */
+        private fun drawResize(canvas: Canvas, type: CursorType) {
+            val angle = when (type) {
+                CursorType.RESIZE_H -> 0f
+                CursorType.RESIZE_V -> 90f
+                CursorType.RESIZE_NWSE -> 45f
+                CursorType.RESIZE_NESW -> 135f
+                else -> 0f
+            }
+            val len = 11f
+            val head = 5f
+            resizePath.reset()
+            resizePath.moveTo(-len, 0f); resizePath.lineTo(len, 0f)     // shaft
+            resizePath.moveTo(len, 0f); resizePath.lineTo(len - head, -head)
+            resizePath.moveTo(len, 0f); resizePath.lineTo(len - head, head)
+            resizePath.moveTo(-len, 0f); resizePath.lineTo(-len + head, -head)
+            resizePath.moveTo(-len, 0f); resizePath.lineTo(-len + head, head)
+            canvas.save()
+            canvas.translate(width / 2f, height / 2f)
+            canvas.rotate(angle)
+            canvas.drawPath(resizePath, resizeOutlinePaint)
+            canvas.drawPath(resizePath, resizeStrokePaint)
+            canvas.restore()
         }
 
         private fun buildArrowPath(path: Path, x: Float, y: Float) {

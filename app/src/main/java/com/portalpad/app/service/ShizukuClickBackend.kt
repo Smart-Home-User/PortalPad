@@ -88,6 +88,12 @@ class ShizukuClickBackend(private val context: Context) : BoundShellBackend {
         svcCall { it.injectLongPress(displayId, x, y, durationMs); true }
     override fun swipe(displayId: Int, sx: Float, sy: Float, ex: Float, ey: Float, durationMs: Long): Boolean =
         svcCall { it.injectSwipe(displayId, sx, sy, ex, ey, durationMs); true }
+    override fun injectPinch(displayId: Int, cx: Float, cy: Float, startSpan: Float, endSpan: Float, durationMs: Long): Boolean =
+        svcCall { it.injectPinch(displayId, cx, cy, startSpan, endSpan, durationMs); true }
+    override fun pinchBegin(displayId: Int, cx: Float, cy: Float, span: Float): Boolean =
+        svcCall { it.pinchBegin(displayId, cx, cy, span); true }
+    override fun pinchMove(span: Float): Boolean = svcCall { it.pinchMove(span); true }
+    override fun pinchEnd(span: Float): Boolean = svcCall { it.pinchEnd(span); true }
     override fun key(displayId: Int, keyCode: Int): Boolean = svcCall {
         // Single server-side press (DOWN + gap + UP). Replaces the old
         // back-to-back DOWN/UP which dropped keys intermittently.

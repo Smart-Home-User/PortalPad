@@ -941,7 +941,11 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
             override fun onDragStart() = injector.dragStart()
             override fun onDragMove(dx: Float, dy: Float) = injector.dragMove(dx, dy)
             override fun onDragEnd() = injector.dragEnd()
-            override fun onPinch(scale: Float) { /* TODO: forward zoom */ }
+            override fun onPinch(scale: Float) = injector.pinchUpdate(scale)
+            override fun onPinchEnd() = injector.pinchCommit()
+            override fun isOnResizeEdge(): Boolean =
+                injector.cursorType.value != com.portalpad.app.service.CursorType.ARROW
+            override fun isOnCaption(): Boolean = injector.cursorOnCaption.value
             override fun onThreeFingerSwipe(dx: Float, dy: Float) {
                 // Resolve the swipe direction, then run the user-configured action
                 // for it (defaults preserve the original right→Back / left→Home /

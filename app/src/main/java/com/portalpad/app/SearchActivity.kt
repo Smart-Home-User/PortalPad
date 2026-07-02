@@ -210,34 +210,10 @@ class SearchActivity : PinnedDensityActivity() {
 
     /** A short tactile tick for taps on the phone (mic start, app launch). */
     private fun performTapHaptic() {
-        runCatching {
-            // Honor the global vibration-strength pref (0 = off).
-            val ms = runCatching {
-                kotlinx.coroutines.runBlocking {
-                    (applicationContext as PortalPadApp).prefs.vibrationMs
-                        .first()
-                }
-            }.getOrDefault(25)
-            if (ms <= 0) return
-            val vib = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-                (getSystemService(android.content.Context.VIBRATOR_MANAGER_SERVICE)
-                    as android.os.VibratorManager).defaultVibrator
-            } else {
-                @Suppress("DEPRECATION")
-                getSystemService(android.content.Context.VIBRATOR_SERVICE) as android.os.Vibrator
-            }
-            if (!vib.hasVibrator()) return
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                vib.vibrate(
-                    android.os.VibrationEffect.createOneShot(
-                        ms.toLong(), android.os.VibrationEffect.DEFAULT_AMPLITUDE,
-                    ),
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                vib.vibrate(ms.toLong())
-            }
-        }
+        // Route through the same preset-driven path as the rest of the app (honors
+        // the Off/Light/Medium/Strong pref and any buzz() tuning) instead of a
+        // hand-rolled Vibrator — keeps every haptic in PortalPad identical.
+        runCatching { PortalPadApp.instance.injector.buzz() }
     }
 
     @Composable

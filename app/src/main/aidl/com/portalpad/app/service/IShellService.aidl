@@ -47,6 +47,27 @@ interface IShellService {
     void injectLongPress(int displayId, float x, float y, long durationMs);
     void injectSwipe(int displayId, float sx, float sy, float ex, float ey, long durationMs);
 
+    /**
+     * Two-pointer pinch/zoom on [displayId], centered at (cx,cy): two synthetic
+     * fingers start [startSpan] px apart (horizontally) and animate to [endSpan]
+     * over [durationMs]. endSpan > startSpan = zoom in; smaller = zoom out. This
+     * is the only multitouch primitive — single-pointer paths can't drive an
+     * app's ScaleGestureDetector. FEASIBILITY-GATED: whether an injected
+     * multitouch gesture is honored on a virtual display is hardware-dependent.
+     */
+    void injectPinch(int displayId, float cx, float cy, float startSpan, float endSpan, long durationMs);
+
+    /**
+     * Continuous pinch: hold a two-pointer gesture open across calls so zoom
+     * tracks the fingers live. [pinchBegin] presses two fingers [span] px apart
+     * centered at (cx,cy); [pinchMove] updates the span each frame; [pinchEnd]
+     * lifts both. The helper runs a watchdog that auto-releases if no move/end
+     * arrives within a short window, so a dropped call can't leave a stuck touch.
+     */
+    void pinchBegin(int displayId, float cx, float cy, float span);
+    void pinchMove(float span);
+    void pinchEnd(float span);
+
     // ─── IME policy ─────────────────────────────────────────────────────
     boolean setDisplayImePolicy(int displayId, int policy);
 

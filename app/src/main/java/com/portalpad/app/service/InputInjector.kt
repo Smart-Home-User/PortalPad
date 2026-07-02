@@ -9,6 +9,7 @@ import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import com.portalpad.app.PortalPadApp
+import com.portalpad.app.data.RunningTask
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -29,6 +30,10 @@ import kotlinx.coroutines.flow.first
  * the OEM renders a system mouse cursor — many don't render one for injected
  * SOURCE_MOUSE events on secondary displays.
  */
+/** Shape the cursor overlay should render. Driven by resize-edge hover in
+ *  desktop-windows mode; ARROW everywhere else. */
+enum class CursorType { ARROW, RESIZE_H, RESIZE_V, RESIZE_NWSE, RESIZE_NESW }
+
 class InputInjector(
     private val accessProvider: () -> ElevatedAccess,
     private val context: Context,
@@ -107,6 +112,113 @@ class InputInjector(
             refreshDisplayMetrics()
             runCatching { repinImePolicy(aggressive = false) }
         }
+
+    /** True when injecting into a trusted VirtualDisplay wrap; false when we fell
+     *  back to the raw physical display (trusted VD couldn't be created). On the
+     *  raw display, Shizuku touches often don't land in foreign apps, so taps are
+     *  routed through the accessibility framework instead. Set by the foreground
+     *  service alongside [displayId]. */
+    @Volatile var usingVd: Boolean = false
+
+    /** Whether the Shizuku injection backend is bound and ready right now. When it
+     *  isn't, taps can't inject the normal way, so the a11y fallback takes over
+     *  (instead of dead-blocking). */
+    /** Whether the active injection backend — Shizuku OR root shell — can deliver
+     *  input right now. When it can't, gestures fall back to a11y. (Previously
+     *  this checked only the Shizuku backend, which wrongly forced a11y on root
+     *  even though root injects fine.) */
+    private fun activeBackendReady(): Boolean =
+        PortalPadApp.instance.clickBackend.isReady
+
+    /** Route this gesture through the accessibility framework: external display,
+     *  and either untrusted (no VD) or the active backend unavailable, and the
+     *  a11y service is connected to dispatch. Mirrors the tap/long-press gate. */
+    private fun useA11y(): Boolean =
+        displayId != 0 && (!usingVd || !activeBackendReady()) &&
+            PortalPadAccessibilityService.instance != null
+
+    // One-shot a11y drag: record the start point; cursor tracks through dragMove;
+    // dispatch a single start→end swipe on dragEnd.
+    private var a11yDragActive = false
+    private var a11yDragStartX = 0f
+    private var a11yDragStartY = 0f
+    // One-shot a11y pinch: accumulate scale; dispatch a 2-stroke pinch on commit.
+    private var a11yPinchActive = false
+    private var a11yPinchScale = 1f
+
+    // ─── Resize-cursor hover feedback (desktop-windows only) ──────────────────
+    /** Pushed by the foreground service from the DESKTOP_MODE_ENABLED pref. When
+     *  off, the resize-cursor feature is fully dormant (cursor stays an arrow). */
+    @Volatile var desktopModeEnabled: Boolean = false
+    private val _cursorType = MutableStateFlow(CursorType.ARROW)
+    val cursorType: StateFlow<CursorType> = _cursorType.asStateFlow()
+    private val _onCaption = MutableStateFlow(false)
+    /** True when the cursor is over a freeform window's top caption strip (below
+     *  the top-resize zone, above the content). Caption grabs use the same quick
+     *  press-hold engage as the resize edges but move the window 1:1 (no lock). */
+    val cursorOnCaption: StateFlow<Boolean> = _onCaption.asStateFlow()
+    // Throttled snapshot of freeform windows — listTasks() hits the task system,
+    // so we never call it per-move; geometry runs against this cache.
+    private var cachedResizeTasks: List<RunningTask> = emptyList()
+    private var lastResizeTaskCacheAt = 0L
+
+    /** On cursor move, if it's hovering a resizable freeform window's edge/corner,
+     *  switch the cursor to the matching resize glyph. Gated so it's never a dead
+     *  affordance: desktop mode on, a resize drag can actually land (trusted VD +
+     *  ready backend), not over the dock, and the window isn't display-filling
+     *  (maximized). Cheap rectangle math against a throttled task cache. */
+    private fun updateResizeCursor() {
+        if (!desktopModeEnabled || !usingVd || !activeBackendReady() || cursorOverDock) {
+            if (_cursorType.value != CursorType.ARROW) _cursorType.value = CursorType.ARROW
+            if (_onCaption.value) _onCaption.value = false
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastResizeTaskCacheAt > RESIZE_CACHE_TTL_MS) {
+            cachedResizeTasks = runCatching {
+                PortalPadApp.instance.freeform.listTasks(displayId)
+            }.getOrDefault(emptyList())
+            lastResizeTaskCacheAt = now
+        }
+        // Topmost window under the cursor — only a thin strip hugging each edge
+        // counts (a little outside, a little inside), so the arrow sits on the
+        // visible border instead of floating in the wallpaper or firing deep in
+        // the window chrome.
+        val b = cachedResizeTasks.firstNotNullOfOrNull { t ->
+            t.bounds?.takeIf { bb ->
+                cursorX >= bb.left - RESIZE_EDGE_OUT && cursorX <= bb.right + RESIZE_GRAB_IN &&
+                    cursorY >= bb.top - RESIZE_GRAB_IN && cursorY <= bb.bottom + RESIZE_GRAB_IN
+            }
+        }
+        val type = when {
+            b == null -> CursorType.ARROW
+            // Fills the display → maximized/fullscreen, not resizable.
+            b.left <= 2 && b.top <= 2 &&
+                b.right >= displayWidth - 2 && b.bottom >= displayHeight - 2 -> CursorType.ARROW
+            else -> {
+                val nearLeft = cursorX >= b.left - RESIZE_EDGE_OUT && cursorX <= b.left + RESIZE_EDGE_IN
+                val nearRight = cursorX >= b.right - RESIZE_EDGE_IN && cursorX <= b.right + RESIZE_GRAB_IN
+                val nearTop = cursorY >= b.top - RESIZE_GRAB_IN && cursorY <= b.top + RESIZE_TOP_IN
+                val nearBottom = cursorY >= b.bottom - RESIZE_EDGE_IN && cursorY <= b.bottom + RESIZE_GRAB_IN
+                when {
+                    (nearLeft && nearTop) || (nearRight && nearBottom) -> CursorType.RESIZE_NWSE
+                    (nearRight && nearTop) || (nearLeft && nearBottom) -> CursorType.RESIZE_NESW
+                    nearLeft || nearRight -> CursorType.RESIZE_H
+                    nearTop || nearBottom -> CursorType.RESIZE_V
+                    else -> CursorType.ARROW // inside the window, not near an edge
+                }
+            }
+        }
+        if (_cursorType.value != type) _cursorType.value = type
+        // Caption strip: the top band of a freeform window that isn't a resize edge
+        // (type == ARROW there) and isn't maximized. A grab here moves the window.
+        val maximized = b != null && b.left <= 2 && b.top <= 2 &&
+            b.right >= displayWidth - 2 && b.bottom >= displayHeight - 2
+        val onCap = b != null && !maximized && type == CursorType.ARROW &&
+            cursorX >= b.left && cursorX <= b.right &&
+            cursorY >= b.top && cursorY <= b.top + CAPTION_STRIP_H
+        if (_onCaption.value != onCap) _onCaption.value = onCap
+    }
 
     /**
      * When true, pressKey() skips its trailing repinImePolicy() call.
@@ -267,17 +379,25 @@ class InputInjector(
         val base = vibrationMs
         if (base <= 0) return
         val v = vibrator ?: return
-        val ms = if (longPress) (base * 2).toLong() else base.toLong()
         runCatching {
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                val effect = android.os.VibrationEffect.createOneShot(
-                    ms, android.os.VibrationEffect.DEFAULT_AMPLITUDE,
-                )
+                // Common case (a click tick) fires the PRE-BUILT effect with no
+                // per-call allocation — that construction was the avoidable latency.
+                // Only the rarer long-press variant (2× duration) builds on demand.
+                val effect = if (longPress) {
+                    android.os.VibrationEffect.createOneShot(
+                        (base * 2).toLong(), android.os.VibrationEffect.DEFAULT_AMPLITUDE,
+                    )
+                } else {
+                    cachedEffect ?: android.os.VibrationEffect.createOneShot(
+                        base.toLong(), android.os.VibrationEffect.DEFAULT_AMPLITUDE,
+                    )
+                }
                 val attrs = touchAttrs
                 if (attrs != null) v.vibrate(effect, attrs) else v.vibrate(effect)
             } else {
                 @Suppress("DEPRECATION")
-                v.vibrate(ms)
+                v.vibrate(if (longPress) (base * 2).toLong() else base.toLong())
             }
         }
     }
@@ -376,6 +496,7 @@ class InputInjector(
         cursorX = (cursorX + sx).coerceIn(0f, (displayWidth - 1).toFloat())
         cursorY = (cursorY + sy).coerceIn(0f, (displayHeight - 1).toFloat())
         scheduleHoverInject(cursorX, cursorY)
+        updateResizeCursor()
     }
 
     // ─── Live double-tap-drag (touchscreen down→move→up) ─────────────────────
@@ -392,7 +513,70 @@ class InputInjector(
     @Volatile private var dragLockX: Float? = null
     @Volatile private var dragLockY: Float? = null
 
+    // ─── Pinch-zoom (two-pointer, continuous) ───────────────────────────────
+    // The two-pointer gesture is held open in the helper and its span is streamed
+    // live as the user pinches, so the app's zoom tracks the fingers in real time
+    // (vs. one jump on release). [pinchUpdate] begins the gesture on its first
+    // call and streams thereafter; [pinchCommit] releases it. Shizuku-only — the
+    // shell `input` path has no multitouch. The helper runs a watchdog that
+    // force-releases a stale gesture so a dropped "end" can't leave a stuck touch.
+    @Volatile private var pinchSessionActive = false
+    private var lastPinchSpan = PINCH_BASE_SPAN
+
+    fun pinchUpdate(scale: Float) = safe {
+        if (useA11y()) {
+            // One-shot a11y pinch: just accumulate; dispatched on commit.
+            a11yPinchActive = true
+            a11yPinchScale = scale
+            return@safe
+        }
+        val backend = PortalPadApp.instance.clickBackend as? ClickBackend.ShizukuUserService ?: return@safe
+        if (!backend.backend.isReady) return@safe
+        val maxSpan = (displayWidth - 1).coerceAtLeast(80).toFloat()
+        val span = (PINCH_BASE_SPAN * scale).coerceIn(40f, maxSpan)
+        if (!pinchSessionActive) {
+            pinchSessionActive = true
+            lastPinchSpan = PINCH_BASE_SPAN
+            // Center the zoom where the cursor is when the pinch starts.
+            backend.backend.pinchBegin(displayId, cursorX, cursorY, PINCH_BASE_SPAN)
+        }
+        // Throttle redundant updates (finger jitter) to keep binder traffic sane.
+        if (kotlin.math.abs(span - lastPinchSpan) >= 2f) {
+            lastPinchSpan = span
+            backend.backend.pinchMove(span)
+        }
+    }
+
+    fun pinchCommit() = safe {
+        if (a11yPinchActive) {
+            a11yPinchActive = false
+            val scale = a11yPinchScale
+            a11yPinchScale = 1f
+            if (kotlin.math.abs(scale - 1f) < 0.05f) return@safe
+            val maxSpan = (displayWidth - 1).coerceAtLeast(80).toFloat()
+            val endSpan = (PINCH_BASE_SPAN * scale).coerceIn(40f, maxSpan)
+            PortalPadAccessibilityService.instance?.dispatchPinch(
+                displayId, cursorX, cursorY, PINCH_BASE_SPAN, endSpan, 200L,
+            )
+            debugToast("Pinch → a11y zoom x${"%.2f".format(scale)} disp=$displayId")
+            return@safe
+        }
+        if (!pinchSessionActive) return@safe
+        pinchSessionActive = false
+        val backend = PortalPadApp.instance.clickBackend as? ClickBackend.ShizukuUserService ?: return@safe
+        backend.backend.pinchEnd(lastPinchSpan)
+        debugToast("Pinch end → zoom x${"%.2f".format(lastPinchSpan / PINCH_BASE_SPAN)} disp=$displayId")
+    }
+
     fun dragStart() = safe {
+        if (useA11y()) {
+            a11yDragActive = true
+            a11yDragStartX = cursorX
+            a11yDragStartY = cursorY
+            clickHaptic()
+            Log.d(TAG, "a11y dragStart @(${cursorX.toInt()},${cursorY.toInt()})")
+            return@safe
+        }
         val backend = PortalPadApp.instance.clickBackend as? ClickBackend.ShizukuUserService
             ?: return@safe
         if (!backend.backend.isReady) return@safe
@@ -412,17 +596,24 @@ class InputInjector(
             // Focused = the task whose bounds contain the cursor (topmost wins;
             // listTasks is roughly front-to-back, so first match is fine).
             val b = tasks.firstNotNullOfOrNull { it.bounds?.takeIf { bb ->
-                cursorX >= bb.left - EDGE_GRAB_PX && cursorX <= bb.right + EDGE_GRAB_PX &&
-                    cursorY >= bb.top - EDGE_GRAB_PX && cursorY <= bb.bottom + EDGE_GRAB_PX
+                cursorX >= bb.left - RESIZE_EDGE_OUT && cursorX <= bb.right + RESIZE_GRAB_IN &&
+                    cursorY >= bb.top - RESIZE_GRAB_IN && cursorY <= bb.bottom + RESIZE_GRAB_IN
             } }
             if (b != null) {
-                val nearLeft = kotlin.math.abs(cursorX - b.left) <= EDGE_GRAB_PX
-                val nearRight = kotlin.math.abs(cursorX - b.right) <= EDGE_GRAB_PX
-                val nearTop = kotlin.math.abs(cursorY - b.top) <= EDGE_GRAB_PX
-                val nearBottom = kotlin.math.abs(cursorY - b.bottom) <= EDGE_GRAB_PX
-                if (nearLeft) { startX = b.left.toFloat(); dragLockX = startX }
+                // Forgiving grab: thin INSIDE the top (title-bar grab stays a move)
+                // but generous OUTSIDE the top/right/bottom, where there's only
+                // wallpaper. left stays generous inside.
+                val nearLeft = cursorX >= b.left - RESIZE_EDGE_OUT && cursorX <= b.left + RESIZE_GRAB_IN
+                val nearRight = cursorX >= b.right - RESIZE_GRAB_IN && cursorX <= b.right + RESIZE_GRAB_IN
+                val nearTop = cursorY >= b.top - RESIZE_GRAB_IN && cursorY <= b.top + RESIZE_TOP_IN
+                val nearBottom = cursorY >= b.bottom - RESIZE_GRAB_IN && cursorY <= b.bottom + RESIZE_GRAB_IN
+                // left/top are INCLUSIVE coords (first pixel inside the window), so
+                // landing exactly on them touches app content and won't resize.
+                // Nudge the touch-down 1px OUTSIDE into Android's resize region —
+                // right/bottom are exclusive coords and already sit just outside.
+                if (nearLeft) { startX = b.left.toFloat() - 1f; dragLockX = startX }
                 if (nearRight) { startX = b.right.toFloat(); dragLockX = startX }
-                if (nearTop) { startY = b.top.toFloat(); dragLockY = startY }
+                if (nearTop) { startY = b.top.toFloat() - 1f; dragLockY = startY }
                 if (nearBottom) { startY = b.bottom.toFloat(); dragLockY = startY }
                 if (dragLockX != null || dragLockY != null) {
                     Log.d(TAG, "dragStart EDGE grab L=$nearLeft R=$nearRight T=$nearTop B=$nearBottom @($startX,$startY)")
@@ -438,16 +629,42 @@ class InputInjector(
         )
         clickHaptic()
         Log.d(TAG, "dragStart → touch DOWN display=$displayId ($startX,$startY) resize=${dragLockX != null || dragLockY != null}")
+        // Instant resize border: Android paints the freeform resize outline only
+        // once it sees motion, so nudge the grab 1px in the resize axis right after
+        // the DOWN. Invisible (1px), but makes the border appear the moment you
+        // grab, before you actually move.
+        if (dragLockX != null || dragLockY != null) {
+            val nudgeX = if (dragLockX != null) startX + 1f else startX
+            val nudgeY = if (dragLockY != null) startY + 1f else startY
+            backend.backend.pointer(
+                action = MotionEvent.ACTION_MOVE,
+                x = nudgeX, y = nudgeY, displayId = displayId,
+                source = InputDevice.SOURCE_TOUCHSCREEN, buttonState = 0, downTime = now,
+            )
+        }
     }
 
     fun dragMove(dx: Float, dy: Float) = safe {
+        if (a11yDragActive) {
+            // Cursor tracks the finger so the user sees the drag; the actual drag
+            // gesture is dispatched once on dragEnd (start→end).
+            cursorX = (cursorX + dx * cursorSpeed).coerceIn(0f, (displayWidth - 1).toFloat())
+            cursorY = (cursorY + dy * cursorSpeed).coerceIn(0f, (displayHeight - 1).toFloat())
+            return@safe
+        }
         val backend = PortalPadApp.instance.clickBackend as? ClickBackend.ShizukuUserService
             ?: return@safe
         if (!backend.backend.isReady || dragDownTime == 0L) return@safe
         val sx = dx * cursorSpeed
         val sy = dy * cursorSpeed
-        cursorX = (cursorX + sx).coerceIn(0f, (displayWidth - 1).toFloat())
-        cursorY = (cursorY + sy).coerceIn(0f, (displayHeight - 1).toFloat())
+        // Resize axis lock: when a single edge was grabbed, pin the off-axis so the
+        // cursor stays glued to the edge being dragged (corner grabs move both;
+        // a plain move has no lock and moves both).
+        val lockedX = dragLockX != null // vertical edge → X is the resize axis
+        val lockedY = dragLockY != null // horizontal edge → Y is the resize axis
+        val isResize = lockedX || lockedY
+        if (!isResize || lockedX) cursorX = (cursorX + sx).coerceIn(0f, (displayWidth - 1).toFloat())
+        if (!isResize || lockedY) cursorY = (cursorY + sy).coerceIn(0f, (displayHeight - 1).toFloat())
         // For a resize-edge grab, the touch follows the cursor on the free axis
         // but we still send the cursor coords (the dragged edge tracks the finger).
         backend.backend.pointer(
@@ -458,6 +675,16 @@ class InputInjector(
     }
 
     fun dragEnd() = safe {
+        if (a11yDragActive) {
+            a11yDragActive = false
+            // Slow swipe (350ms) so it reads as a drag, not a fling. Window-move
+            // works; text-select may need a long-press dwell a11y can't easily add.
+            PortalPadAccessibilityService.instance?.dispatchSwipe(
+                displayId, a11yDragStartX, a11yDragStartY, cursorX, cursorY, 350L, "drag",
+            )
+            Log.d(TAG, "a11y dragEnd (${a11yDragStartX.toInt()},${a11yDragStartY.toInt()})→(${cursorX.toInt()},${cursorY.toInt()})")
+            return@safe
+        }
         val backend = PortalPadApp.instance.clickBackend as? ClickBackend.ShizukuUserService
             ?: return@safe
         if (dragDownTime == 0L) return@safe
@@ -662,6 +889,18 @@ class InputInjector(
         // Notify desktop-mode window controls of the click coordinate (used for
         // click-to-grab window move/resize). Cheap no-op when nothing observes.
         emitClickEvent(x.toFloat(), y.toFloat())
+        // Accessibility fallback: on a NON-trusted display (the trusted VD
+        // couldn't be created), Shizuku-injected touches frequently don't land in
+        // foreign app windows. An a11y-dispatched gesture is system-sourced and
+        // honored without display trust, so prefer it there. Falls through to the
+        // normal backend if the a11y service isn't connected / can't dispatch.
+        if (displayId != 0 && (!usingVd || !activeBackendReady())) {
+            val svc = PortalPadAccessibilityService.instance
+            if (svc != null && svc.dispatchTap(displayId, x.toFloat(), y.toFloat())) {
+                debugToast("Left click → a11y gesture display=$displayId ($x,$y)")
+                return@safe
+            }
+        }
         val backend = PortalPadApp.instance.clickBackend
 
         when (backend) {
@@ -743,6 +982,15 @@ class InputInjector(
             return@safe
         }
         val x = cursorX.toInt(); val y = cursorY.toInt()
+        // Accessibility fallback (see leftClick): on an untrusted display, dispatch
+        // the long-press through the a11y framework so it lands in foreign apps.
+        if (displayId != 0 && (!usingVd || !activeBackendReady())) {
+            val svc = PortalPadAccessibilityService.instance
+            if (svc != null && svc.dispatchLongPress(displayId, x.toFloat(), y.toFloat(), 1200L)) {
+                debugToast("Right click → a11y long-press display=$displayId ($x,$y)")
+                return@safe
+            }
+        }
         val backend = PortalPadApp.instance.clickBackend
 
         when (backend) {
@@ -770,22 +1018,46 @@ class InputInjector(
         }
     }
 
+    /**
+     * Complete a double-tap. This is reached ONLY after the first tap of the
+     * pair already fired as an eager [leftClick] (see the single-tap path in
+     * TrackpadSurface). So a double-tap is finished by injecting exactly ONE
+     * more tap through the SAME proven path as leftClick — hover-exit → touch
+     * tap → repin — not a fresh pair of raw taps. Two clean taps separated by
+     * the user's real inter-tap gap read as a proper double-tap in apps; the
+     * previous two back-to-back taps with NO hover-exit were the ones the
+     * dispatcher dropped, which is why double-taps landed as singles or were
+     * ignored, and why one physical double-tap injected three taps total.
+     */
     fun doubleClick() = safe {
         clickHaptic()
         val x = cursorX.toInt(); val y = cursorY.toInt()
+        if (displayId != 0) {
+            PortalPadApp.instance.lastGlassesTapAt = android.os.SystemClock.elapsedRealtime()
+        }
+        emitClickEvent(x.toFloat(), y.toFloat())
         val backend = PortalPadApp.instance.clickBackend
 
         when (backend) {
             is ClickBackend.ShizukuUserService -> {
-                if (!backend.backend.isReady) return@safe
-                backend.backend.tap(displayId, x.toFloat(), y.toFloat())
-                backend.backend.tap(displayId, x.toFloat(), y.toFloat())
-                debugToast("Double click → Shizuku UserService display=$displayId")
+                if (!backend.backend.isReady) {
+                    debugToast("Double click BLOCKED — Shizuku UserService not bound")
+                    return@safe
+                }
+                sendHoverExitViaBackend(x.toFloat(), y.toFloat())
+                val ok = backend.backend.tap(displayId, x.toFloat(), y.toFloat())
+                debugToast(
+                    if (ok) "Double click → Shizuku (touch) display=$displayId ($x,$y)"
+                    else "Double click → Shizuku tap returned false"
+                )
+                repinImePolicy()
             }
             is ClickBackend.Shell -> {
-                if (!backend.access.isReady) return@safe
-                debugToast("Double click → ${backend.displayName} display=$displayId")
-                backend.access.execShell("input ${displayFlag()}tap $x $y")
+                if (!backend.access.isReady) {
+                    debugToast("Double click BLOCKED — ${backend.displayName} not ready")
+                    return@safe
+                }
+                debugToast("Double click → ${backend.displayName} display=$displayId ($x,$y)")
                 backend.access.execShell("input ${displayFlag()}tap $x $y")
             }
         }
@@ -824,6 +1096,16 @@ class InputInjector(
         // The accumulated motion is being delivered as this swipe — clear it.
         scrollAccumX = 0f
         scrollAccumY = 0f
+        if (useA11y()) {
+            // Feed the swipe vector to the paced/coalesced a11y scroller — one
+            // gesture in flight at a time, so swipes don't cancel each other.
+            PortalPadAccessibilityService.instance?.scrollGesture(
+                displayId, cx.toFloat(), cy.toFloat(),
+                (endX - cx).toFloat(), (endY - cy).toFloat(),
+                displayWidth, displayHeight,
+            )
+            return@safe
+        }
         val backend = PortalPadApp.instance.clickBackend
 
         when (backend) {
@@ -1425,5 +1707,26 @@ class InputInjector(
         /** How close (px) the cursor must be to a window edge at drag-start for the
          *  drag to grab that edge (resize) rather than move the window. */
         private const val EDGE_GRAB_PX = 48f
+        // Resize-cursor hover: refresh the freeform-task snapshot at most this
+        // often (windows only move on drag, so mild staleness is invisible).
+        private const val RESIZE_CACHE_TTL_MS = 250L
+        // Resize-cursor hover strip: how far outside / inside each visible edge
+        // the resize arrow appears. Kept thin so it hugs the border.
+        private const val RESIZE_EDGE_OUT = 8f
+        private const val RESIZE_EDGE_IN = 14f
+        // The top edge's inside reach is a bit wider than the other edges' arrow
+        // strip so it's easier to catch, while still leaving the caption below it
+        // for title-bar moves.
+        private const val RESIZE_TOP_IN = 20f
+        // Height of the freeform caption strip (below the top-resize zone) that a
+        // grab treats as "move the window". Android captions run ~40–48px; tunable.
+        private const val CAPTION_STRIP_H = 48f
+        // The resize GRAB zone is more forgiving than the arrow strip so you don't
+        // have to be pixel-perfect. Applied inward on left/right/bottom; the top
+        // stays thin (RESIZE_EDGE_IN) so title-bar grabs remain clean moves.
+        private const val RESIZE_GRAB_IN = 30f
+        /** Reference finger span (px) for scale=1.0 in the injected pinch; the
+         *  live span is PINCH_BASE_SPAN * pinchScale. */
+        private const val PINCH_BASE_SPAN = 240f
     }
 }

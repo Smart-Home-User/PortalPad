@@ -22,8 +22,8 @@ android {
         applicationId = "com.portalpad.app"
         minSdk = 30
         targetSdk = 34
-        versionCode = 110
-        versionName = "1.1-beta"
+        versionCode = 120
+        versionName = "1.2-beta"
         vectorDrawables { useSupportLibrary = true }
         // Ship only 64-bit ARM. Every phone that can drive XREAL glasses (USB-C
         // DisplayPort Alt Mode, and DeX/desktop mode on top of that) is arm64-v8a —

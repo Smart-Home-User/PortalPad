@@ -123,11 +123,11 @@ The easiest way is **Android Studio**:
 2. **File → Open** and select the project folder. Let it finish syncing.
 3. Press ▶ to build, install, and launch on a connected phone.
 
-From the command line instead:
+From the command line instead — the Gradle wrapper is included, so you don't need a separate Gradle install:
 
 ```
-gradle wrapper          # one-time, generates gradle-wrapper.jar
-./gradlew assembleDebug
+./gradlew assembleDebug        # macOS / Linux
+gradlew.bat assembleDebug      # Windows (cmd) — or .\gradlew assembleDebug in PowerShell
 ```
 
 The APK is at `app/build/outputs/apk/debug/app-debug.apk`.

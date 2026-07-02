@@ -126,9 +126,8 @@ fun GestureGuideDialog(
             SectionLabel("One finger")
             GestureLine(GestureRow("Slide", "move the cursor"))
             GestureLine(GestureRow("Tap", "left click"))
-            GestureLine(GestureRow("Long-press", "right click"))
-            GestureLine(GestureRow("Double-tap", "double click"))
-            GestureLine(GestureRow("Double-tap + drag", "drag to move a window; grab a window edge to resize"))
+            GestureLine(GestureRow("Touch & hold", "select the word or item under the cursor"))
+            GestureLine(GestureRow("Touch & hold, then move", "drag a window, or select text; grab a window edge to resize"))
             if (edgeScrollEnabled) {
                 val sideLabel = if (edgeScrollSide == "left") "Left" else "Right"
                 GestureLine(GestureRow("$sideLabel edge strip", "drag one finger to scroll"))

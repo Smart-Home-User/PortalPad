@@ -466,6 +466,152 @@ class PortalPadAccessibilityService : AccessibilityService() {
         return super.onUnbind(intent)
     }
 
+    /**
+     * Inject a tap on [displayId] at ([x],[y]) through the accessibility
+     * framework. Unlike Shizuku injection (which the system gates on display
+     * trust), an a11y-dispatched gesture is system-sourced, so foreign apps honor
+     * it on a NON-trusted display — the fallback for devices where the trusted VD
+     * can't be created. Returns whether the gesture was accepted for dispatch
+     * (not whether it landed; the app's reaction is observed by the user).
+     */
+    fun dispatchTap(displayId: Int, x: Float, y: Float): Boolean {
+        val path = android.graphics.Path().apply { moveTo(x, y) }
+        return dispatchPath(displayId, path, 1L, "tap")
+    }
+
+    /** Long-press (right-click / select) via the a11y framework. */
+    fun dispatchLongPress(displayId: Int, x: Float, y: Float, durationMs: Long): Boolean {
+        val path = android.graphics.Path().apply { moveTo(x, y) }
+        return dispatchPath(displayId, path, durationMs.coerceAtLeast(1L), "long-press")
+    }
+
+    /** A straight-line swipe — used for scroll (fast) and drag (slow). */
+    fun dispatchSwipe(
+        displayId: Int, sx: Float, sy: Float, ex: Float, ey: Float, durationMs: Long, label: String = "swipe",
+    ): Boolean {
+        val path = android.graphics.Path().apply { moveTo(sx, sy); lineTo(ex, ey) }
+        return dispatchPath(displayId, path, durationMs.coerceAtLeast(1L), label)
+    }
+
+    /** Two-finger pinch/zoom centered at (cx,cy): both fingers animate from
+     *  [startSpan] to [endSpan] apart. a11y supports multi-stroke gestures. */
+    fun dispatchPinch(
+        displayId: Int, cx: Float, cy: Float, startSpan: Float, endSpan: Float, durationMs: Long,
+    ): Boolean {
+        return try {
+            val sh = startSpan / 2f
+            val eh = endSpan / 2f
+            val left = android.graphics.Path().apply { moveTo(cx - sh, cy); lineTo(cx - eh, cy) }
+            val right = android.graphics.Path().apply { moveTo(cx + sh, cy); lineTo(cx + eh, cy) }
+            val dur = durationMs.coerceAtLeast(1L)
+            val builder = android.accessibilityservice.GestureDescription.Builder()
+                .addStroke(android.accessibilityservice.GestureDescription.StrokeDescription(left, 0L, dur))
+                .addStroke(android.accessibilityservice.GestureDescription.StrokeDescription(right, 0L, dur))
+            if (android.os.Build.VERSION.SDK_INT >= 30) runCatching { builder.setDisplayId(displayId) }
+            val dispatched = dispatchGesture(builder.build(), gestureCallback("pinch", displayId), null)
+            Log.d(TAG, "a11y dispatch pinch disp=$displayId span $startSpan→$endSpan dispatched=$dispatched")
+            dispatched
+        } catch (t: Throwable) {
+            Log.e(TAG, "a11y dispatch pinch failed disp=$displayId", t); false
+        }
+    }
+
+    private fun dispatchPath(
+        displayId: Int, path: android.graphics.Path, durationMs: Long, label: String,
+    ): Boolean {
+        return try {
+            val stroke = android.accessibilityservice.GestureDescription.StrokeDescription(path, 0L, durationMs)
+            val builder = android.accessibilityservice.GestureDescription.Builder().addStroke(stroke)
+            // setDisplayId targets the external display (API 30+, our minSdk).
+            if (android.os.Build.VERSION.SDK_INT >= 30) runCatching { builder.setDisplayId(displayId) }
+            val dispatched = dispatchGesture(builder.build(), gestureCallback(label, displayId), null)
+            Log.d(TAG, "a11y dispatch $label disp=$displayId dur=${durationMs}ms dispatched=$dispatched")
+            dispatched
+        } catch (t: Throwable) {
+            Log.e(TAG, "a11y dispatch $label failed disp=$displayId", t); false
+        }
+    }
+
+    private fun gestureCallback(label: String, displayId: Int) = object : GestureResultCallback() {
+        override fun onCompleted(d: android.accessibilityservice.GestureDescription?) {
+            Log.d(TAG, "a11y $label COMPLETED disp=$displayId")
+        }
+        override fun onCancelled(d: android.accessibilityservice.GestureDescription?) {
+            Log.w(TAG, "a11y $label CANCELLED disp=$displayId")
+        }
+    }
+
+    // ─── Coalesced, completion-paced scroll ──────────────────────────────────
+    // a11y runs one gesture at a time, so firing a swipe per scroll tick makes
+    // each new dispatch cancel the one still in flight — nothing ever scrolls.
+    // Instead we bank incoming scroll vectors and dispatch the next swipe only
+    // once the current one finishes, so exactly one scroll gesture is ever live.
+    private val scrollLock = Any()
+    private var scrollVecX = 0f
+    private var scrollVecY = 0f
+    private var scrollAnchorX = 0f
+    private var scrollAnchorY = 0f
+    private var scrollDispId = 0
+    private var scrollDispW = 0
+    private var scrollDispH = 0
+    private var scrollInFlight = false
+
+    /** Feed one scroll tick's swipe vector (already scaled + inverted by the
+     *  caller). Accumulates and paces so only one swipe runs at a time. */
+    fun scrollGesture(
+        displayId: Int, anchorX: Float, anchorY: Float, vx: Float, vy: Float, dispW: Int, dispH: Int,
+    ) {
+        synchronized(scrollLock) {
+            scrollVecX += vx
+            scrollVecY += vy
+            scrollAnchorX = anchorX
+            scrollAnchorY = anchorY
+            scrollDispId = displayId
+            scrollDispW = dispW
+            scrollDispH = dispH
+            if (!scrollInFlight) dispatchScrollLocked()
+        }
+    }
+
+    private fun dispatchScrollLocked() {
+        val vx = scrollVecX
+        val vy = scrollVecY
+        // Nothing banked up → the chain ends until the next tick arrives.
+        if (kotlin.math.abs(vx) < 4f && kotlin.math.abs(vy) < 4f) {
+            scrollVecX = 0f; scrollVecY = 0f; scrollInFlight = false
+            return
+        }
+        scrollVecX = 0f; scrollVecY = 0f
+        scrollInFlight = true
+        val sx = scrollAnchorX
+        val sy = scrollAnchorY
+        val ex = (sx + vx).coerceIn(4f, (scrollDispW - 4).coerceAtLeast(8).toFloat())
+        val ey = (sy + vy).coerceIn(4f, (scrollDispH - 4).coerceAtLeast(8).toFloat())
+        val dist = kotlin.math.hypot((ex - sx).toDouble(), (ey - sy).toDouble()).toFloat()
+        // ~1ms/px, floored so it reads as a controlled scroll rather than a flick.
+        val dur = dist.toLong().coerceIn(120L, 350L)
+        try {
+            val path = android.graphics.Path().apply { moveTo(sx, sy); lineTo(ex, ey) }
+            val stroke = android.accessibilityservice.GestureDescription.StrokeDescription(path, 0L, dur)
+            val builder = android.accessibilityservice.GestureDescription.Builder().addStroke(stroke)
+            if (android.os.Build.VERSION.SDK_INT >= 30) runCatching { builder.setDisplayId(scrollDispId) }
+            val cb = object : GestureResultCallback() {
+                override fun onCompleted(d: android.accessibilityservice.GestureDescription?) {
+                    synchronized(scrollLock) { dispatchScrollLocked() }
+                }
+                override fun onCancelled(d: android.accessibilityservice.GestureDescription?) {
+                    synchronized(scrollLock) { dispatchScrollLocked() }
+                }
+            }
+            val ok = dispatchGesture(builder.build(), cb, null)
+            Log.d(TAG, "a11y scroll swipe disp=$scrollDispId ($sx,$sy)->($ex,$ey) ${dur}ms ok=$ok")
+            if (!ok) scrollInFlight = false
+        } catch (t: Throwable) {
+            Log.e(TAG, "a11y scroll dispatch failed", t)
+            scrollInFlight = false
+        }
+    }
+
     companion object {
         private const val TAG = "PortalPadA11y"
         // Mirror the poller's tap window: a field tap counts as "recent" for 2s.

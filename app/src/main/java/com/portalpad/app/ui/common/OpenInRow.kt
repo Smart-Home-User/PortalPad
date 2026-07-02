@@ -41,6 +41,10 @@ fun playStoreDest(sublabel: String? = null, onClick: () -> Unit) =
 fun gitHubDest(sublabel: String? = null, onClick: () -> Unit) =
     OpenInDest(R.drawable.ic_github, "GitHub", sublabel, onClick)
 
+/** F-Droid chip with the standard icon + "F-Droid" label. */
+fun fDroidDest(sublabel: String? = null, onClick: () -> Unit) =
+    OpenInDest(R.drawable.ic_fdroid, "F-Droid", sublabel, onClick)
+
 /**
  * Compact "Open in… [chip] [chip]" row. A plain "Open in…" label followed by
  * one or more small icon-buttons. Chips with a [OpenInDest.sublabel] render a

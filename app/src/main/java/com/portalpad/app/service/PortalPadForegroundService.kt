@@ -798,7 +798,13 @@ class PortalPadForegroundService : Service() {
                             val fullscreenContext =
                                 !snap.desktop || snap.maximizedId != null || fillsExternal
                             val idleMs = android.os.SystemClock.elapsedRealtime() - lastMoveMs
-                            if (playing && fullscreenContext && !hiddenByUs && idleMs >= secs * 1000L) {
+                            // Don't hide while the cursor is parked on the visible
+                            // dock — the user is about to use it. cursorOverDock is
+                            // published by DockBar and is already gated on dock
+                            // visibility, so when the dock idle-hides this releases
+                            // and normal auto-hide resumes.
+                            if (playing && fullscreenContext && !hiddenByUs &&
+                                !app.injector.cursorOverDock && idleMs >= secs * 1000L) {
                                 app.injector.setCursorVisible(false)
                                 hiddenByUs = true
                             } else if ((!playing || !fullscreenContext) && hiddenByUs) {
@@ -819,6 +825,13 @@ class PortalPadForegroundService : Service() {
         // it takes effect without a service restart. A full reconcile is used
         // (not just attachVdOverlays) because the regular dock is suppressed in
         // desktop mode, and the dock attach lives in refreshExternalDisplay.
+        // Keep the injector's resize-cursor gate in sync with the desktop-mode
+        // pref (initial value + every change). Self-contained; no drop(1) here so
+        // the flag is correct from startup.
+        scope.launch {
+            app.prefs.bool(PreferencesRepository.Keys.DESKTOP_MODE_ENABLED, default = false)
+                .collect { app.injector.desktopModeEnabled = it }
+        }
         scope.launch {
             app.prefs.bool(PreferencesRepository.Keys.DESKTOP_MODE_ENABLED, default = false)
                 // Same fix as DOCK_ENABLED: distinctUntilChanged so an unrelated
@@ -1878,6 +1891,7 @@ class PortalPadForegroundService : Service() {
         //    full trusted-VD pipeline.
         val injectionDisplayId = if (usingVd) effectiveDisplayId else external.displayId
         app.injector.displayId = injectionDisplayId
+        app.injector.usingVd = usingVd
         Log.d(TAG, "injection target: displayId=$injectionDisplayId (usingVd=$usingVd, physical=${external.displayId})")
 
         // Recover an app stranded on the phone by a screen-off flap. When the

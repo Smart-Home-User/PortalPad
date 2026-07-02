@@ -21,8 +21,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -86,7 +84,6 @@ private fun ArrangePill(
     onLongPress: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val haptics = LocalHapticFeedback.current
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
     val bgColor = if (pressed) AbPrimary else AbSurfaceElevated
@@ -101,11 +98,11 @@ private fun ArrangePill(
                 interactionSource = interactionSource,
                 indication = rememberRipple(),
                 onClick = {
-                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = false)
                     onTap()
                 },
                 onLongClick = {
-                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = true)
                     onLongPress()
                 },
             ),

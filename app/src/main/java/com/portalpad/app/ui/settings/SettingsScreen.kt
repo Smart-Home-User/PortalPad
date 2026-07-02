@@ -1479,7 +1479,7 @@ private fun ResourcesPage(onBack: () -> Unit) {
             )
         }
         TabBody {
-            SectionCard(title = "Guides") {
+            SectionCard(title = "Guides", tightSpacing = true, titleDivider = true) {
                 val guideUrl = "https://xrealguide.wixsite.com/unofficial"
                 Column(
                     Modifier
@@ -1493,10 +1493,10 @@ private fun ResourcesPage(onBack: () -> Unit) {
                                 ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
                             )
                         }
-                        .padding(vertical = 6.dp),
+                        .padding(bottom = 6.dp),
                 ) {
                     Text(
-                        "XREAL guides",
+                        "XREAL Unofficial Guide",
                         color = AbOnSurface,
                         fontWeight = FontWeight.SemiBold,
                         style = MaterialTheme.typography.bodyLarge,
@@ -1509,7 +1509,7 @@ private fun ResourcesPage(onBack: () -> Unit) {
                 }
             }
 
-            SectionCard(title = "Companion apps", tightSpacing = true) {
+            SectionCard(title = "Companion apps", tightSpacing = true, titleDivider = true) {
                 Text(
                     "Shizuku",
                     color = AbOnSurface,
@@ -1555,25 +1555,65 @@ private fun ResourcesPage(onBack: () -> Unit) {
 
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "GitHub Store",
+                    text = androidx.compose.ui.text.buildAnnotatedString {
+                        withStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.SemiBold)) {
+                            append("Komi Store")
+                        }
+                        withStyle(
+                            androidx.compose.ui.text.SpanStyle(
+                                fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+                                fontWeight = FontWeight.Normal,
+                            ),
+                        ) {
+                            append(" (formerly GitHub Store)")
+                        }
+                    },
+                    color = AbOnSurface,
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+                Text(
+                    "Komi Store is an open \"app store\" for GitHub, Codeberg, Forgejo, and Gitea releases. Discover repositories that ship real installers and keep them updated \u2014 no scraping, no waiting on stores. Browse Trending, Hot Releases, Most Popular, and topic feeds (Privacy, Media, Productivity, Networking, Dev Tools). Search across GitHub or any forge host you trust. Tap an APK and install it \u2014 the app handles the rest.",
+                    color = AbOnSurfaceMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Spacer(Modifier.height(2.dp))
+                com.portalpad.app.ui.common.OpenInRow(
+                    destinations = listOf(
+                        com.portalpad.app.ui.common.gitHubDest {
+                            openUrl(ctx, "https://github.com/kurikomi-labs/komi-store")
+                        },
+                        com.portalpad.app.ui.common.fDroidDest {
+                            openUrl(ctx, "https://f-droid.org/en/packages/zed.rainxch.githubstore/")
+                        },
+                    ),
+                )
+            }
+
+            SectionCard(title = "XR community apps", tightSpacing = true, titleDivider = true) {
+                Text(
+                    "DroidOS Launcher",
                     color = AbOnSurface,
                     fontWeight = FontWeight.SemiBold,
                     style = MaterialTheme.typography.bodyLarge,
                 )
                 Text(
-                    "Download and update apps straight from GitHub repos (add a repo manually; it detects installed apps like Shizuku and Extinguish).",
+                    "DroidOS Launcher is an app launcher and multi-window controller for Android devices, including cover screens and external displays. It is designed to work with Shizuku to provide advanced launch and window management actions without requiring root.",
                     color = AbOnSurfaceMuted,
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Spacer(Modifier.height(2.dp))
-                ResourceLinkButton(
-                    iconRes = com.portalpad.app.R.drawable.ic_fdroid,
-                    label = "Open in F-Droid",
-                    onClick = { openUrl(ctx, "https://f-droid.org/packages/zed.rainxch.githubstore/") },
+                com.portalpad.app.ui.common.OpenInRow(
+                    destinations = listOf(
+                        com.portalpad.app.ui.common.gitHubDest {
+                            openUrl(ctx, "https://github.com/Katsuyamaki/DroidOS")
+                        },
+                        com.portalpad.app.ui.common.fDroidDest {
+                            openUrl(ctx, "https://f-droid.org/en/packages/com.katsuyamaki.DroidOSFOSSLauncher/")
+                        },
+                    ),
                 )
-            }
 
-            SectionCard(title = "Other apps", tightSpacing = true) {
+                Spacer(Modifier.height(16.dp))
                 Text(
                     "ScreenLab XR: External Display",
                     color = AbOnSurface,
@@ -1591,8 +1631,9 @@ private fun ResourcesPage(onBack: () -> Unit) {
                     label = "Open in Play Store",
                     onClick = { openStore(ctx, "com.northnroro.nroro_shader") },
                 )
+            }
 
-                Spacer(Modifier.height(16.dp))
+            SectionCard(title = "Other apps", tightSpacing = true, titleDivider = true) {
                 Text(
                     "Win-X Launcher",
                     color = AbOnSurface,
@@ -8489,6 +8530,7 @@ private fun SectionCard(
     pill: @Composable (() -> Unit)? = null,
     centeredTitleNoDot: Boolean = false,
     tightSpacing: Boolean = false,
+    titleDivider: Boolean = false,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Card(
@@ -8515,6 +8557,9 @@ private fun SectionCard(
                         pill?.invoke()
                     }
                 }
+            }
+            if (titleDivider && title.isNotEmpty()) {
+                HorizontalDivider(color = AbSurfaceElevated, thickness = 1.dp)
             }
             content()
         }

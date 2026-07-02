@@ -36,9 +36,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -90,7 +88,6 @@ fun QuickWheelOverlay(
     onOpenDrawer: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val haptics = LocalHapticFeedback.current
     var preview by remember { mutableStateOf<Int?>(null) }
 
     val ringRadius = 116f
@@ -175,7 +172,7 @@ fun QuickWheelOverlay(
                         .border(1.dp, Color(0x73E5D8FF), CircleShape)
                         .pointerInput(Unit) {
                             detectTapGestures(onTap = {
-                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = true)
                                 onOpenDrawer()
                             })
                         },
@@ -216,21 +213,21 @@ fun QuickWheelOverlay(
                                     onTap = {
                                         when {
                                             slot == null -> {
-                                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = false)
                                                 onAssignSlot(i)
                                             }
                                             preview == i -> {                    // 2nd tap → launch
-                                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = true)
                                                 onLaunchSlot(slot)
                                             }
                                             else -> {                            // 1st tap → latch name
-                                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = false)
                                                 preview = i
                                             }
                                         }
                                     },
                                     onLongPress = {
-                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = true)
                                         onAssignSlot(i)
                                     },
                                 )

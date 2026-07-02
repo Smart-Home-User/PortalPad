@@ -363,6 +363,15 @@ interface GestureSink {
     fun onDragStart() {}
     fun onDragMove(dx: Float, dy: Float) {}
     fun onDragEnd() {}
+    // Pinch released — commit the accumulated zoom (no-op if it was a scroll).
+    fun onPinchEnd() {}
+    // True when the cursor is currently on a window resize edge (the ↔/↕ arrow is
+    // showing). On an edge the drag intent is unambiguous, so the recognizer skips
+    // the touch-and-hold and lets a press-drag resize immediately.
+    fun isOnResizeEdge(): Boolean = false
+    // True when the cursor is over a freeform window's caption strip — a grab here
+    // uses the same quick edge-hold engage but moves the window (no resize).
+    fun isOnCaption(): Boolean = false
 }
 
 /**
@@ -392,6 +401,26 @@ private class GestureRecognizer(
     private var lastSingleX: Float = 0f
     private var lastSingleY: Float = 0f
     private var didMoveBeyondSlop = false
+    // True once the finger crosses slop while STILL inside the hold window — i.e.
+    // it began moving before it was ever "held", so this gesture is a cursor slide
+    // and must never engage a press-drag. Without this, ordinary cursor movement
+    // (a sustained touch that travels) injected a touch-drag, which made webpages
+    // scroll/pan as the cursor moved.
+    private var movedEarly = false
+    // Latched at press: was the cursor on a resize edge? If so, the drag engages
+    // without waiting for the hold (desktop-style grab-and-resize).
+    private var pressOnEdge = false
+    // Latched at press: was the cursor on a window caption strip? If so, a brief
+    // hold grabs and moves the window (same quick engage as an edge).
+    private var pressOnCaption = false
+    // Rest tracking for the quick-zone (edge/caption) hold. The grab engages only
+    // after the finger has stayed within restSlopPx of this anchor for edgeHoldMs.
+    // Any drift past the slop moves the anchor and restarts the timer, so a slide at
+    // ANY speed keeps resetting and never engages — only a deliberate still hold
+    // does. Reset at press.
+    private var restAnchorX = 0f
+    private var restAnchorY = 0f
+    private var restAnchorAt = 0L
 
     // Double-tap-drag state. When a press lands within the double-tap window of
     // the previous tap, the gesture is "armed" — if the finger then moves beyond
@@ -406,6 +435,9 @@ private class GestureRecognizer(
     private var twoFingerStartDist: Float = 0f
     private var twoFingerLastCentroid: Offset = Offset.Zero
     private var twoFingerMoved = false
+    // Latches once a 2-finger gesture is clearly a pinch (scale moved past a
+    // threshold), so it zooms instead of also scrolling.
+    private var pinchLatched = false
 
     // 3-finger state
     private var threeFingerStart: Offset = Offset.Zero
@@ -435,6 +467,13 @@ private class GestureRecognizer(
     //     finger re-touches to continue positioning" accidental-click class.
     //     Long-press right-clicks are still allowed (≥250ms held).
     private val slopPx = 5f
+    // Tap-slop is looser than the drag-start slop above: a finger tap (especially
+    // a thumb) naturally rolls a few px between touch-down and lift, so the 5px
+    // gate rejected real taps as "moved-beyond-slop". 8px admits that roll while
+    // staying well short of a deliberate cursor slide. Used ONLY to disqualify a
+    // lift from being a tap — drag-start still uses slopPx so double-tap-drag
+    // begins just as crisply.
+    private val tapSlopPx = 8f
     // Long-press right-click tolerates more drift than a tap: a finger held
     // still for over a second jitters well past the 5px tap-slop (~12–17px
     // observed), but a genuine cursor-repositioning slide travels much farther.
@@ -442,8 +481,30 @@ private class GestureRecognizer(
     private val longPressSlopPx = 40f
     private val tapMaxDurationMs = 200L
     private val doubleTapWindowMs = 280L
-    private val longPressThresholdMs = 250L
-    private val postDragSuppressMs = 400L
+    private val longPressThresholdMs = 200L
+    // On a resize edge, a much shorter hold engages the resize so the border pops
+    // almost immediately on a deliberate press-hold — but still long enough that a
+    // quick press-and-slide near an edge stays a plain cursor move, not a resize.
+    // Quick-zone (edge/caption) hold: engages only after the finger rests still for
+    // this long. Gated on stillness (see restSlopPx), not raw elapsed time, so a
+    // slow slide over the zone never trips it — long enough to read as a deliberate
+    // press-and-hold.
+    private val edgeHoldMs = 300L
+    // Stillness slop for that hold: drift within this of the rest anchor counts as
+    // "holding still" (absorbs natural hold jitter); drifting past it restarts the
+    // timer. Set above typical hold jitter but below a deliberate slide.
+    private val restSlopPx = 18f
+    // After a resize/caption drag ends, the cursor is parked on the edge with the
+    // arrow still showing. For this grace window a fresh press there moves the
+    // cursor instead of instantly re-grabbing, so you can slide away without timing
+    // it. A sustained hold past the grace still re-grabs.
+    private val edgeGraceMs = 300L
+    // Press-drag (DeX "touch and hold + move"): once the finger has been held in
+    // place for longPressThresholdMs, moving past this distance commits to a
+    // button-held drag. Bigger than tapSlopPx so a still hold's natural jitter
+    // (~12-17px) stays a "select" long-press rather than accidentally dragging.
+    private val dragEngagePx = 24f
+    private val postDragSuppressMs = 220L
     private val twoFingerTapTimeoutMs = 220L
     private val twoFingerSlopPx = 24f
     // Minimum per-frame movement to actually emit onMove. Avoids sending a
@@ -488,17 +549,15 @@ private class GestureRecognizer(
             val inPostDrag = lastDragEndAt > 0 && postDragGap < postDragSuppressMs
             var classified = "drag-or-stale"
             if (pressedAt > 0 && held >= longPressThresholdMs && totalMotion <= longPressSlopPx) {
-                // Right-click on long-press — a deliberate still hold ≥250ms.
-                // It is EXEMPT from the tight 5px tap-slop: a finger held in
-                // place for over a second naturally jitters past 5px (the log
-                // showed ~12–17px on a dead-still hold), so gating this on the
-                // tap-slop would (and did) swallow real long-presses. Instead we
-                // allow a generous longPressSlopPx so jitter is fine but a true
-                // cursor-repositioning slide (which travels much farther) is
-                // still excluded and treated as movement, not a click.
+                // Touch-and-hold with no real move = "select" (DeX touch-and-hold).
+                // Injects a touch long-press, which selects the word/object under
+                // the cursor or opens its context menu. EXEMPT from the tight
+                // tap-slop: a finger held in place jitters past it (~12-17px
+                // observed), so we tolerate longPressSlopPx of drift before this
+                // counts as a slide. A hold that travels past dragEngagePx instead
+                // becomes a drag (handled in the move loop) and never reaches here.
                 sink.onSecondaryTap()
-                lastSingleAt = 0
-                classified = "right-click(long-press motion=${totalMotion.toInt()}px)"
+                classified = "select(touch-hold motion=${totalMotion.toInt()}px)"
             } else if (!didMoveBeyondSlop && pressedAt > 0) {
                 val inStripDeadZone = deadZone?.inZone?.invoke(pressStartX, surfaceWidth) == true
                 if (inStripDeadZone) {
@@ -506,13 +565,12 @@ private class GestureRecognizer(
                     // missed the scroll strip. Never click here.
                     classified = "suppressed-edge-strip-zone"
                 } else if (tapsEnabled && held < tapMaxDurationMs && !inPostDrag) {
-                    if (now - lastSingleAt < doubleTapWindowMs) {
-                        sink.onDoubleTap(); lastSingleAt = 0
-                        classified = "double-tap"
-                    } else {
-                        sink.onTap(); lastSingleAt = now
-                        classified = "left-click(tap)"
-                    }
+                    // Single left click. Double-click is NOT synthesized — two
+                    // quick taps simply fire two clicks and the app pairs them
+                    // itself, like a real trackpad. (This is what removed the old
+                    // triple-count and double-tap unreliability.)
+                    sink.onTap()
+                    classified = "left-click(tap)"
                 } else if (tapsEnabled && held < tapMaxDurationMs && inPostDrag) {
                     // The user just finished a drag and re-touched within the
                     // suppression window. This is almost always a finger
@@ -526,9 +584,11 @@ private class GestureRecognizer(
                 }
             } else if (didMoveBeyondSlop) {
                 classified = "no-click(moved-beyond-slop)"
-                // Stamp the drag-end time so the next quick tap can be
-                // suppressed as a re-positioning gesture.
-                lastDragEndAt = now
+                // Deliberately do NOT stamp lastDragEndAt here. A plain cursor
+                // move that was never a button-held drag is normally followed by
+                // an intended tap ("slide to the target, then click"); stamping
+                // here suppressed that legitimate tap. Post-drag suppression now
+                // applies only after a real drag (see the DRAG END branch above).
             } else {
                 classified = "no-click(no-press-recorded)"
             }
@@ -548,6 +608,8 @@ private class GestureRecognizer(
             val elapsed = System.currentTimeMillis() - twoFingerStartTime
             if (!twoFingerMoved && elapsed < twoFingerTapTimeoutMs) {
                 sink.onSecondaryTap()
+            } else if (pinchLatched) {
+                sink.onPinchEnd()
             }
             resetTwoFingerState()
         }
@@ -596,15 +658,21 @@ private class GestureRecognizer(
             lastSingleX = p.position.x
             lastSingleY = p.position.y
             didMoveBeyondSlop = false
-            // Arm a double-tap-drag if this press follows a recent tap. If the
-            // finger then moves beyond slop, it becomes an active button-held
-            // drag (for moving freeform windows, selecting text, etc.).
-            dragArmed = lastSingleAt > 0 && (now - lastSingleAt) < doubleTapWindowMs
+            movedEarly = false
+            // On a resize edge OR caption strip the drag is unambiguous — a brief
+            // hold engages it below (border shows / window sticks) with no 24px move.
+            pressOnEdge = sink.isOnResizeEdge()
+            pressOnCaption = sink.isOnCaption()
+            restAnchorX = p.position.x
+            restAnchorY = p.position.y
+            restAnchorAt = now
+            // Drag is hold-primed (DeX touch-and-hold + move): a press held in place
+            // that then travels becomes a button-held drag — decided in the move
+            // loop below, not by a preceding tap. Nothing to arm here.
             dragActive = false
             android.util.Log.d(
                 "Gesture",
-                "PRESS at (${p.position.x.toInt()},${p.position.y.toInt()}) " +
-                    "t=$now (anchor) dragArmed=$dragArmed",
+                "PRESS at (${p.position.x.toInt()},${p.position.y.toInt()}) t=$now (anchor)",
             )
         }
         // DeX-style: cursor moves on every frame with any meaningful motion,
@@ -614,13 +682,34 @@ private class GestureRecognizer(
         val dx = p.position.x - lastSingleX
         val dy = p.position.y - lastSingleY
         val moved = hypot(dx, dy) > motionEpsilonPx
-        // If armed and the finger has now moved beyond slop, begin a real drag.
-        if (dragArmed && !dragActive) {
+        // Rest tracking: any drift past restSlopPx from the rest anchor moves the
+        // anchor and restarts the hold timer, so continuous motion (slow OR fast)
+        // over an edge/caption keeps resetting and never engages — you just move the
+        // cursor. Only a deliberate STILL hold lets restedMs reach the threshold.
+        val restDrift = hypot(p.position.x - restAnchorX, p.position.y - restAnchorY)
+        if (restDrift > restSlopPx) {
+            restAnchorX = p.position.x
+            restAnchorY = p.position.y
+            restAnchorAt = now
+        }
+        // Press-drag engage. On a resize edge or caption strip (the "quick zone"), a
+        // deliberate still hold (finger resting for edgeHoldMs) grabs it — the resize
+        // border pops / the window sticks — so press-and-HOLD acts and any slide over
+        // the zone stays a plain cursor move. A grace window after a prior drag lets a
+        // fresh press on the zone move the cursor instead of re-grabbing. Outside the
+        // zone it's the DeX touch-and-hold: hold longPressThresholdMs, THEN travel
+        // past dragEngagePx to move a window.
+        val quickZone = pressOnEdge || pressOnCaption
+        val graceOk = lastDragEndAt == 0L || now - lastDragEndAt >= edgeGraceMs
+        val onQuickHold = quickZone && graceOk && now - restAnchorAt >= edgeHoldMs
+        val offZoneReady = !quickZone && !movedEarly && now - pressedAt >= longPressThresholdMs
+        if (!dragActive && pressedAt > 0 && (onQuickHold || offZoneReady)) {
             val totalFromPress = hypot(p.position.x - pressStartX, p.position.y - pressStartY)
-            if (totalFromPress > slopPx) {
+            if (onQuickHold || totalFromPress > dragEngagePx) {
                 dragActive = true
                 sink.onDragStart()
-                android.util.Log.d("Gesture", "DRAG START (double-tap-drag)")
+                val what = if (pressOnEdge) "edge hold" else if (pressOnCaption) "caption hold" else "hold + move"
+                android.util.Log.d("Gesture", "DRAG START ($what)")
             }
         }
         if (moved) {
@@ -648,7 +737,20 @@ private class GestureRecognizer(
         // Track total motion from press for click classification.
         val totalDx = p.position.x - pressStartX
         val totalDy = p.position.y - pressStartY
-        if (!didMoveBeyondSlop && hypot(totalDx, totalDy) > slopPx) didMoveBeyondSlop = true
+        val totalFromPressNow = hypot(totalDx, totalDy)
+        if (!didMoveBeyondSlop && totalFromPressNow > tapSlopPx) {
+            didMoveBeyondSlop = true
+        }
+        // A finger that travels past the drag-engage distance BEFORE the hold
+        // completes is a cursor slide, not a press-drag → lock out drag. Using
+        // dragEngagePx (not the tight tap-slop) tolerates the ~12-17px jitter of a
+        // finger held in place, so a real touch-and-hold still promotes to a drag
+        // once you move. A quick slide clears 24px well within the hold window and
+        // still locks out correctly.
+        if (!movedEarly && pressedAt > 0 && now - pressedAt < longPressThresholdMs &&
+            totalFromPressNow > dragEngagePx) {
+            movedEarly = true
+        }
         // No lift-detection here — it's unreachable when count==1 (the lift event
         // makes count drop to 0, which exits this branch). Lift is handled by the
         // onPointerEvent transition block above.
@@ -678,10 +780,16 @@ private class GestureRecognizer(
 
         if (twoFingerMoved) {
             val scaleDelta = dist / twoFingerStartDist
-            if (abs(scaleDelta - 1f) > 0.04f) sink.onPinch(scaleDelta)
-            val ddx = centroid.x - twoFingerLastCentroid.x
-            val ddy = centroid.y - twoFingerLastCentroid.y
-            if (hypot(ddx, ddy) > 2f) sink.onScroll(ddx, ddy)
+            // Latch as a pinch once the span clearly changes, so a pinch zooms
+            // instead of also scrolling. Below the latch, it's treated as scroll.
+            if (abs(scaleDelta - 1f) > 0.15f) pinchLatched = true
+            if (pinchLatched) {
+                sink.onPinch(scaleDelta)
+            } else {
+                val ddx = centroid.x - twoFingerLastCentroid.x
+                val ddy = centroid.y - twoFingerLastCentroid.y
+                if (hypot(ddx, ddy) > 2f) sink.onScroll(ddx, ddy)
+            }
         }
         twoFingerLastCentroid = centroid
     }
@@ -706,5 +814,6 @@ private class GestureRecognizer(
         twoFingerStartDist = 0f
         twoFingerLastCentroid = Offset.Zero
         twoFingerMoved = false
+        pinchLatched = false
     }
 }
