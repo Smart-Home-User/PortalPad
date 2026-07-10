@@ -278,6 +278,14 @@ class PortalPadApp : Application() {
 
     fun setExternalDisplayId(id: Int?) { _externalDisplayId.value = id }
 
+    /** Bumped when the snapshotter detects a MASS window death (LMK reclaim /
+     *  crash wave) and holds the previous snapshot instead of overwriting it —
+     *  the trackpad's "Restore last session?" offer re-arms on each bump so
+     *  the user gets a one-tap path back to the layout the system destroyed. */
+    private val _restoreOfferNudge = MutableStateFlow(0)
+    val restoreOfferNudge: StateFlow<Int> = _restoreOfferNudge.asStateFlow()
+    fun bumpRestoreOfferNudge() { _restoreOfferNudge.value += 1 }
+
     // The dock's ACTUAL measured band rectangle on the external display, in real
     // display pixels: [left, top, right, bottom]. Published by DockOverlay after
     // each layout so the quick-settings flyout can mirror the dock's exact width
@@ -355,7 +363,7 @@ class PortalPadApp : Application() {
      *
      * @param component "pkg/cls" or a package's launch component string.
      */
-    fun launchAppOnExternal(component: String) {
+    fun launchAppOnExternal(component: String, forceFullscreen: Boolean = false) {
         val displayId = externalDisplayId.value ?: return
         if (!access.isReady) return
         markExternalLaunch()
@@ -364,7 +372,11 @@ class PortalPadApp : Application() {
             val desktop = runCatching {
                 prefs.bool(com.portalpad.app.data.PreferencesRepository.Keys.DESKTOP_MODE_ENABLED, default = false).first()
             }.getOrDefault(false)
-            val asWindow = desktop && runCatching {
+            // forceFullscreen: per-assignment override (Home/Back nav buttons
+            // assigned to TV-launcher-style apps) — skip the freeform path and
+            // take the plain startActivityOnDisplay branch below, which already
+            // arms the permission-dialog watch for fullscreen launches.
+            val asWindow = !forceFullscreen && desktop && runCatching {
                 prefs.bool(com.portalpad.app.data.PreferencesRepository.Keys.DOCK_OPENS_FREEFORM, default = true).first()
             }.getOrDefault(true)
             if (asWindow) {
@@ -398,6 +410,11 @@ class PortalPadApp : Application() {
                 }
             } else {
                 runCatching { access.startActivityOnDisplay(component, displayId) }
+                // Extend/fullscreen launches skip launchFreeform, so arm the
+                // permission-dialog watch here too (fullscreen mode) — otherwise a
+                // first-run app's transparent GrantPermissionsActivity can black out
+                // the external display undetected.
+                runCatching { freeform.armDialogShellWatch(component, displayId, freeform = false) }
             }
         }
     }
@@ -446,6 +463,10 @@ class PortalPadApp : Application() {
     // and re-trigger the relay — that loop was collapsing the keyboard to one letter
     // at a time. Set by the relay's lifecycle (onResume true / onDestroy false).
     @Volatile var relayOpen: Boolean = false
+    /** When the relay last closed — refocusExternalDisplay skips briefly after
+     *  (a launcher-intent refocus relaunches the top app; Chrome resets its
+     *  omnibox and the suggestion dropdown dies unclickable). */
+    @Volatile var relayClosedAt = 0L
 
     // Timestamp (elapsedRealtime) of the last deliberate tap injected onto the
     // glasses via the trackpad. The accessibility detector requires a RECENT tap to

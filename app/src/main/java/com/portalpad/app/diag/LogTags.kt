@@ -34,6 +34,7 @@ internal object LogTags {
             "FreeformManager:V Gesture:V GestureInk:V GlColorRenderer:V GlassesToast:V " +
             "IconPackManager:V InputInjector:V LaunchEntry:V LogcatScreen:V " +
             "LogcatStreamer:V MainActivity:V MediaController:V NativeMouse:V " +
+            "PhoneCurtain:V " +
             "NavButtonsOverlay:V NotifListener:V NotifPanel:V PhoneExitBands:V " +
             "PortalPadA11y:V PortalPadDisplayDiag:V PortalPadFgService:V " +
             "PortalPadRelay:V PortalPadRestore:V PortalPadSleep:V QuickSettings:V " +
@@ -41,6 +42,6 @@ internal object LogTags {
             "ScreenRecorder:V Screenshot:V SearchOverlay:V ShellUserService:V " +
             "ShizukuClickBackend:V " +
             "ShizukuManager:V ShizukuWarning:V TaskbarOverlay:V TrackpadActivity:V " +
-            "TrackpadSurface:V VDMirror:V VdRecorder:V WindowArranger:V " +
+            "TrackpadSurface:V UpdateChecker:V VDMirror:V VdRecorder:V WindowArranger:V " +
             "WindowControlBar:V "
 }

@@ -314,6 +314,39 @@ class GlColorRenderer(
         }
     }
 
+    /**
+     * Clear the glasses surface to opaque black and PRESENT it.
+     *
+     * The panel only changes when a frame is swapped to it. [drawFrame] runs solely
+     * on `onFrameAvailable` from the VirtualDisplay's SurfaceTexture, so when the VD
+     * is destroyed (service stopped) or replaced (transient-mirror revert, replug),
+     * no frame is produced and the display keeps compositing its LAST image — the
+     * user sees a ghost of whatever was on screen (e.g. a Kindle window that no
+     * longer exists) until something forces a repaint, like nudging the DPI slider.
+     *
+     * Pushing one black frame gives the panel something new to show. Safe to call
+     * after the VD is gone: it touches only the EGL output surface, never the
+     * SurfaceTexture. No-op once [release] has run.
+     */
+    fun presentBlackFrame(): Boolean = runOnGlBlocking {
+        if (released) {
+            Log.w(TAG, "presentBlackFrame: renderer already released — panel may keep last frame")
+            return@runOnGlBlocking false
+        }
+        val ok = runCatching {
+            if (eglDisplay == EGL14.EGL_NO_DISPLAY || eglSurface == EGL14.EGL_NO_SURFACE) {
+                return@runCatching false
+            }
+            EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+            GLES20.glClearColor(0f, 0f, 0f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+            EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+            true
+        }.getOrDefault(false)
+        Log.d(TAG, "presentBlackFrame: ok=$ok")
+        ok
+    }
+
     fun release() {
         if (released) return
         released = true

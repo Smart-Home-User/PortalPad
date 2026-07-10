@@ -87,6 +87,24 @@ class PreferencesRepository(private val context: Context) {
         val CAPTURE_INTRO_SHOWN = booleanPreferencesKey("capture_intro_shown") // first-tap screenshot/record explainer
         val ENABLE_MOUSE_HOVER = booleanPreferencesKey("mouse_hover")
         /**
+         * EXPERIMENT: when an app launched to the external display triggers a
+         * runtime permission dialog, keep everything ON the external display by
+         * flipping the host task to fullscreen in place (so the transparent
+         * prompt paints over the now-opaque app) instead of moving the app to
+         * the phone. Default OFF — the phone-move path is the reliable default;
+         * this is opt-in because whether the in-place fullscreen flip renders
+         * the prompt (vs. relocating the black rect) is hardware-dependent. The
+         * phone-move remains the fallback if the flip doesn't take.
+         */
+        val PERM_DIALOG_KEEP_ON_EXTERNAL = booleanPreferencesKey("perm_dialog_keep_on_external")
+        /** EXPERIMENT (permfix / AirBeam parity): drive the glasses via a
+         *  SurfaceControl layerStack retarget (no app overlay) instead of the
+         *  overlay + GL-shader mirror. Immune to the security overlay-hide that
+         *  blanks the panel during USB/permission dialogs; trades the non-linear
+         *  gamma stage (linear color is preserved via setDisplayColorTransform).
+         *  Auto-falls-back to the overlay path if the retarget is refused. */
+        val PANEL_SYSTEM_MIRROR = booleanPreferencesKey("panel_system_mirror")
+        /**
          * Master gate for the DeX-style desktop-windows experience (beta):
          * freeform resizable windows, a bottom taskbar, and a top window-bar.
          * Default OFF — when off, nothing in the freeform/taskbar path runs and
@@ -226,6 +244,12 @@ class PreferencesRepository(private val context: Context) {
         val AUTO_LAUNCH_AFTER_MOVE = booleanPreferencesKey("auto_after_move")
         val AUTO_LAUNCH_WHEN_ENABLED = booleanPreferencesKey("auto_when_enabled")
         val AUTO_ACTIVATE_EXTERNAL = booleanPreferencesKey("auto_external")
+        /** Set true by a DELIBERATE user stop (companion stop()), cleared by a
+         *  deliberate start (companion start()). A START_STICKY relaunch checks
+         *  this in onCreate: true → the user said stop, stay stopped (stopSelf);
+         *  false → the SYSTEM killed us (e.g. One UI stopping the FGS on recents
+         *  Close-All) and the relaunch should resume the session. */
+        val SERVICE_USER_STOPPED = booleanPreferencesKey("service_user_stopped")
         /** Samsung only. When true, starting the PortalPad service first turns
          *  Samsung DeX OFF (if it's currently on) so DeX and our VirtualDisplay
          *  don't fight over the external display. Default true. */
@@ -646,6 +670,7 @@ class PreferencesRepository(private val context: Context) {
     }
     val colorTuning: Flow<String> = context.dataStore.data.map { it[Keys.COLOR_TUNING] ?: "" }
     val gpuColorPipeline: Flow<Boolean> = context.dataStore.data.map { it[Keys.GPU_COLOR_PIPELINE] ?: true }
+    val panelSystemMirror: Flow<Boolean> = context.dataStore.data.map { it[Keys.PANEL_SYSTEM_MIRROR] ?: false }
     // Global haptic strength (ms). Default 25 = Medium. 0 = Off.
     val vibrationMs: Flow<Int> = context.dataStore.data.map { it[Keys.VIBRATION_MS] ?: 25 }
     fun bool(key: Preferences.Key<Boolean>, default: Boolean = false): Flow<Boolean> =
@@ -843,6 +868,7 @@ class PreferencesRepository(private val context: Context) {
     }
     suspend fun setColorTuning(value: String) = context.dataStore.edit { it[Keys.COLOR_TUNING] = value }
     suspend fun setGpuColorPipeline(value: Boolean) = context.dataStore.edit { it[Keys.GPU_COLOR_PIPELINE] = value }
+    suspend fun setPanelSystemMirror(value: Boolean) = context.dataStore.edit { it[Keys.PANEL_SYSTEM_MIRROR] = value }
     suspend fun setVibrationMs(value: Int) = context.dataStore.edit { it[Keys.VIBRATION_MS] = value }
     suspend fun setBool(key: Preferences.Key<Boolean>, value: Boolean) =
         context.dataStore.edit { it[key] = value }

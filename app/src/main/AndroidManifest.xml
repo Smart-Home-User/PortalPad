@@ -12,6 +12,17 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- In-app update checker (v1.3+). INTERNET is used ONLY to query the
+         GitHub Releases API for this repo and download the release APK when
+         the user taps install — PortalPad makes no other network calls.
+         REQUEST_INSTALL_PACKAGES lets the downloaded APK be handed to the
+         system package installer (user must still grant "Install unknown
+         apps" once and confirm every install in the system dialog). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Downgrade path without Shizuku/root: lets the update page open the
+         system uninstall dialog for PortalPad itself (normal permission). -->
+    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
     <!-- Optional. Only used for the mobile network-type label (5G/LTE/4G) on the
          status icon — signal bars do NOT need it. Inert unless the user opts in on
          the setup page, which grants it via `pm grant` through Shizuku/Root. -->
@@ -35,6 +46,16 @@
 
     <!-- Granted via Shizuku at runtime -->
     <uses-permission android:name="android.permission.INJECT_EVENTS"
+        tools:ignore="ProtectedPermissions" />
+    <!-- EXPERIMENT (permfix): the VD mirror + cursor/dock overlays are
+         TYPE_APPLICATION_OVERLAY windows, which One UI hides system-wide while
+         any security-sensitive dialog (USB chooser, USB access, runtime
+         permission) is up — HIDE_NON_SYSTEM_OVERLAY_WINDOWS anti-tapjacking.
+         That hides the mirror → glasses go black. This permission + a window's
+         setSystemApplicationOverlay(true) exempts the window from that hide, IF
+         we can grant it via Shizuku (signature|role perm — grantability is the
+         open question this build probes). -->
+    <uses-permission android:name="android.permission.SYSTEM_APPLICATION_OVERLAY"
         tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="android.permission.INTERNAL_SYSTEM_WINDOW"
         tools:ignore="ProtectedPermissions" />
@@ -100,6 +121,7 @@
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:launchMode="singleTask"
             android:taskAffinity="com.portalpad.app.wallpaper"
+            android:excludeFromRecents="true"
             android:theme="@style/Theme.PortalPad.Trackpad" />
 
         <!-- App / activity picker for home & back & dock customization -->
@@ -107,6 +129,12 @@
             android:name=".ui.settings.AppPickerActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.PortalPad.FastLaunch" />
+
+        <!-- In-app update checker page (opened from the top-bar update icon) -->
+        <activity
+            android:name=".ui.settings.UpdateActivity"
+            android:exported="false"
             android:theme="@style/Theme.PortalPad.FastLaunch" />
 
         <!-- Window-limit manager: lists open external windows to close (on phone).

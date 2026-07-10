@@ -65,6 +65,25 @@ class DockPresentation(
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // DEFANG the window. A Presentation is a fullscreen dialog: its default
+        // theme background is OPAQUE and it takes focus — used as the dock
+        // fallback that combination obscured the ENTIRE session (grey screen,
+        // apps launching invisibly underneath, focus stolen from them;
+        // 2026-07-09 SF/WM dumps: sole HWC layer on the panel + WM
+        // mObscuringWindow). The dock content is a bottom strip on a
+        // transparent Box, so make the WINDOW match: transparent background,
+        // never focusable, touches outside the strip pass through via
+        // NOT_TOUCH_MODAL. Correct for the legit OEM-fallback use too — a dock
+        // over content instead of a dock over a void.
+        window?.let { w ->
+            w.setBackgroundDrawable(
+                android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT),
+            )
+            w.addFlags(
+                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            )
+        }
         savedStateRegistryController.performAttach()
         savedStateRegistryController.performRestore(savedInstanceState)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)

@@ -107,6 +107,12 @@ data class SavedWindow(
     val top: Int = 0,
     val right: Int = 0,
     val bottom: Int = 0,
+    // Task id at snapshot time. Lets restore find this exact window among the
+    // "refugee" tasks Android reparents to the phone display when the external
+    // display is torn down (resolution switch), and MOVE it back — same task,
+    // same in-app state — instead of relaunching a blank duplicate. -1 (old
+    // snapshots) disables exact matching; those fall back to relaunch.
+    val taskId: Int = -1,
 ) {
     val bounds: WindowBounds get() = WindowBounds(left, top, right, bottom)
 }

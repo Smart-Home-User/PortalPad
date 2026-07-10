@@ -74,6 +74,12 @@ class CursorOverlay(
     // (hotspot at top-left) vs a resize glyph (centered on the point).
     @Volatile private var currentType: CursorType = CursorType.ARROW
 
+    /** True when the cursor window is currently attached. [show] swallows add
+     *  failures (e.g. transient a11y-token invalidity on a fresh VD), so
+     *  callers that must GUARANTEE a visible cursor check this and retry —
+     *  otherwise the session runs with a working but INVISIBLE cursor. */
+    val isAttached: Boolean get() = cursorView != null
+
     fun show() {
         if (cursorView != null) return
 
@@ -134,6 +140,19 @@ class CursorOverlay(
             // the dumpsys diff: the reference implementation's IME insets stay stable on the VD,
             // ours were churning.
             softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
+        }
+
+        // EXPERIMENT (permfix): exempt the cursor from HIDE_NON_SYSTEM_OVERLAY_
+        // WINDOWS (the security hide that blanks non-system overlays while a USB/
+        // permission dialog is up) so it stays visible during and after such a
+        // dialog. Only effective if the app holds SYSTEM_APPLICATION_OVERLAY
+        // (granted via Shizuku at session start); silently ignored otherwise.
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            runCatching {
+                WindowManager.LayoutParams::class.java
+                    .getMethod("setSystemApplicationOverlay", Boolean::class.javaPrimitiveType)
+                    .invoke(p, true)
+            }
         }
 
         try {

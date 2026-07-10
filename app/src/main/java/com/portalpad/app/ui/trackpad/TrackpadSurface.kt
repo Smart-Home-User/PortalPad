@@ -61,6 +61,18 @@ fun TrackpadSurface(
     val activeTouches = remember { mutableStateMapOf<Long, FingerTouch>() }
     val context = LocalContext.current
 
+    // UNBUFFERED TOUCH DISPATCH — Android batches touch events to the PHONE
+    // display's vsync before delivery (~8ms of added staleness at 120Hz, 16ms
+    // at 60Hz). This view is a latency-sensitive input surface (same class as
+    // a game), so ask for events at full digitizer rate instead. API 30+
+    // (our minSdk). One call; persists for this view.
+    val rootView = androidx.compose.ui.platform.LocalView.current
+    LaunchedEffect(rootView) {
+        runCatching {
+            rootView.requestUnbufferedDispatch(android.view.InputDevice.SOURCE_CLASS_POINTER)
+        }
+    }
+
     // `pointerInput(Unit)` only runs its block once — but we need the
     // recognizer to see fresh `tapToClick` reads on every gesture, not
     // the value captured at first composition. `rememberUpdatedState`
@@ -141,7 +153,13 @@ fun TrackpadSurface(
                                 else -> false
                             }
                         }
-                        val recognizer = GestureRecognizer(sink, tapEnabledRef, deadZoneRef, { pointerAccelState.value })
+                        val recognizer = GestureRecognizer(
+                            sink,
+                            tapEnabledRef,
+                            deadZoneRef,
+                            { pointerAccelState.value },
+                            densityScale = density.density / 2.8125f,
+                        )
                         while (true) {
                             val event = awaitPointerEvent(PointerEventPass.Main)
                             try {
@@ -385,6 +403,14 @@ private class GestureRecognizer(
     // Live read of the user's Pointer-acceleration strength (1.0 = tuned
     // default, 0 = off). A getter so changes apply mid-gesture.
     private val pointerAccel: () -> Float = { 1f },
+    // Density scale for the DISTANCE thresholds below. They were tuned in raw
+    // pixels on a Galaxy S24 at its default display zoom (450dpi class,
+    // density 2.8125) — on that device this is exactly 1.0 and nothing
+    // changes. On lower/higher-density phones the same raw-px gates were
+    // physically bigger/smaller fingerscape, so slop/drag feel didn't
+    // transfer; scaling by density/2.8125 makes the gates the same PHYSICAL
+    // size everywhere. Time thresholds are untouched.
+    private val densityScale: Float = 1f,
 ) {
     // Latest surface width (px), updated each event, for dead-zone evaluation.
     private var surfaceWidth: Float = 0f
@@ -459,29 +485,32 @@ private class GestureRecognizer(
     //     can never tap-click on lift. Tight enough that small adjustment
     //     motions visibly drag the cursor before they could accidentally tap.
     //   Tap window 0–199ms (no slop) = left click.
-    //   Long-press 250ms+ (no slop) = right click. (Small dead zone
-    //     200–249ms is intentional — guards against ambiguous medium-length
-    //     touches that aren't clearly a quick tap nor a deliberate hold.)
-    //   postDragSuppressMs 400: after a drag (slop tripped), the next tap
+    //   Touch-and-hold select 250ms+ (still) — the 200–249ms DEAD ZONE between
+    //     them is intentional: a slightly slow tap (~200–220ms is common for
+    //     deliberate tappers) must fall into safe nothing, NOT pop a context
+    //     menu. (This buffer was lost in a tuning pass when the hold threshold
+    //     drifted to 200ms, making slow taps fire select — restored.)
+    //   postDragSuppressMs 220: after a REAL drag (button-held), the next tap
     //     within this window is suppressed. Eliminates the "drag → lift →
     //     finger re-touches to continue positioning" accidental-click class.
-    //     Long-press right-clicks are still allowed (≥250ms held).
-    private val slopPx = 5f
+    //     Plain cursor moves do NOT arm this (see the moved-beyond-slop
+    //     branch) — "slide to target, then tap" must always click.
+    //   Distances scale by [densityScale]; times are absolute.
+    private val slopPx = 5f * densityScale
     // Tap-slop is looser than the drag-start slop above: a finger tap (especially
     // a thumb) naturally rolls a few px between touch-down and lift, so the 5px
     // gate rejected real taps as "moved-beyond-slop". 8px admits that roll while
     // staying well short of a deliberate cursor slide. Used ONLY to disqualify a
     // lift from being a tap — drag-start still uses slopPx so double-tap-drag
     // begins just as crisply.
-    private val tapSlopPx = 8f
+    private val tapSlopPx = 8f * densityScale
     // Long-press right-click tolerates more drift than a tap: a finger held
     // still for over a second jitters well past the 5px tap-slop (~12–17px
     // observed), but a genuine cursor-repositioning slide travels much farther.
     // 40px cleanly separates "still hold with jitter" from "actually sliding".
-    private val longPressSlopPx = 40f
+    private val longPressSlopPx = 40f * densityScale
     private val tapMaxDurationMs = 200L
-    private val doubleTapWindowMs = 280L
-    private val longPressThresholdMs = 200L
+    private val longPressThresholdMs = 250L
     // On a resize edge, a much shorter hold engages the resize so the border pops
     // almost immediately on a deliberate press-hold — but still long enough that a
     // quick press-and-slide near an edge stays a plain cursor move, not a resize.
@@ -493,7 +522,7 @@ private class GestureRecognizer(
     // Stillness slop for that hold: drift within this of the rest anchor counts as
     // "holding still" (absorbs natural hold jitter); drifting past it restarts the
     // timer. Set above typical hold jitter but below a deliberate slide.
-    private val restSlopPx = 18f
+    private val restSlopPx = 18f * densityScale
     // After a resize/caption drag ends, the cursor is parked on the edge with the
     // arrow still showing. For this grace window a fresh press there moves the
     // cursor instead of instantly re-grabbing, so you can slide away without timing
@@ -503,13 +532,13 @@ private class GestureRecognizer(
     // place for longPressThresholdMs, moving past this distance commits to a
     // button-held drag. Bigger than tapSlopPx so a still hold's natural jitter
     // (~12-17px) stays a "select" long-press rather than accidentally dragging.
-    private val dragEngagePx = 24f
+    private val dragEngagePx = 24f * densityScale
     private val postDragSuppressMs = 220L
     private val twoFingerTapTimeoutMs = 220L
-    private val twoFingerSlopPx = 24f
+    private val twoFingerSlopPx = 24f * densityScale
     // Minimum per-frame movement to actually emit onMove. Avoids sending a
     // flood of zero-motion hover events when the finger is steady.
-    private val motionEpsilonPx = 0.5f
+    private val motionEpsilonPx = 0.5f * densityScale
 
     fun onPointerEvent(changes: List<PointerInputChange>, surfaceWidthPx: Float = 0f) {
         surfaceWidth = surfaceWidthPx

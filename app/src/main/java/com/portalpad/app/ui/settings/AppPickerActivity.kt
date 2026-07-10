@@ -95,8 +95,13 @@ class AppPickerActivity : com.portalpad.app.PinnedDensityActivity() {
     private suspend fun applySingle(target: String, entry: AppEntry) {
         val app = PortalPadApp.instance
         when {
-            target == "home" -> app.prefs.setHomeAction(entry)
-            target == "back" -> app.prefs.setBackAction(BackAction.Launch(entry))
+            // Nav buttons default NEW assignments to FULLSCREEN (freeform=false):
+            // the primary use case is Android-TV-style launchers that should own
+            // the panel. The "Launch app in full screen" toggle under Current
+            // Action opts an assignment back into a window. Other targets (wheel,
+            // gestures, prog keys) keep AppEntry's default (freeform=true).
+            target == "home" -> app.prefs.setHomeAction(entry.copy(freeform = false))
+            target == "back" -> app.prefs.setBackAction(BackAction.Launch(entry.copy(freeform = false)))
             target == "gesture_up" -> app.prefs.setGestureAppUp(entry)
             target == "gesture_down" -> app.prefs.setGestureAppDown(entry)
             target == "gesture_left" -> app.prefs.setGestureAppLeft(entry)
@@ -512,6 +517,72 @@ private fun AppPickerScreen(
                         overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                         modifier = Modifier.fillMaxWidth(),
                     )
+                }
+                // Per-assignment launch mode — ALWAYS visible for the Home/Back
+                // pickers so the option and the fullscreen default are
+                // discoverable before anything is assigned. Live and editable
+                // only for a real app/activity assignment; greyed (with an
+                // explanatory subtitle) when nothing is assigned or the
+                // assignment is a shortcut (those fire on the phone) / System.
+                // Toggle semantics: ON = full screen = freeform=false. New
+                // assignments are written freeform=false (ON); entries saved
+                // before the flag existed stay freeform (OFF) via the field's
+                // serialization default — no silent behavior change.
+                run {
+                    val currentEntry: AppEntry? = when (target) {
+                        "home" -> homeActionState
+                        "back" -> (backActionState as? BackAction.Launch)?.entry
+                        else -> null
+                    }
+                    val isShortcutEntry = currentEntry?.isShortcut == true
+                    val editable = currentEntry != null && !isShortcutEntry
+                    val ffScope = rememberCoroutineScope()
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                            Text(
+                                "Launch app in full screen",
+                                color = if (editable) AbOnSurface else AbOnSurfaceDim,
+                                style = MaterialTheme.typography.bodyLarge,
+                            )
+                            Text(
+                                when {
+                                    isShortcutEntry ->
+                                        "Not applicable to shortcuts — they run on the phone."
+                                    currentEntry == null ->
+                                        "Assign an app or activity to use this. New assignments launch full screen."
+                                    else ->
+                                        "Best for TV-style launchers. Turn off to launch as a freeform window. Applies on the app's next launch."
+                                },
+                                color = if (editable) AbOnSurfaceMuted else AbOnSurfaceDim,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        Switch(
+                            checked = if (editable) !(currentEntry!!.freeform) else true,
+                            enabled = editable,
+                            onCheckedChange = { on ->
+                                val entry = currentEntry ?: return@Switch
+                                ffScope.launch {
+                                    val updated = entry.copy(freeform = !on)
+                                    when (target) {
+                                        "home" -> app.prefs.setHomeAction(updated)
+                                        "back" -> app.prefs.setBackAction(BackAction.Launch(updated))
+                                    }
+                                }
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedTrackColor = AbPrimary,
+                                checkedThumbColor = AbPrimaryBright,
+                                uncheckedTrackColor = AbSurfaceElevated,
+                                uncheckedThumbColor = AbOnSurfaceDim,
+                            ),
+                        )
+                    }
                 }
                 }
             }

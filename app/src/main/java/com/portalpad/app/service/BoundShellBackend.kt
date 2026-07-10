@@ -90,6 +90,25 @@ interface BoundShellBackend {
      *  the privileged process. */
     fun setLayerColorTransform(layer: android.view.SurfaceControl, matrix12: FloatArray): String
 
+    /** EXPERIMENT (permfix / AirBeam parity): passively probe whether the
+     *  SurfaceControl display-mirror primitives are usable on this ROM, WITHOUT
+     *  disturbing the live display. Resolves the physical panel token, tries
+     *  createDisplay (destroying the result immediately), and reports which
+     *  mirror primitives are invokable. The returned string is a one-line
+     *  capability summary for the log — decides whether an AirBeam-style
+     *  overlay-free system mirror is even reachable here before we build it. */
+    fun probeMirrorCapability(physicalDisplayHint: Int): String
+
+    /** EXPERIMENT (permfix / AirBeam parity): retarget the glasses panel to the
+     *  VD's layerStack (overlay-free mirror). [stopLayerStackMirror] restores
+     *  the panel's original layerStack; safe to call even if start failed. */
+    fun startLayerStackMirror(glassesDisplayId: Int, vdDisplayId: Int): String
+    fun stopLayerStackMirror(glassesDisplayId: Int): String
+
+    /** Best-effort delivered-fps for a display from SurfaceFlinger frame stats
+     *  (system-mirror Performance overlay). Non-positive when unavailable. */
+    fun sampleDisplayFps(displayId: Int): Float
+
     // ─── Diagnostics ────────────────────────────────────────────────────
     fun streamLogcat(filter: String? = null): ParcelFileDescriptor?
     fun stopLogcatStream()

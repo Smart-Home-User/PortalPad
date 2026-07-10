@@ -34,4 +34,5 @@
     <style name="Theme.PortalPad.FastLaunch" parent="Theme.PortalPad">
         <item name="android:windowBackground">#0F0A1A</item>
     </style>
+
 </resources>

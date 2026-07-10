@@ -55,7 +55,13 @@ object GlassesToast {
             dismissNow()
             val host = OverlayHost.forDisplay(display, serviceContext)
             val ctx = host.context
-            val density = ctx.resources.displayMetrics.density
+            // A display that's still settling (e.g. right after a wallpaper
+            // activity launches on it) can report density/metrics as 0 — which
+            // collapsed every density-scaled dimension to 0 and laid the whole
+            // card out at 0x0 (invisible until a much-later relayout, seen as a
+            // one-frame flash at teardown). Floor both so the card always has a
+            // real size, independent of the display's transient state.
+            val density = ctx.resources.displayMetrics.density.takeIf { it > 0.1f } ?: 2.0f
 
             @Suppress("DEPRECATION")
             val metrics = android.util.DisplayMetrics().also { display.getRealMetrics(it) }
@@ -159,6 +165,11 @@ object GlassesToast {
         dismissRunnable = null
         current?.let { (wm, v) -> runCatching { wm.removeView(v) } }
         current = null
+    }
+
+    /** Public dismiss — clears any live toast/card immediately. */
+    fun dismiss() {
+        mainHandler.post { dismissNow() }
     }
 
     private const val TAG = "GlassesToast"

@@ -119,6 +119,29 @@ interface IShellService {
      */
     String setLayerColorTransform(in SurfaceControl layer, in float[] matrix12);
 
+    /**
+     * EXPERIMENT (permfix / AirBeam parity): passively report whether the
+     * SurfaceControl display-mirror primitives are usable on this ROM WITHOUT
+     * disturbing the live display. Returns a one-line capability summary.
+     */
+    String probeMirrorCapability(int physicalDisplayHint);
+
+    /**
+     * EXPERIMENT (permfix / AirBeam parity): retarget the physical glasses
+     * panel to composite the VD's layerStack directly (overlay-free mirror).
+     * start returns a status string; stop restores the panel's original
+     * layerStack. Reversible; safe to call stop even if start failed.
+     */
+    String startLayerStackMirror(int glassesDisplayId, int vdDisplayId);
+    String stopLayerStackMirror(int glassesDisplayId);
+
+    /**
+     * Best-effort delivered-fps for a display from SurfaceFlinger frame stats,
+     * for the system-mirror Performance overlay (no GL loop to count there).
+     * Returns fps, or a non-positive value if it can't be determined.
+     */
+    float sampleDisplayFps(int displayId);
+
     // ─── Surface mirror: glasses physical → our virtual display ────────
     boolean startSurfaceMirror(int physicalDisplayId, in Surface surface);
     void stopSurfaceMirror(int physicalDisplayId);

@@ -42,6 +42,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Brush
@@ -147,7 +148,7 @@ fun SettingsScreen(
     Scaffold(
         topBar = {
             BrandedTopBar(
-                onSettingsPage = showSystem || showPermissions,
+                onSettingsPage = showSystem || showPermissions || showResources,
                 onOpenSettings = {
                     showResources = false; showDiagnostics = false; showSystem = true
                 },
@@ -238,10 +239,9 @@ fun SettingsScreen(
                     }
                 }
             }
-            // ── Settings | Permissions strip — BELOW the main nav, ONLY on the
-            // two 3-dot-reachable pages (Privilege Source + Permissions). Hidden
-            // everywhere else.
-            if (showSystem || showPermissions) {
+            // ── Settings | Permissions | Resources strip — BELOW the main nav,
+            // ONLY on these three peer pages. Hidden everywhere else.
+            if (showSystem || showPermissions || showResources) {
                 Row(
                     Modifier
                         .fillMaxWidth()
@@ -282,6 +282,14 @@ fun SettingsScreen(
                         showDockCustomization = false; showTopBarCustomization = false; showFolderWindowCustomization = false
                         showPermissions = true
                     }
+                    VerticalDivider(color = AbSurface, modifier = Modifier.height(16.dp))
+                    sectionLabel("Resources", showResources) {
+                        if (showResources) scrollToTopTick++
+                        showSystem = false; showPermissions = false; showDiagnostics = false
+                        showDisplay = false; showWallpaperPicker = false; showFolderManager = false
+                        showDockCustomization = false; showTopBarCustomization = false; showFolderWindowCustomization = false
+                        showResources = true
+                    }
                 }
             }
             HorizontalDivider(color = AbSurface, thickness = 1.dp)
@@ -296,7 +304,7 @@ fun SettingsScreen(
             } else {
 
             if (showResources) {
-                ResourcesPage(onBack = { showResources = false })
+                ResourcesPage()
             } else if (showDiagnostics) {
                 DiagnosticsPage(onBack = { showDiagnostics = false })
             } else if (showSystem) {
@@ -322,7 +330,6 @@ fun SettingsScreen(
                         onBackupNow = onBackupNow,
                         onRestoreFromFile = onRestoreFromFile,
                         onScheduleBackup = onScheduleBackup,
-                        onOpenResources = { showResources = true },
                     )
                 }
             } else if (showDisplay) {
@@ -1448,29 +1455,17 @@ private fun PermBadge(status: PermStatus) {
  * setup-time reference content, not something you return to constantly.
  */
 @Composable
-private fun ResourcesPage(onBack: () -> Unit) {
+private fun ResourcesPage() {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     Column(Modifier.fillMaxSize()) {
-        // Header with back arrow.
+        // Header — no back arrow: Resources is a top-strip peer of
+        // Settings/Permissions now (was a Settings sub-page with a box).
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 8.dp),
+                .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(
-                Modifier
-                    .clip(RoundedCornerShape(10.dp))
-                    .clickable { onBack() }
-                    .padding(8.dp),
-            ) {
-                Icon(
-                    Icons.AutoMirrored.Filled.KeyboardArrowLeft,
-                    contentDescription = "Back",
-                    tint = AbOnSurface,
-                )
-            }
-            Spacer(Modifier.width(4.dp))
             Text(
                 "Resources",
                 color = AbOnSurface,
@@ -1848,15 +1843,22 @@ private fun BrandedTopBar(onSettingsPage: Boolean, onOpenSettings: () -> Unit) {
                 Spacer(Modifier.width(8.dp))
                 // Version number — makes it easy to confirm which build is
                 // actually installed without digging into system settings.
+                // Amber when the last update check says this binary is NOT the
+                // published latest (ahead of GitHub, or same tag but different
+                // bytes); the update page explains why.
                 Text(
                     "v${com.portalpad.app.BuildConfig.VERSION_NAME}",
-                    color = AbOnSurfaceMuted,
+                    color = if (com.portalpad.app.service.UpdateChecker.versionTintAmber.value) {
+                        com.portalpad.app.ui.theme.AbWarning
+                    } else {
+                        AbOnSurfaceMuted
+                    },
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Spacer(Modifier.width(6.dp))
                 // Check for updates — sits right after the version so "your build"
-                // and "is there a newer one?" read together. Opens the GitHub repo
-                // in the browser (no INTERNET permission needed for ACTION_VIEW).
+                // and "is there a newer one?" read together. Opens the in-app
+                // update page (v1.3+); the page itself links out to GitHub.
                 Icon(
                     Icons.Default.Sync,
                     contentDescription = "Check for updates",
@@ -1864,8 +1866,26 @@ private fun BrandedTopBar(onSettingsPage: Boolean, onOpenSettings: () -> Unit) {
                     modifier = Modifier
                         .size(18.dp)
                         .clip(RoundedCornerShape(50))
-                        .clickable { openUrl(ctx, "https://github.com/Smart-Home-User/PortalPad/releases") },
+                        .clickable {
+                            ctx.startActivity(
+                                android.content.Intent(
+                                    ctx,
+                                    com.portalpad.app.ui.settings.UpdateActivity::class.java,
+                                ),
+                            )
+                        },
                 )
+                // "« New" hint — visible only when the last update check found a
+                // release newer than this build (and it wasn't skipped). State is
+                // owned by UpdateChecker; refreshed on launch and on page checks.
+                if (com.portalpad.app.service.UpdateChecker.badgeVisible.value) {
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        "\u00ab New",
+                        color = AbAccent,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
             }
         },
         actions = {
@@ -3557,11 +3577,20 @@ private fun StartTab(onEnableClick: () -> Unit, onGoToSystemTab: () -> Unit, onG
                 .border(1.dp, Color(0xFF8A7A4D), RoundedCornerShape(12.dp))
                 .padding(horizontal = 12.dp, vertical = 10.dp),
         ) {
-            Text(
-                "DRM-protected content isn't supported on the external display. In streaming apps you may see a black screen, an HDCP error, or a copyright-protection notice.",
-                color = Color(0xFFB8A66A),
-                style = MaterialTheme.typography.bodySmall,
-            )
+            Column {
+                Text(
+                    "DRM-protected video may not play on the external display.\n" +
+                        "In streaming apps you may see a black screen, an HDCP error, or a copyright-protection notice.",
+                    color = Color(0xFFB8A66A),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Turning on System mirror (Display settings) may fix this for some DRM-protected streaming apps.",
+                    color = AbOnSurfaceMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
         }
         // Two primary actions side by side: Start/Stop Service (left) and Launch
         // trackpad (right). Equal size, shorter height, each with a two-line label
@@ -3785,9 +3814,9 @@ private fun StartTab(onEnableClick: () -> Unit, onGoToSystemTab: () -> Unit, onG
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(10.dp))
                     .clickable { onOpenAutoLaunch() }
-                    .padding(vertical = 8.dp, horizontal = 8.dp),
+                    .padding(vertical = 4.dp, horizontal = 8.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 Text(
                     "Auto Launch on Start", color = AbOnSurfaceMuted,
@@ -3809,7 +3838,7 @@ private fun StartTab(onEnableClick: () -> Unit, onGoToSystemTab: () -> Unit, onG
                 }
             }
             androidx.compose.material3.HorizontalDivider(
-                modifier = Modifier.padding(vertical = 6.dp),
+                modifier = Modifier.padding(vertical = 3.dp),
                 thickness = 1.dp,
                 color = AbOnSurfaceDim.copy(alpha = 0.5f),
             )
@@ -5296,6 +5325,28 @@ fun DisplaySubpage(onBack: () -> Unit) {
                 fontWeight = FontWeight.Bold,
             )
 
+            SectionCard(title = "Display pipeline") {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text("System mirror (experimental)", color = AbOnSurface)
+                        Text(
+                            "Carries the external display's picture through the system compositor instead of an app-overlay window, so it no longer goes black when a USB or permission dialog appears, and some DRM video plays that otherwise wouldn't (like Netflix or Prime Video, though other streaming apps may still not work).",
+                            color = AbOnSurfaceMuted,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        Spacer(Modifier.height(3.dp))
+                        Text(
+                            "Trade-off: color tuning, screen size, Side Mode and the performance overlay's frame-rate stats aren't available in this mode.\nTurn OFF for full color and all display controls.",
+                            color = AbOnSurfaceDim,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    androidx.compose.material3.Switch(
+                        checked = app.prefs.panelSystemMirror.collectAsState(initial = false).value,
+                        onCheckedChange = { scope.launch { app.prefs.setPanelSystemMirror(it) } },
+                    )
+                }
+            }
             SectionCard(title = "Display DPI") {
                 // In an app-owned session with Shizuku stopped, DPI can't be
                 // reconfigured (reconfigure needs the shell identity), so flag it
@@ -5476,7 +5527,7 @@ fun DisplaySubpage(onBack: () -> Unit) {
                 )
             }
 
-            SectionCard(title = "Screen size") {
+            SectionCard(title = "Screen size", disabled = app.prefs.panelSystemMirror.collectAsState(initial = false).value) {
                 val connected = externalDisplayId != null || physicalExternalDisplayId != null
                 val sizeAlpha = if (connected) 1f else 0.4f
                 val sizeValue = screenSizePct.toFloat().coerceIn(50f, 100f)
@@ -5541,7 +5592,7 @@ fun DisplaySubpage(onBack: () -> Unit) {
                     com.portalpad.app.data.SideCorner.BL -> "bottom-left"
                     com.portalpad.app.data.SideCorner.BR -> "bottom-right"
                 }
-                SectionCard(title = "Side Mode") {
+                SectionCard(title = "Side Mode", disabled = app.prefs.panelSystemMirror.collectAsState(initial = false).value) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text(
@@ -5683,7 +5734,7 @@ fun DisplaySubpage(onBack: () -> Unit) {
                 }
                 fun maybeLive() { if (live && gpuOn) { apply(); persist() } }
 
-                SectionCard(title = "Color tuning") {
+                SectionCard(title = "Color tuning", disabled = app.prefs.panelSystemMirror.collectAsState(initial = false).value) {
                     Text(
                         "Tunes the external display color (not the phone), via a GPU color pass. Settings are saved and re-applied automatically when you reconnect the external display.",
                         color = AbOnSurfaceMuted,
@@ -5827,7 +5878,41 @@ fun DisplaySubpage(onBack: () -> Unit) {
                     Text(status, color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodySmall)
                 }
             }
-            PerformanceOverlaySection(app, scope)
+            PerformanceOverlaySection(app, scope, mirrorOn = app.prefs.panelSystemMirror.collectAsState(initial = false).value)
+
+            // Page-wide reset: return all Display *appearance* settings to their
+            // defaults in one tap — DPI (Auto), aspect (AUTO), screen size (100%),
+            // Side Mode, color tuning + GPU pipeline. Intentionally does NOT touch
+            // the System-mirror mode toggle or the Performance-overlay rows (those
+            // are modes/diagnostics, not appearance).
+            Spacer(Modifier.height(12.dp))
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(AbSurfaceElevated)
+                    .border(1.dp, AbAccent.copy(alpha = 0.45f), RoundedCornerShape(14.dp))
+                    .clickable {
+                        scope.launch {
+                            app.prefs.setDisplayDpi(0)
+                            app.prefs.setAspectRatio("AUTO")
+                            app.prefs.setScreenSizePct(100)
+                            app.prefs.setSideModeConfig(com.portalpad.app.data.SideModeConfig())
+                            app.prefs.setColorTuning("")
+                            app.prefs.setGpuColorPipeline(true)
+                        }
+                    }
+                    .padding(vertical = 14.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "Reset all display settings",
+                    color = AbOnSurface,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            Spacer(Modifier.height(8.dp))
         }
 
         // Pinned "← Back" — same position/style as the button-actions page.
@@ -5857,6 +5942,7 @@ fun DisplaySubpage(onBack: () -> Unit) {
 private fun PerformanceOverlaySection(
     app: PortalPadApp,
     scope: kotlinx.coroutines.CoroutineScope,
+    mirrorOn: Boolean = false,
 ) {
     val enabled by app.prefs.bool(PreferencesRepository.Keys.HUD_ENABLED, false)
         .collectAsState(initial = false)
@@ -5879,6 +5965,14 @@ private fun PerformanceOverlaySection(
             color = AbOnSurfaceMuted,
             style = MaterialTheme.typography.bodySmall,
         )
+        if (mirrorOn) {
+            Text(
+                "System mirror is on: the overlay shows the resolution and refresh rate. " +
+                    "Frame-rate stats (fps, draw time, frames behind) need overlay mode.",
+                color = AbOnSurfaceMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(
                 "Show overlay",
@@ -6131,6 +6225,13 @@ private fun WorkspaceTab(
                 desc = "When desktop windows is on, tapping a dock app opens it as a freeform window instead of fullscreen.",
                 key = PreferencesRepository.Keys.DOCK_OPENS_FREEFORM,
                 default = true,
+            )
+            ToggleRowWithDesc(
+                label = "Handle permission prompts on the phone",
+                desc = "When an app opened on the external display asks for a permission (notifications, camera, etc.), Android shows the prompt there as an unusable black window. With this on, PortalPad closes the app, shows an Allow/Deny popup on the trackpad screen, applies your choices via Shizuku or Root, and reopens the app on the external display. Turn off to leave the system prompt as-is.",
+                key = PreferencesRepository.Keys.PERM_DIALOG_KEEP_ON_EXTERNAL,
+                default = true,
+                requirement = Requirement.ROOT_OR_SHIZUKU,
             )
             val maxWin by prefs.int(PreferencesRepository.Keys.MAX_WINDOWS, default = 5)
                 .collectAsState(initial = 5)
@@ -7001,6 +7102,28 @@ private fun DisplayTab() {
     }
 
     TabBody {
+        SectionCard(title = "Display pipeline") {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text("System mirror (experimental)", color = AbOnSurface)
+                    Text(
+                        "Carries the external display's picture through the system compositor instead of an app-overlay window, so it no longer goes black when a USB or permission dialog appears, and some DRM video plays that otherwise wouldn't (like Netflix or Prime Video, though other streaming apps may still not work).",
+                        color = AbOnSurfaceMuted,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        "Trade-off: color tuning, screen size, Side Mode and the performance overlay's frame-rate stats aren't available in this mode.\nTurn OFF for full color and all display controls.",
+                        color = AbOnSurfaceDim,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                androidx.compose.material3.Switch(
+                    checked = prefs.panelSystemMirror.collectAsState(initial = false).value,
+                    onCheckedChange = { scope.launch { prefs.setPanelSystemMirror(it) } },
+                )
+            }
+        }
         SectionCard(title = "Target display") {
             OutlinedCard(
                 Modifier.fillMaxWidth(),
@@ -7191,7 +7314,6 @@ private fun SystemTab(
     onBackupNow: () -> Unit,
     onRestoreFromFile: () -> Unit,
     onScheduleBackup: (dayOfWeek: Int, hour: Int) -> Unit,
-    onOpenResources: () -> Unit,
 ) {
     val app = PortalPadApp.instance
     val prefs = app.prefs
@@ -7212,39 +7334,6 @@ private fun SystemTab(
     val ctx = androidx.compose.ui.platform.LocalContext.current
 
     TabBody {
-        // Compact pointer to the Resources sub-page (companion apps + guides).
-        // Kept small here so System stays focused on setup/permissions; the
-        // full list lives on its own screen with room to breathe.
-        SectionCard(title = "Resources") {
-            Text(
-                "New here? Companion apps and guides that help you get PortalPad set up and running smoothly.",
-                color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium,
-            )
-            Spacer(Modifier.height(8.dp))
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(AbSurfaceElevated)
-                    .clickable { onOpenResources() }
-                    .padding(horizontal = 14.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    "Open Resources",
-                    color = AbOnSurface,
-                    fontWeight = FontWeight.SemiBold,
-                    style = MaterialTheme.typography.bodyLarge,
-                    modifier = Modifier.weight(1f),
-                )
-                Icon(
-                    Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                    contentDescription = null,
-                    tint = AbPrimaryBright,
-                )
-            }
-        }
-
         SectionCard(title = "Privilege source") {
             Text(
                 "How PortalPad performs elevated operations like launching apps on external displays, external-display / AR-glasses click routing, IME policy, and granting Android permissions.",
@@ -8531,12 +8620,15 @@ private fun SectionCard(
     centeredTitleNoDot: Boolean = false,
     tightSpacing: Boolean = false,
     titleDivider: Boolean = false,
+    disabled: Boolean = false,
     content: @Composable ColumnScope.() -> Unit,
 ) {
+    androidx.compose.foundation.layout.Box {
     Card(
         colors = CardDefaults.cardColors(containerColor = AbSurface),
         shape = RoundedCornerShape(20.dp),
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth()
+            .then(if (disabled) Modifier.alpha(0.4f) else Modifier),
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(if (tightSpacing) 5.dp else 10.dp)) {
             if (title.isNotEmpty()) {
@@ -8562,6 +8654,18 @@ private fun SectionCard(
                 HorizontalDivider(color = AbSurfaceElevated, thickness = 1.dp)
             }
             content()
+        }
+    }
+        // When disabled, overlay a transparent catcher that consumes all touch
+        // so the (dimmed) controls can't be interacted with. Saved values are
+        // untouched — flipping back re-enables them exactly as they were.
+        if (disabled) {
+            androidx.compose.foundation.layout.Box(
+                Modifier.matchParentSize().clickable(
+                    interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                    indication = null,
+                ) {},
+            )
         }
     }
 }

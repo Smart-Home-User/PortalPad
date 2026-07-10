@@ -126,10 +126,6 @@ class ShizukuManager(private val context: Context) : ElevatedAccess {
         execShell("am task resize $taskId $left $top $right $bottom")
     }
 
-    fun splitScreen(taskId: Int) {
-        execShell("am stack move-task $taskId 3 true")
-    }
-
     companion object {
         private const val TAG = "ShizukuManager"
         private const val SHIZUKU_PKG = "moe.shizuku.privileged.api"

@@ -22,8 +22,14 @@ android {
         applicationId = "com.portalpad.app"
         minSdk = 30
         targetSdk = 34
-        versionCode = 120
-        versionName = "1.2-beta"
+        versionCode = 130
+        versionName = "1.3-beta"
+        // Compile timestamp for the update checker's same-tag heuristic: when
+        // the installed versionName equals GitHub's latest tag but the release
+        // asset carries no sha256 digest, a release published AFTER this build
+        // was compiled triggers a soft "reinstall to be sure" hint. Regenerated
+        // every build (slightly weaker incremental caching — accepted).
+        buildConfigField("long", "BUILD_TIME_MS", "${System.currentTimeMillis()}L")
         vectorDrawables { useSupportLibrary = true }
         // Ship only 64-bit ARM. Every phone that can drive XREAL glasses (USB-C
         // DisplayPort Alt Mode, and DeX/desktop mode on top of that) is arm64-v8a —

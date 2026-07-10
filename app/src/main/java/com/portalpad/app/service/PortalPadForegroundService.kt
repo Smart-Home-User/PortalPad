@@ -68,6 +68,39 @@ class PortalPadForegroundService : Service() {
     /** Visible mirror of the trusted VD's content on the physical glasses
      *  display. Null when not in Display Glasses mode. */
     private var vdMirror: com.portalpad.app.presentation.VirtualDisplayMirror? = null
+    /** Glasses logical display id whose panel layerStack is currently retargeted
+     *  by the system-mirror path (>=0 = active). Lets teardown/reconcile restore
+     *  the panel's original layerStack. -1 = no system mirror active. */
+    private var systemMirrorGlassesId: Int = -1
+    /** VD logical display id paired with [systemMirrorGlassesId], so the mirror
+     *  can be re-applied after screen-on (One UI clobbers the panel's layerStack
+     *  during the wake ColorFade). -1 when no mirror active. */
+    private var systemMirrorVdId: Int = -1
+    /** TRANSIENT mirror override for permission dialogs. When true,
+     *  [refreshExternalDisplay]'s panel-feed selection treats the panel as if
+     *  System mirror were on, WITHOUT touching the user's saved PANEL_SYSTEM_MIRROR
+     *  pref — so an overlay-mode user's screen isn't blacked out by the security
+     *  overlay-hide while an Android permission prompt is up. Reverts on a safety
+     *  timeout (Stage 1) or when the dialog closes (Stage 2). Set only via
+     *  [beginTransientMirrorForDialog] / cleared via [endTransientMirrorInternal]. */
+    @Volatile private var transientMirrorForDialog = false
+    /** Set when onCreate detects a sticky relaunch after a deliberate user stop
+     *  and aborts before any setup — onDestroy/onStartCommand then skip
+     *  teardown/restart for this instance (nothing was ever set up). */
+    @Volatile private var abortedRelaunch = false
+    /** True while a suspected mass window death (LMK/crash) has HELD one
+     *  snapshot write — the next capture either confirms the reduced state
+     *  (persists → written) or the layout recovered. See captureSessionNow. */
+    @Volatile private var snapshotCollapsePending = false
+    /** Pending safety-timeout revert for [transientMirrorForDialog] (main thread). */
+    private var transientMirrorRevertJob: Runnable? = null
+    /** Standalone Performance-overlay HUD used in system-mirror mode (there's no
+     *  VD-mirror host to parent into). Null in overlay mode / when not shown. */
+    private var mirrorHud: com.portalpad.app.presentation.PerformanceHud? = null
+    /** Latest SurfaceFlinger delivered-fps for the mirror HUD, refreshed by a
+     *  background poll while the mirror HUD is active. -1 = unavailable. */
+    @Volatile private var mirrorSfFps: Float = -1f
+    private var mirrorFpsJob: kotlinx.coroutines.Job? = null
     /** The display the cursor/nav/dock overlays were last attached to. Lets
      *  pref watchers re-attach overlays without a full VD teardown/rebuild. */
     private var lastOverlayDisplay: Display? = null
@@ -336,6 +369,7 @@ class PortalPadForegroundService : Service() {
                 return
             }
             Log.d(TAG, "Display added: $displayId")
+            cancelGraceTeardown("display $displayId added")
             // A re-add that closely follows a removal is a flap-recreate (the
             // shell process was reaped + the VD recreated with a new id), NOT a
             // fresh user attach. Captured before the refresh so it reflects the gap.
@@ -408,6 +442,17 @@ class PortalPadForegroundService : Service() {
             // only non-physical (VD) removals honor it.
             if (suppressed && !isPhysicalUnplug) {
                 Log.d(TAG, "Display removed (suppressed): $displayId")
+                // Orphan sweep: if teardown already cleared the tracked external
+                // id, NO dock window should exist anymore — but a stale queued
+                // attach can sneak one in between the physical teardown and this
+                // (deliberately swallowed) VD removal, and it lands on the phone
+                // screen with nobody left to clean it. dismissDock is idempotent;
+                // in the healthy case this is a no-op.
+                val extNow = (applicationContext as? PortalPadApp)?.externalDisplayId?.value
+                if (extNow == null) {
+                    Log.d(TAG, "orphan sweep on suppressed removal (no tracked external) → dismissDock")
+                    runCatching { dismissDock() }
+                }
                 return
             }
             Log.d(
@@ -416,49 +461,180 @@ class PortalPadForegroundService : Service() {
                     if (suppressed && isPhysicalUnplug) " (physical unplug, bypassed suppression)" else "",
             )
             maybeShowTransitionSpinner("displayRemoved", holdUntilReady = false)
+            // DIAG (disconnect-freeze): time each main-thread teardown step so a
+            // capture shows exactly which one blocks. Look for "DISC-STEP".
+            fun discStep(name: String, block: () -> Unit) {
+                val t0 = android.os.SystemClock.uptimeMillis()
+                runCatching { block() }
+                val dt = android.os.SystemClock.uptimeMillis() - t0
+                if (dt > 50) Log.w(TAG, "DISC-STEP $name took ${dt}ms")
+                else Log.d(TAG, "DISC-STEP $name ${dt}ms")
+            }
             // Reset IME policy before tearing down so a dangling policy on the
             // departing display can't strand the phone keyboard.
-            runCatching { (applicationContext as PortalPadApp).injector.resetImePolicy() }
+            discStep("resetImePolicy") { (applicationContext as PortalPadApp).injector.resetImePolicy() }
             // Backup keyboard-wedge cleanup: Extinguish can leave the phone IME
             // wedged after screen on/off cycles during the session. Stopping its
             // service clears that; we then restart it so the user can still use
             // Extinguish elsewhere. Best-effort via Shizuku; no-op without it.
             // Guarded so it can NEVER abort the rest of teardown (dock/VD dismiss,
             // id clearing) — same defensive pattern as the IME reset above.
-            runCatching { cleanupExtinguishOnDisconnect() }
-            dismissDock()
-            dismissVdMirror()
-            bubble.hide()
-            // Finish the home-backdrop if it's up, so the now-orphaned task can't
-            // get migrated by the system onto the phone's default display (which
-            // would make the wallpaper hijack the phone screen).
-            runCatching { com.portalpad.app.WallpaperActivity.finishIfShowing() }
-            // Release the app-owned VirtualDisplay on a real disconnect. Without
-            // this, the VD ("PortalPad Session") stays registered in DisplayManager
-            // and other apps keep listing it as an available external display. Mirror
-            // onDestroy's order: stop the session (releases the VD) BEFORE clearing
-            // the tracked ids. Suppress the listener so the VD's own removal event
-            // doesn't re-enter onDisplayRemoved and double-tear-down.
-            if (virtualDisplaySession.isActive) suppressDisplayListener("displayRemoved-stop")
-            runCatching { virtualDisplaySession.stop() }
-            val tdApp = applicationContext as PortalPadApp
-            tdApp.setExternalDisplayId(null); tdApp.setPhysicalExternalDisplayId(null)
-            tdApp.setVirtualDisplayId(null)
-            lastDisplayRemovedAt = System.currentTimeMillis()
-            // The display we'd reconciled is gone — clear the cache so a
-            // future re-attach doesn't get short-circuited as "same as last".
-            lastReconciledDisplayId = null
-            // The VD is torn down; force the next attach's aspect apply to run.
-            lastAppliedVdSpec = null
-            // The external display is gone, so freeform/force-resizable have no
-            // reason to stay on. Revert now (force_resizable_activities OFF — leaving
-            // it on system-wide crashes SystemUI's split-screen coordinator on later
-            // app launches). Re-enabled on reconnect. Off the main thread (shells out).
-            scope.launch {
-                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    runCatching { tdApp.freeform.disableFreeform() }
+            discStep("cleanupExtinguish") { cleanupExtinguishOnDisconnect() }
+            discStep("dismissDock") { dismissDock() }
+            discStep("dismissVdMirror") { dismissVdMirror() }
+            // Stop the transient-mirror machinery so a late dialog-close tick or
+            // safety-net timer can't revert against the (now gone, or freshly
+            // replugged) display, and so a replug comes back on the user's real
+            // mode. No reconcile — the display is departing.
+            discStep("cancelTransientMirror") { cancelTransientMirrorForTeardown() }
+            discStep("bubbleHide") { bubble.hide() }
+            // Stop media (e.g. Netflix) RIGHT AWAY: its task stays alive briefly
+            // under the grace window, so without this the audio keeps playing out
+            // the phone speaker after the external display it was on is gone.
+            // We momentarily take AUDIOFOCUS_GAIN, which makes the current player
+            // lose focus and pause, then abandon it. This needs no Shizuku/root
+            // (so it still works if elevated access dropped mid-session) and only
+            // fires when something is actually playing. Trade-off: a resolution
+            // flap also pauses playback, and this pauses whatever holds audio
+            // focus (not strictly the glasses app) — both acceptable on unplug.
+            discStep("pauseMediaOnDisconnect") {
+                val am = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                if (am != null && am.isMusicActive) {
+                    val req = android.media.AudioFocusRequest.Builder(
+                        android.media.AudioManager.AUDIOFOCUS_GAIN,
+                    ).setAudioAttributes(
+                        android.media.AudioAttributes.Builder()
+                            .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MOVIE)
+                            .build(),
+                    ).build()
+                    runCatching { am.requestAudioFocus(req) }
+                    // Abandon shortly after so we don't hold focus; the player has
+                    // already paused on the permanent-loss and won't auto-resume.
+                    mainHandler.postDelayed({
+                        runCatching { am.abandonAudioFocusRequest(req) }
+                    }, 600L)
                 }
             }
+            // ── GRACE-PERIOD disconnect model (rollback of the parking design,
+            // which needed compensation on compensation: curtain, HOME pushes,
+            // mode-conversion fallbacks, freeform floaters on the phone). The
+            // VD and its tasks are simply KEPT ALIVE for a grace window:
+            //   • replug within grace (a glasses-side resolution switch IS a
+            //     ~2-3s disconnect/reconnect) → rebind the same VD to the new
+            //     panel, resize in place — windows and their state never
+            //     disturbed, nothing ever touches the phone screen;
+            //   • no replug → the ORIGINAL destructive teardown runs, 10s
+            //     late — disconnect UX exactly as it always was.
+            // The "External Display Disconnected" banner is driven by the
+            // PHYSICAL id (cleared inline below), so it shows immediately.
+            val tdApp = applicationContext as PortalPadApp
+            lastDisplayRemovedAt = System.currentTimeMillis()
+            tdApp.setPhysicalExternalDisplayId(null)
+            tdApp.flapRecoveryUntilMs = System.currentTimeMillis() + 25_000L
+            lastReconciledDisplayId = null
+            lastAppliedVdSpec = null
+            armGraceTeardown()
+        }
+    }
+
+    /** Grace window before a physical unplug becomes a destructive teardown.
+     *  8s: long enough to ride out a glasses-side resolution flap (the glasses
+     *  disconnect/reconnect in ~2-3s during a refresh-rate switch, and we want
+     *  the session preserved across that), but short enough that a REAL unplug
+     *  tears the VD ("PortalPad Session") down promptly. While the VD lives, its
+     *  tasks stay alive — so media keeps playing (audio out the phone), other
+     *  apps still list the VD as a connected display, and the session bubble
+     *  lingers; all three clear the instant the VD is destroyed. 60s made that
+     *  linger up to a minute. Cost of 8s: a deliberate unplug→replug slower than
+     *  ~8s restarts the session instead of resuming it. The visible disconnect
+     *  UX (banner, return-to-main) runs on the physical-id timeline (~5s) and is
+     *  independent of this. */
+    private val disconnectGraceMs = 4_000L
+    /** Absolute SAFETY-NET timeout for a [transientMirrorForDialog] flip. The
+     *  PRIMARY revert is now dialog-close detection (FreeformManager's close
+     *  watch calls [endTransientMirrorForDialog] the moment the prompt closes),
+     *  so this only fires if that watch ever wedges — hence generous, to avoid
+     *  reverting into a black screen while a prompt the user is still reading is
+     *  open. Tunable. */
+    private val TRANSIENT_MIRROR_REVERT_MS = 120_000L
+    // System mirror retargets the physical panel onto the VD's layerStack, so on
+    // disconnect the system churns on the still-alive, previously-scanned-out VD
+    // and blocks our main thread for seconds. In mirror mode we therefore tear
+    // the VD down almost immediately instead of holding the full grace (still
+    // long enough to catch a very quick resolution flap). Overlay mode keeps the
+    // full 60s grace. Set true while a mirror session is active; NOT cleared by
+    // dismissVdMirror, so armGraceTeardown can still see it at disconnect.
+    private val mirrorDisconnectGraceMs = 500L
+    @Volatile private var mirrorModeActive = false
+
+    @Volatile private var graceTeardownPending = false
+
+    private val graceTeardownRunnable = Runnable {
+        graceTeardownPending = false
+        val app = applicationContext as PortalPadApp
+        if (app.physicalExternalDisplayId.value != null) {
+            Log.d("PortalPadSleep", "grace teardown SKIPPED — display is back")
+            return@Runnable
+        }
+        Log.d("PortalPadSleep", "grace expired (no replug in ${disconnectGraceMs}ms) → full session teardown")
+        // The backdrop lives on the VD — only finish it now that the VD dies
+        // (finishing it earlier would be pointless; keeping it past the VD's
+        // death risks the system migrating it onto the phone).
+        runCatching { com.portalpad.app.WallpaperActivity.finishIfShowing() }
+        if (virtualDisplaySession.isActive) suppressDisplayListener("displayRemoved-stop")
+        scope.launch {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching { virtualDisplaySession.stop() }
+                app.setExternalDisplayId(null)
+                app.setVirtualDisplayId(null)
+                // force_resizable_activities left ON system-wide crashes
+                // SystemUI's split coordinator on later launches. Re-enabled
+                // on the next connect.
+                runCatching { app.freeform.disableFreeform() }
+            }
+        }
+    }
+
+    /** True when the VD lived CONTINUOUSLY through the last disconnect (grace
+     *  cancelled by a replug). Gates the liveness filter below: on a surviving
+     *  VD, a snapshot window whose task id is dead was closed BY THE USER
+     *  (e.g. cleared recents) and must not be resurrected; after a real
+     *  teardown, dead ids are the teardown's doing and restore is legitimate. */
+    @Volatile private var vdSurvivedDisconnect = false
+
+    private fun armGraceTeardown() {
+        vdSurvivedDisconnect = false
+        mainHandler.removeCallbacks(graceTeardownRunnable)
+        graceTeardownPending = true
+        // Full grace for all modes. (A short mirror-mode grace was tried and
+        // reverted: tearing the VD down early landed inside the disconnect
+        // transition and ADDED a main-thread window-op freeze rather than
+        // avoiding one.)
+        mainHandler.postDelayed(graceTeardownRunnable, disconnectGraceMs)
+        Log.d("PortalPadSleep", "disconnect → grace armed (${disconnectGraceMs}ms, mirror=$mirrorModeActive): VD + windows kept alive")
+    }
+
+    private fun cancelGraceTeardown(reason: String) {
+        if (!graceTeardownPending) return
+        graceTeardownPending = false
+        // VERIFY survival instead of asserting it: another teardown path can
+        // kill the VD in the gap between the disconnect and this cancel
+        // (observed: a debounced displayChanged reconcile raced the
+        // DISPLAY_REMOVED handler and stopped the VD 500ms BEFORE grace was
+        // even armed — the cancel then claimed "windows intact" over a corpse,
+        // and the liveness filter trusted the claim and dropped the entire
+        // restore as "user-closed").
+        vdSurvivedDisconnect = virtualDisplaySession.isActive
+        mainHandler.removeCallbacks(graceTeardownRunnable)
+        if (vdSurvivedDisconnect) {
+            Log.d("PortalPadSleep", "grace teardown CANCELLED ($reason) — session survives, windows intact")
+        } else {
+            Log.w(
+                "PortalPadSleep",
+                "grace teardown CANCELLED ($reason) — but the VD is already DEAD " +
+                    "(another path tore it down mid-grace); treating as full teardown so restore runs",
+            )
         }
     }
 
@@ -487,6 +663,69 @@ class PortalPadForegroundService : Service() {
                     "${intent.action?.substringAfterLast('.')} extId=$extId " +
                         "vdAlive=$vdAlive backendReady=$backendReady",
                 )
+                // ── Keyguard re-assert (SCREEN_ON, locked, display connected) ──
+                // One UI's lock transition demotes the top task on the FIRST
+                // keyguard appearance after an unlock, regardless of its
+                // SHOW_WHEN_LOCKED attribute (measured: task sent TO_BACK; the
+                // second off/on in the same locked session then occludes fine).
+                // Flag hygiene can't win that fight — the reliable lever is
+                // ACTIVELY launching the showWhenLocked activity while the
+                // keyguard is up, which occludes deterministically (the
+                // alarm-clock pattern). singleTask + REORDER_TO_FRONT means an
+                // already-front activity is a visual no-op and its mode is kept.
+                if (intent.action == Intent.ACTION_SCREEN_ON) {
+                    // System mirror: One UI resets the physical panel's
+                    // layerStack to its native value during the screen-on
+                    // ColorFade, which drops our retarget → black glasses. Re-
+                    // apply the retarget shortly after wake (past the fade), off
+                    // the main thread.
+                    if (systemMirrorGlassesId >= 0 && systemMirrorVdId >= 0) {
+                        val gid = systemMirrorGlassesId
+                        val vd = systemMirrorVdId
+                        // Two staggered attempts: the first re-applies as soon as
+                        // the wake ColorFade is likely done (shorter flash); the
+                        // second is a backup if the fade ran long. The idempotent
+                        // original-layerStack save keeps restore correct.
+                        for (d in longArrayOf(400L, 850L)) {
+                            mainHandler.postDelayed({
+                                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                                    val ok = runCatching {
+                                        virtualDisplaySession.startSystemMirror(gid, vd)
+                                    }.getOrDefault(false)
+                                    Log.w(TAG, "panel-feed: re-applied mirror retarget after wake @${d}ms (ok=$ok)")
+                                }
+                            }, d)
+                        }
+                    }
+                    val km = runCatching {
+                        getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager
+                    }.getOrNull()
+                    val locked = km?.isKeyguardLocked == true
+                    val physConnected = app.physicalExternalDisplayId.value != null
+                    val allowLock = runCatching {
+                        kotlinx.coroutines.runBlocking {
+                            app.prefs.bool(
+                                com.portalpad.app.data.PreferencesRepository.Keys.ALLOW_LOCKSCREEN,
+                                true,
+                            ).first()
+                        }
+                    }.getOrDefault(true)
+                    if (locked && physConnected && allowLock) {
+                        Log.d("PortalPadSleep", "SCREEN_ON locked + display connected → re-asserting over keyguard")
+                        // NO launch here — deliberately. History: a reorder
+                        // returned DELIVERED_TO_TOP (no transition, no occlusion
+                        // re-eval); the trampoline that replaced it turned out to
+                        // SABOTAGE occlusion — measured to the millisecond:
+                        // DOZING→OCCLUDED had already STARTED on wake (the
+                        // showWhenLocked birth-attribute + relayout fixes work),
+                        // and the translucent trampoline's launch CANCELED it
+                        // into PRIMARY_BOUNCER (keyguard occlusion is granted
+                        // only to OPAQUE activities; a translucent launch over
+                        // the keyguard raises the bouncer instead). The flag
+                        // machinery alone is the fix; this log line stays so
+                        // captures show the moment's state.
+                    }
+                }
             }
         }
     }
@@ -495,6 +734,27 @@ class PortalPadForegroundService : Service() {
         super.onCreate()
         instance = this
         ensureChannel()
+        // §4.3 relaunch guard. One UI stops this FGS on its own (observed:
+        // recents Close-All at 23:46:29 → START_STICKY relaunch 2s later), and
+        // that relaunch is DESIRED — the user was mid-session. But a stray
+        // sticky relaunch after the user deliberately pressed Stop must NOT
+        // resurrect the session. The companion start()/stop() maintain the
+        // marker; only a system-initiated relaunch can see it as true here.
+        // startForeground first — the FGS contract applies to relaunches too.
+        val userStopped = runCatching {
+            kotlinx.coroutines.runBlocking {
+                (applicationContext as PortalPadApp).prefs
+                    .bool(PreferencesRepository.Keys.SERVICE_USER_STOPPED, default = false)
+                    .first()
+            }
+        }.getOrDefault(false)
+        if (userStopped) {
+            runCatching { startForeground(NOTIF_ID, buildNotification()) }
+            abortedRelaunch = true
+            Log.w(TAG, "onCreate: sticky relaunch after a deliberate user stop — honoring the stop (stopSelf)")
+            stopSelf()
+            return
+        }
 
         // Live external-display DPI: apply the user's DPI to the running VD via
         // `wm density` whenever the pref changes, so the slider/text field take
@@ -512,6 +772,39 @@ class PortalPadForegroundService : Service() {
                     applyDpiToLiveVd(a, userDpi)
                 }
             }
+        }
+        // Live panel-feed switch: flipping "System mirror" mid-session should
+        // take effect immediately (no stop/start or replug). We drop the first
+        // emission (the initial value is already applied by the normal setup)
+        // and, on any real change, force a full external re-reconcile — which
+        // tears down the current panel feed (dismissVdMirror restores the
+        // retargeted layerStack / stops the mirror HUD) and rebuilds it in the
+        // newly-selected mode. The VD itself persists, so the switch is quick.
+        scope.launch {
+            val a = applicationContext as PortalPadApp
+            a.prefs.panelSystemMirror
+                // distinctUntilChanged + drop(1): DataStore flows re-emit the WHOLE
+                // preferences object on ANY key write, so unrelated writes during a
+                // launch / permission flow (recordExternalApp, markExternalLaunch,
+                // setLastForegroundApp) were re-firing this forced re-reconcile with
+                // the SAME mirror value — a storm of panel-feed teardown/rebuilds that
+                // recreated the cursor ~30x (so it never held a stable frame = "cursor
+                // lost" in mirror+desktop) and transiently re-established the mirror
+                // (phone briefly shown on external). Same guard DOCK_ENABLED /
+                // DESKTOP_MODE already use; dedup FIRST, then drop the initial value.
+                .distinctUntilChanged()
+                .drop(1)
+                .collect {
+                    Log.w(TAG, "panel-feed: System mirror toggled → $it, flipping feed live")
+                    mainHandler.post {
+                        // Narrow feed flip; full reconcile only when there's no
+                        // live session to flip (e.g. toggled while disconnected —
+                        // the reconcile no-ops or applies at next attach).
+                        if (!setPanelFeed(toMirror = it, trigger = "panel-mirror-toggle")) {
+                            refreshExternalDisplay(force = true, trigger = "panel-mirror-toggle")
+                        }
+                    }
+                }
         }
         // Live external-display aspect ratio: resize the running VD in place when
         // the pref changes, so a new ratio takes effect immediately instead of on
@@ -892,7 +1185,8 @@ class PortalPadForegroundService : Service() {
         }
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int =
+        if (abortedRelaunch) START_NOT_STICKY else START_STICKY
 
     /**
      * Recover a session stranded on the phone after a VirtualDisplay "flap" — the
@@ -930,7 +1224,18 @@ class PortalPadForegroundService : Service() {
             // Overlays live on the VD (injector display), not the physical id.
             val hasSavedLayout = runCatching {
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    app.prefs.lastSession.first().windows.isNotEmpty()
+                    val snap = app.prefs.lastSession.first()
+                    if (snap.windows.isEmpty()) return@withContext false
+                    if (!vdSurvivedDisconnect) return@withContext true
+                    // Surviving VD: count only windows whose tasks are still
+                    // alive. Dead ids on a VD that never died were closed BY
+                    // THE USER (cleared recents) — the liveness filter in
+                    // mergedRecoverySession drops them from the restore, and
+                    // if NONE survive there is nothing to restore: vdDisp
+                    // resolves null and no "Restoring windows" cover flashes
+                    // over a display that will stay exactly as the user left it.
+                    val liveIds = app.freeform.listTasks().map { it.taskId }.toSet()
+                    snap.windows.any { it.taskId <= 0 || it.taskId in liveIds }
                 }
             }.getOrDefault(false)
             val vdDisp = if (!hasSavedLayout) null else runCatching {
@@ -1030,7 +1335,7 @@ class PortalPadForegroundService : Service() {
                     // Per-resolution memory: restore THIS width's remembered layout
                     // exactly (scale 1f); a width never seen is seeded by scaling the
                     // most-recent layout to fit.
-                    val (session, sxM, syM) = app.prefs.sessionForCanvas(w2, h2)
+                    val (session, sxM, syM) = mergedRecoverySession(app, w2, h2)
                     if (session.windows.isNotEmpty()) {
                         // Let the re-homed tasks settle on the new display first.
                         kotlinx.coroutines.delay(600)
@@ -1042,6 +1347,7 @@ class PortalPadForegroundService : Service() {
                 vdDisp?.let {
                     com.portalpad.app.presentation.RestoreCover.showDone(applicationContext, it)
                 }
+                returnToPortalPadIfAlive()
                 return@launch
             }
             // 2) relaunch-fallback: same path the "Restore last session" button uses.
@@ -1054,7 +1360,7 @@ class PortalPadForegroundService : Service() {
                 val h = m.heightPixels.let { if (it <= 1) 1080 else it }
                 // Per-resolution memory: this width's remembered layout (exact), or
                 // the most-recent layout scaled to fit if this width is new.
-                val (session, sxF, syF) = app.prefs.sessionForCanvas(w, h)
+                val (session, sxF, syF) = mergedRecoverySession(app, w, h)
                 if (session.windows.isEmpty()) {
                     Log.d("PortalPadSleep", "RECOVERY relaunch skipped (no saved session)")
                     return@withContext
@@ -1072,6 +1378,7 @@ class PortalPadForegroundService : Service() {
             vdDisp?.let {
                 com.portalpad.app.presentation.RestoreCover.showDone(applicationContext, it)
             }
+            returnToPortalPadIfAlive()
         }
     }
 
@@ -1160,6 +1467,15 @@ class PortalPadForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        if (abortedRelaunch) {
+            // This instance stopped itself in onCreate before ANY setup ran —
+            // no listeners, no scope work, no VD, no overlays. Running the full
+            // teardown here would (at minimum) yank MainActivity to the front
+            // out of nowhere. Just clear the instance handle and go.
+            Log.w(TAG, "onDestroy: aborted relaunch — skipping teardown (nothing was set up)")
+            if (instance === this) instance = null
+            return
+        }
         runCatching { sessionWakeLock?.let { if (it.isHeld) it.release() } }
         sessionWakeLock = null
         runCatching { unregisterReceiver(screenStateReceiver) }
@@ -1182,6 +1498,19 @@ class PortalPadForegroundService : Service() {
         }
         if (instance === this) instance = null
         (applicationContext as PortalPadApp).setServiceRunning(false)
+        // FINAL session snapshot, synchronously, BEFORE any teardown below
+        // destroys windows. The continuous snapshotter is debounced (~1.5s), so
+        // a move/resize made moments before Stop may not be flushed yet — this
+        // captures the true final arrangement while every window is still
+        // alive. captureSessionNow's own junk-state filters still apply, and an
+        // empty/mid-transition state never overwrites the previous good
+        // snapshot (snapshotSession returns null on empty). This is what the
+        // start-path "Restore last session?" offer restores from.
+        runCatching {
+            kotlinx.coroutines.runBlocking {
+                captureSessionNow(applicationContext as PortalPadApp)
+            }
+        }
         // Finish the home-backdrop so the orphaned task can't migrate to the
         // phone display when the VD tears down (same reason as onDisplayRemoved).
         runCatching { com.portalpad.app.WallpaperActivity.finishIfShowing() }
@@ -1189,6 +1518,45 @@ class PortalPadForegroundService : Service() {
         runCatching { (applicationContext as PortalPadApp).signal.stop() }
         autoDisableJob?.cancel()
         externalAppTrackerJob?.cancel()
+        // Restore the system-mirror panel BEFORE cancelling the scope. dismissVdMirror()
+        // (below) restores via `scope.launch(IO){ stopSystemMirror() }`, but scope.cancel()
+        // runs first — so on stop-service that coroutine never executes, the panel stays
+        // retargeted at the VD we're about to destroy, and the glasses freeze on their
+        // last frame (Kindle-on-black). Do it synchronously here so teardown order can't
+        // swallow it; dismissVdMirror()'s (now redundant) launch is a harmless no-op once
+        // systemMirrorGlassesId is cleared.
+        //
+        // NOTE: this restores the panel to its saved native layerStack. On this device
+        // the panel had been showing PortalPad's VD, so the immediate visual is a plain
+        // panel (the phone's own DP output takes over once the VD is released). A prior
+        // attempt to instead retarget the panel at display 0 HERE (mid-teardown) made the
+        // panel unstable across the subsequent VD teardown — so we restore now (prevents
+        // a stranded dead-stack), then AFTER virtualDisplaySession.stop() releases the VD
+        // we retarget to the phone (display 0) so a stopped service mirrors the device.
+        var mirrorGlassesForPhone = -1
+        if (systemMirrorGlassesId >= 0) {
+            val gid = systemMirrorGlassesId
+            mirrorGlassesForPhone = gid
+            systemMirrorGlassesId = -1
+            systemMirrorVdId = -1
+            runCatching { virtualDisplaySession.stopSystemMirror(gid) }
+            Log.w(TAG, "onDestroy: restored system-mirror panel for glasses=$gid")
+        }
+        // OVERLAY mode (System mirror pref off): no retarget is active, so the
+        // bookkeeping above is -1 — but stop-service should STILL leave the
+        // glasses mirroring the phone. Previously this only ever happened by
+        // accident (transient-mirror churn leaving stale bookkeeping at stop
+        // time); now it's deliberate. Gated on a live VD session: in raw
+        // fallback there's no VD teardown to go black over (and no backend to
+        // retarget with anyway), and when no display is connected there's
+        // nothing to point anywhere.
+        if (mirrorGlassesForPhone < 0 && virtualDisplaySession.isActive) {
+            mirrorGlassesForPhone =
+                (applicationContext as PortalPadApp).physicalExternalDisplayId.value ?: -1
+            if (mirrorGlassesForPhone >= 0) {
+                Log.w(TAG, "onDestroy: overlay mode — phone-mirror glasses=$mirrorGlassesForPhone after VD release")
+            }
+        }
         scope.cancel()
         pendingOverlayReassert?.let { mainHandler.removeCallbacks(it) }
         pendingOverlayReassert = null
@@ -1204,6 +1572,26 @@ class PortalPadForegroundService : Service() {
         // keyboard isn't left behind after the user turns PortalPad off.
         runCatching { stopExtinguishForKeyboardSafety("disable") }
         runCatching { virtualDisplaySession.stop() }
+        // VD is now released. Retarget the glasses panel at the PHONE's display so a
+        // stopped service leaves the glasses mirroring the device (portrait/pillarboxed
+        // is fine — that's just what the phone is showing), rather than a black panel.
+        // Done HERE, post-release, not during teardown: an earlier attempt to retarget
+        // mid-onDestroy was destabilised when the VD died under it. Display 0 is the
+        // phone; the retarget reuses the proven primitive. Single synchronous binder
+        // call, like the resetImePolicy/stop calls just above. If it fails, the panel
+        // stays on its saved native stack (black) — acceptable; never a frozen dead stack.
+        if (mirrorGlassesForPhone >= 0) {
+            val ok = runCatching {
+                virtualDisplaySession.startSystemMirror(
+                    mirrorGlassesForPhone, android.view.Display.DEFAULT_DISPLAY,
+                )
+            }.getOrDefault(false)
+            Log.w(
+                TAG,
+                if (ok) "onDestroy: stop → mirrored phone (display 0) on glasses=$mirrorGlassesForPhone"
+                else "onDestroy: phone-mirror retarget failed → panel on native stack (glasses=$mirrorGlassesForPhone)",
+            )
+        }
         val tdApp = applicationContext as PortalPadApp
         tdApp.setExternalDisplayId(null)
         tdApp.setPhysicalExternalDisplayId(null)
@@ -1263,6 +1651,189 @@ class PortalPadForegroundService : Service() {
     private fun dismissVdMirror() {
         vdMirror?.dismiss(); vdMirror = null
         activeVdMirror = null
+        runCatching { mirrorHud?.stop() }; mirrorHud = null
+        mirrorFpsJob?.cancel(); mirrorFpsJob = null; mirrorSfFps = -1f
+        // System-mirror path: restore the panel's original layerStack so the
+        // glasses aren't left retargeted at a dead VD. Symmetric with the
+        // overlay dismiss above; the next setup re-establishes whichever path.
+        if (systemMirrorGlassesId >= 0) {
+            val gid = systemMirrorGlassesId
+            systemMirrorGlassesId = -1
+            systemMirrorVdId = -1
+            // Off the main thread: this is a shell binder call that can block for
+            // seconds while the system is contended (e.g. during USB unplug).
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching { virtualDisplaySession.stopSystemMirror(gid) }
+            }
+        }
+    }
+
+    /**
+     * Narrow panel-feed flip: switch what the physical panel shows — system
+     * mirror (panel retargeted at the VD's layerStack) vs the overlay mirror
+     * (fullscreen SurfaceView the VD renders into) — WITHOUT the full
+     * refreshExternalDisplay reconcile. The VD, its windows, the dock, top bar,
+     * and cursor are untouched; only the feed changes. This is all the transient
+     * permission-dialog mirror and the Settings "System mirror" toggle need —
+     * the full reconcile they previously ran re-derived the whole session per
+     * flip (dock/cursor/mirror teardown+rebuild ×2 per dialog), and any pass
+     * that sampled the backend during a momentary not-ready blip DESTROYED the
+     * live VD, windows and all (the §"raw tasks=0" empty-snapshot loop).
+     *
+     * Returns false when there's no live VD session to flip — the caller falls
+     * back to the full reconcile, which owns session creation.
+     */
+    private fun setPanelFeed(toMirror: Boolean, trigger: String): Boolean {
+        val app = applicationContext as PortalPadApp
+        if (!virtualDisplaySession.isActive) return false
+        val gid = app.physicalExternalDisplayId.value ?: return false
+        val vdId = app.virtualDisplayId ?: return false
+        val overlayDisplay = runCatching { displayManager.getDisplay(vdId) }.getOrNull() ?: return false
+        val external = runCatching { displayManager.getDisplay(gid) }.getOrNull() ?: return false
+        if (toMirror) {
+            if (systemMirrorGlassesId == gid && systemMirrorVdId == vdId) {
+                Log.w(TAG, "panel-feed: setPanelFeed(mirror, $trigger) — already mirroring, no-op")
+                return true
+            }
+            // Drop the overlay mirror only. Its system-mirror-stop branch is a
+            // no-op here (systemMirrorGlassesId is -1 in overlay mode), and
+            // onSurfaceGone returns the VD to its invisible placeholder surface
+            // — the layerStack retarget below doesn't care what surface the VD
+            // renders into.
+            dismissVdMirror()
+            systemMirrorGlassesId = gid
+            systemMirrorVdId = vdId
+            mirrorModeActive = true
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                val ok = runCatching {
+                    virtualDisplaySession.startSystemMirror(gid, vdId)
+                }.getOrDefault(false)
+                if (ok) Log.w(TAG, "panel-feed: setPanelFeed($trigger) retargeted glasses=$gid → vd=$vdId")
+                else Log.w(TAG, "panel-feed: setPanelFeed($trigger) retarget FAILED glasses=$gid vd=$vdId")
+            }
+            // Standalone HUD + fps poll — same as the reconcile's mirror block
+            // (the overlay mirror's internal HUD died with it above).
+            runCatching { mirrorHud?.stop() }
+            mirrorFpsJob?.cancel(); mirrorSfFps = -1f
+            mirrorFpsJob = scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                while (true) {
+                    mirrorSfFps = runCatching {
+                        virtualDisplaySession.sampleDisplayFps(vdId)
+                    }.getOrDefault(-1f)
+                    kotlinx.coroutines.delay(1500)
+                }
+            }
+            mirrorHud = com.portalpad.app.presentation.PerformanceHud.standalone(
+                this, overlayDisplay, glActive = false,
+                fpsSampler = { mirrorSfFps },
+            )
+            return true
+        } else {
+            if (systemMirrorGlassesId < 0 && vdMirror != null) {
+                Log.w(TAG, "panel-feed: setPanelFeed(overlay, $trigger) — already overlay, no-op")
+                return true
+            }
+            // Restores the panel's native layerStack, stops the standalone
+            // HUD/fps poll, clears the mirror bookkeeping.
+            dismissVdMirror()
+            mirrorModeActive = false
+            try {
+                vdMirror = com.portalpad.app.presentation.VirtualDisplayMirror(
+                    this,
+                    external,
+                    onSurfaceReady = { surf ->
+                        virtualDisplaySession.bindMirrorSurface(surf)
+                        // A static VD pushes no new frames into the fresh surface
+                        // (the mirror only swaps on onFrameAvailable), so an idle
+                        // session would sit on the mirror's black init frame until
+                        // something recomposites. Recreate the cursor once: one
+                        // cheap window add that forces a VD composition AND
+                        // restores cursor-on-top — without the full
+                        // attachVdOverlays churn.
+                        mainHandler.post { recreateCursorOnTop(overlayDisplay) }
+                    },
+                    onSurfaceGone = { virtualDisplaySession.unbindMirrorSurface() },
+                ).also { it.show() }
+                activeVdMirror = vdMirror
+            } catch (t: Throwable) {
+                Log.w(TAG, "panel-feed: setPanelFeed(overlay, $trigger) mirror attach failed", t)
+            }
+            return true
+        }
+    }
+
+    /**
+     * Flip to a TRANSIENT system mirror for the duration of an Android permission
+     * dialog (called from FreeformManager when the dialog is detected in overlay
+     * mode). Makes the native prompt usable on the external display without the
+     * security overlay-hide blacking the panel — no app kill, no relaunch — and
+     * reverts to the user's real mode on a safety timeout. Never writes the
+     * PANEL_SYSTEM_MIRROR pref. No-op when the user is already in system mirror.
+     * Runs on the main thread.
+     */
+    private fun beginTransientMirrorInternal() {
+        val app = applicationContext as PortalPadApp
+        val prefOn = runCatching {
+            kotlinx.coroutines.runBlocking { app.prefs.panelSystemMirror.first() }
+        }.getOrDefault(false)
+        // Already in mirror (by the user's own pref): the dialog is already
+        // usable — nothing to flip, and we must not schedule a revert that would
+        // later force the panel back.
+        if (prefOn) return
+        if (transientMirrorForDialog) {
+            // Already flipped for an earlier dialog in this burst — just push the
+            // safety-revert deadline out so a chained prompt doesn't get cut off.
+            scheduleTransientMirrorRevert()
+            return
+        }
+        transientMirrorForDialog = true
+        Log.w(TAG, "transient mirror: ON for permission dialog (overlay→mirror, pref untouched)")
+        // Narrow feed flip — leaves the VD/windows/dock/cursor alone. Full
+        // reconcile only as a fallback when no live session exists to flip.
+        if (!setPanelFeed(toMirror = true, trigger = "perm-dialog-mirror-on")) {
+            refreshExternalDisplay(force = true, trigger = "perm-dialog-mirror-on")
+        }
+        scheduleTransientMirrorRevert()
+    }
+
+    /** (Re)arm the safety-timeout that reverts the transient mirror even if the
+     *  dialog-close signal is missed. Main thread. */
+    private fun scheduleTransientMirrorRevert() {
+        transientMirrorRevertJob?.let { mainHandler.removeCallbacks(it) }
+        val r = Runnable { endTransientMirrorInternal("safety-timeout") }
+        transientMirrorRevertJob = r
+        mainHandler.postDelayed(r, TRANSIENT_MIRROR_REVERT_MS)
+    }
+
+    /** Clear the transient mirror and reconcile back to the user's real mode
+     *  (overlay). Idempotent; safe to call when no transient mirror is active. */
+    private fun endTransientMirrorInternal(reason: String) {
+        transientMirrorRevertJob?.let { mainHandler.removeCallbacks(it) }
+        transientMirrorRevertJob = null
+        if (!transientMirrorForDialog) return
+        transientMirrorForDialog = false
+        Log.w(TAG, "transient mirror: OFF ($reason) — reverting to user's mode")
+        // Narrow feed flip back to overlay; the windows the user just granted
+        // a permission to are on the VD and must survive the revert.
+        if (!setPanelFeed(toMirror = false, trigger = "perm-dialog-mirror-off")) {
+            refreshExternalDisplay(force = true, trigger = "perm-dialog-mirror-off")
+        }
+    }
+
+    /** Disconnect-time teardown of the transient-mirror machinery: clear the
+     *  flag, cancel the safety-net revert, and cancel the FreeformManager
+     *  close-watch — WITHOUT reconciling (unlike [endTransientMirrorInternal]).
+     *  The display is going away and the grace/teardown path handles the panel,
+     *  so a forced refresh here is pointless; the point is purely to stop a late
+     *  close-watch tick or safety-net timer from later reverting a transient
+     *  mirror against a display that has been unplugged (or a fresh one after a
+     *  quick replug). Also clears the flag so a replug comes back on the user's
+     *  real mode rather than inheriting a stale transient mirror. Idempotent. */
+    private fun cancelTransientMirrorForTeardown() {
+        runCatching { (applicationContext as PortalPadApp).freeform.cancelDialogCloseWatch() }
+        transientMirrorRevertJob?.let { mainHandler.removeCallbacks(it) }
+        transientMirrorRevertJob = null
+        transientMirrorForDialog = false
     }
 
     /** Dismiss only the dock (overlay or presentation), leaving the cursor and
@@ -1416,6 +1987,15 @@ class PortalPadForegroundService : Service() {
                 suppressDisplayListener("aspect-live")
                 virtualDisplaySession.start(physId, w, h, dpi)
                 Log.d(TAG, "Applied aspect $aspect → ${w}x$h dpi=$dpi to live VD (phys=$physId)")
+                // The listener is suppressed ("aspect-live"), so this resize's
+                // onDisplayChanged never reaches the injector's bounds update —
+                // re-read explicitly or the cursor stays clamped to the OLD
+                // canvas (same stale-bounds bug as the rebind path). Immediate
+                // read + one delayed re-read for DisplayManager propagation lag.
+                runCatching { app.injector.updateDisplaySizeForRotation() }
+                mainHandler.postDelayed({
+                    runCatching { app.injector.updateDisplaySizeForRotation() }
+                }, 600L)
                 // Proportionally rescale the captured windows to the new canvas so a
                 // custom layout is preserved rather than flattened into even columns
                 // (manual "arrange evenly" stays the deliberate way to even them).
@@ -1456,7 +2036,7 @@ class PortalPadForegroundService : Service() {
         }
     }
 
-    private fun recreateCursorOnTop(overlayDisplay: Display) {
+    private fun recreateCursorOnTop(overlayDisplay: Display, attempt: Int = 0) {
         val app = applicationContext as PortalPadApp
         val cursorEnabled = runCatching {
             kotlinx.coroutines.runBlocking {
@@ -1471,6 +2051,30 @@ class PortalPadForegroundService : Service() {
             ).also { it.show() }
             Log.d(TAG, "Cursor recreated on top of overlays")
         }.onFailure { Log.w(TAG, "recreateCursorOnTop failed", it) }
+        // The add can fail SILENTLY on a fresh VD: the display's a11y token is
+        // transiently invalid for the first ~1-2s (log-proven 2026-07-09: two
+        // cursor adds at +0.6s got "token null is not valid" while the dock's
+        // add at +0.4s worked and later windows attached fine). show() swallows
+        // that failure, and the old code never rechecked — leaving the session
+        // with a working but INVISIBLE cursor until replug. Verify and retry
+        // with backoff; the display-liveness check keeps a queued retry from
+        // re-adding to a torn-down VD.
+        if (cursorOverlay?.isAttached != true) {
+            if (attempt < 6) {
+                Log.w(TAG, "cursor overlay not attached (a11y token not ready?) — retry ${attempt + 1}/6 in 400ms")
+                mainHandler.postDelayed({
+                    if (runCatching { displayManager.getDisplay(overlayDisplay.displayId) != null }
+                            .getOrDefault(false)
+                    ) {
+                        recreateCursorOnTop(overlayDisplay, attempt + 1)
+                    }
+                }, 400L)
+            } else {
+                Log.e(TAG, "cursor overlay attach FAILED after retries — cursor will be invisible this session")
+            }
+        } else if (attempt > 0) {
+            Log.w(TAG, "cursor overlay attached on retry $attempt")
+        }
     }
 
     /**
@@ -1485,24 +2089,17 @@ class PortalPadForegroundService : Service() {
     private fun attachVdOverlays(overlayDisplay: Display) {
         val app = applicationContext as PortalPadApp
 
-        // Cursor overlay — visible amber arrow at injector.cursorPosition.
-        // Honors "Custom cursor on external display" so users whose OEM
-        // already draws a cursor can turn ours off.
+        // Cursor overlay is attached at the TAIL of this method (after the dock),
+        // not here — see the end of attachVdOverlays. Attaching it here too would
+        // just be torn down and re-added moments later, and worse, an early attach
+        // lands UNDER the dock that attaches after it. We only clear any stale
+        // instance now; the single authoritative attach happens last.
         cursorOverlay?.dismiss(); cursorOverlay = null
         val cursorEnabled = runCatching {
             kotlinx.coroutines.runBlocking {
                 app.prefs.bool(PreferencesRepository.Keys.ENABLE_MOUSE_HOVER, default = true).first()
             }
         }.getOrDefault(true)
-        if (cursorEnabled) {
-            try {
-                cursorOverlay = com.portalpad.app.presentation.CursorOverlay(
-                    this, overlayDisplay, app.injector,
-                ).also { it.show() }
-            } catch (t: Throwable) {
-                Log.w(TAG, "CursorOverlay attach failed (need overlay permission?)", t)
-            }
-        }
 
         // Floating nav buttons — retired feature. The Controls toggle was
         // removed; we force this off (ignoring any previously-stored pref) so it
@@ -1572,30 +2169,61 @@ class PortalPadForegroundService : Service() {
             Log.w(TAG, "ShizukuWarningOverlay attach failed", t)
         }
 
-        // Re-assert the DOCK here too. The dock is first attached in the main
-        // refreshExternalDisplay flow, but that can run BEFORE the VD mirror's
-        // surface is ready — so on connect the dock window can be composited
-        // against a not-yet-presenting display and stay blank (the same class of
-        // bug the cursor used to have, which is why toggling "Show dock on
-        // external display" off/on — a fresh attach after the display settles —
-        // fixed it). Re-attaching here (from onSurfaceReady + the delayed
-        // reassert) makes the dock reliably appear on connect without the toggle.
-        // Idempotent: skip if it's already showing on this display.
+        // Attach / re-assert the DOCK here. In VD mode this is now the dock's
+        // authoritative attach (the inline attach in refreshExternalDisplay is
+        // skipped for usingVd — see there), running only once the mirror surface
+        // and the VD's a11y overlay token have settled, so the 2032 add succeeds
+        // instead of throwing BadToken and falling back to Presentation.
+        //
+        // Re-home condition: attach when there is no proper 2032 OVERLAY dock on
+        // this display yet. Critically, a Presentation-fallback dock (left by an
+        // early attach on a previous cycle, or by a transient 2032 failure) does
+        // NOT count as satisfied when the a11y service is bound — we tear it down
+        // and re-home to 2032, because Presentation is NOT exempt from
+        // HIDE_NON_SYSTEM_OVERLAY_WINDOWS and would vanish during permission
+        // dialogs. When a11y is NOT bound, 2032 can't succeed, so any showing dock
+        // (Presentation / 2038) is accepted and left alone — that also prevents a
+        // dismiss→re-add→fail loop across attachVdOverlays' repeated runs.
         val dockEnabled = runCatching {
             kotlinx.coroutines.runBlocking {
                 app.prefs.bool(PreferencesRepository.Keys.DOCK_ENABLED, default = true).first()
             }
         }.getOrDefault(true)
-        if (dockEnabled && !isDockShowing(overlayDisplay.displayId)) {
+        val a11yReady = com.portalpad.app.service.PortalPadAccessibilityService.instance != null
+        val dockSatisfied = isDockOverlayShowing(overlayDisplay.displayId) ||
+            (!a11yReady && isDockShowing(overlayDisplay.displayId))
+        if (dockEnabled && !dockSatisfied) {
             dismissDockOnly()
             attachDock(overlayDisplay, DockDisplayMode.OVERLAY)
-            Log.d(TAG, "Dock re-asserted in attachVdOverlays on display ${overlayDisplay.displayId}")
+            Log.d(TAG, "Dock (re)attached in attachVdOverlays on display ${overlayDisplay.displayId} (a11yReady=$a11yReady)")
+        }
+
+        // Cursor must be the LAST overlay attached so its window token is newest
+        // in the layer — among equal-type overlays, z-order = add order, so the
+        // last addView wins. The dock/taskbar attach ABOVE this point, so the
+        // cursor has to be (re)added AFTER them; and this method re-runs several
+        // times during startup surface churn, each run re-adding the dock — which
+        // is why the cursor sat under the dock icons for ~5-6s until the churn
+        // settled. Recreating the cursor on top here — at the tail of EVERY run,
+        // after the dock — makes it topmost on every cycle, not just when the
+        // dock's own attach callback happens to win. Posted so it runs after the
+        // dock's async view attach this frame.
+        if (cursorEnabled) {
+            mainHandler.post { recreateCursorOnTop(overlayDisplay) }
         }
     }
 
     private fun isDockShowing(displayId: Int): Boolean =
         (dockOverlay?.isShowing == true && dockOverlay?.displayId == displayId) ||
             (dockPresentation?.isShowing == true && dockPresentation?.display?.displayId == displayId)
+
+    /** True only when the dock is showing as a proper OVERLAY window
+     *  ([dockOverlay], i.e. 2032 when a11y is bound / 2038 otherwise) on
+     *  [displayId] — NOT the Presentation fallback. attachVdOverlays uses this
+     *  to decide whether to re-home a stranded Presentation dock to a real
+     *  overlay once the display has settled. */
+    private fun isDockOverlayShowing(displayId: Int): Boolean =
+        dockOverlay?.isShowing == true && dockOverlay?.displayId == displayId
 
     /**
      * Reconciles state with the current display set:
@@ -1733,13 +2361,43 @@ class PortalPadForegroundService : Service() {
             return
         }
 
+        // Freeze guard: during/right after a physical unplug, the system's
+        // display-disconnect transition heavily contends WindowManager, so any
+        // reconcile that runs teardown/window ops here blocks the main thread
+        // for seconds (observed 4-8s). The dedicated DISPLAY_REMOVED handler
+        // already tears the session down on unplug (via the grace model), so a
+        // non-forced displayChanged reconcile while the physical display is
+        // absent should just no-op. A replug reconciles with force / a present
+        // physical id. NOTE both signals are checked: the StateFlow is nulled
+        // by the removal handler and LAGS, so a debounced displayChanged that
+        // lands in the gap (observed 500ms before DISPLAY_REMOVED) used to slip
+        // past this guard and tear the VD down with NO grace — then grace was
+        // armed for the corpse, the replug "cancelled" it, vdSurvivedDisconnect
+        // lied, and the liveness filter dropped the entire restore. external
+        // (from pickExternalDisplay above) is the ground truth.
+        if (!force && trigger.startsWith("displayChanged") &&
+            (external == null || app.physicalExternalDisplayId.value == null)
+        ) {
+            if (external == null && app.physicalExternalDisplayId.value != null) {
+                Log.w(TAG, "refreshExternalDisplay SKIP ($trigger): physical gone but removal handler hasn't run yet — deferring to DISPLAY_REMOVED/grace")
+                return
+            }
+            Log.w(TAG, "refreshExternalDisplay SKIP ($trigger): physical absent — avoiding contended-WM block")
+            return
+        }
+
         if (external == null) {
             app.setExternalDisplayId(null)
             app.setPhysicalExternalDisplayId(null)
             app.setVirtualDisplayId(null)
             if (lastId != null) {
-                // We had a display; release VD and any overlays now that it's gone.
-                virtualDisplaySession.stop()
+                // We had a display; release VD and any overlays now that it's
+                // gone. The VD release can block on a contended system during a
+                // disconnect transition, so run it off the main thread; the
+                // overlay dismissals are fast UI ops and stay on-thread.
+                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching { virtualDisplaySession.stop() }
+                }
                 dismissDock()
                 dismissVdMirror()
             }
@@ -1826,9 +2484,26 @@ class PortalPadForegroundService : Service() {
                 Log.d(TAG, "Starting AirGlassesSession: glasses=${external.displayId} ${w}x$h dpi=$dpi (userDpi=$userDpi detected=$detectedDpi)")
 
                 suppressDisplayListener("AirGlassesSession.start")
-                val vdId = virtualDisplaySession.start(external.displayId, w, h, dpi)
+                // rebind(): if the session survived the disconnect grace, adopt
+                // the NEW physical id and resize the SAME VD in place — tasks
+                // (and their in-app state, e.g. Chrome tabs) are never touched.
+                // Falls through to a normal fresh start when nothing survived.
+                val vdId = virtualDisplaySession.rebind(external.displayId, w, h, dpi)
                 if (vdId >= 0) {
                     Log.d(TAG, "AirGlassesSession started: vd=$vdId glasses=${external.displayId}")
+                    // Base layer, unconditionally. Must NOT depend on launchAutoStart's
+                    // gating (suppressAutoStartContent / wasNullBefore / vdJustCreated):
+                    // when those all fell false on a double-pass connect, nothing laid
+                    // the backdrop and restored windows floated on black. Deduped by
+                    // displayId, so a brand-new VD always gets one and a later
+                    // launchAutoStart()/refocus-fallback call is a no-op.
+                    ensureBackdrop(vdId, "vd-created")
+                    // IME-policy BASELINE at birth: apply the pref-correct
+                    // policy once now, so (with the dedupe in the injector)
+                    // the first relay open of the session is already a
+                    // policy NO-OP — the address-bar tap's suggestion
+                    // dropdown survives the relay appearing.
+                    runCatching { app.injector.repinImePolicy(aggressive = false) }
                     vdId to true
                 } else {
                     Log.w(TAG, "AirGlassesSession failed to start; falling back to raw glasses id")
@@ -1891,6 +2566,21 @@ class PortalPadForegroundService : Service() {
         //    full trusted-VD pipeline.
         val injectionDisplayId = if (usingVd) effectiveDisplayId else external.displayId
         app.injector.displayId = injectionDisplayId
+        // The setter above dedupes on an UNCHANGED id and skips its metrics
+        // read — which is exactly the resolution-switch case: rebind() resizes
+        // the SAME VD in place (e.g. 1920→3840 ultrawide), the resize's
+        // onDisplayChanged is swallowed by the suppression window around
+        // session start, and the injector kept clamping the cursor to the old
+        // width — the cursor dead-ended at the center of an ultrawide canvas.
+        // Re-read the size explicitly: clamps without recentering and is a
+        // documented cheap no-op when nothing changed, so fresh attaches are
+        // unaffected. Second delayed read covers DisplayManager propagation
+        // lag after an in-place resize (the aspect path sleeps 250ms for the
+        // same reason).
+        runCatching { app.injector.updateDisplaySizeForRotation() }
+        mainHandler.postDelayed({
+            runCatching { app.injector.updateDisplaySizeForRotation() }
+        }, 600L)
         app.injector.usingVd = usingVd
         Log.d(TAG, "injection target: displayId=$injectionDisplayId (usingVd=$usingVd, physical=${external.displayId})")
 
@@ -1944,7 +2634,103 @@ class PortalPadForegroundService : Service() {
         // so VD content appears on the user's glasses. Without this the
         // VD renders to an invisible ImageReader and the user sees nothing.
         dismissVdMirror()
-        if (usingVd) {
+        // Panel-feed selection. When the system-mirror pref is on, drive the
+        // glasses via a SurfaceControl layerStack retarget (no app overlay →
+        // immune to the security overlay-hide that blanks the panel during
+        // USB/permission dialogs). If the ROM refuses the retarget, we fall
+        // through to the proven overlay + GL-shader path below. The toggle (and
+        // the auto-fallback) make this fully reversible.
+        val systemMirrorPref = usingVd && (transientMirrorForDialog || runCatching {
+            kotlinx.coroutines.runBlocking {
+                app.prefs.panelSystemMirror.first()
+            }
+        }.getOrDefault(false))
+        var systemMirrorStarted = false
+        if (systemMirrorPref) {
+            // Optimistically commit to the mirror path so the setup below runs
+            // on the main thread without waiting on a shell binder call. The
+            // actual layerStack retarget + color (synchronous binder calls to
+            // the shell service) run OFF the main thread — on unplug the system
+            // is contended and those calls can block for seconds, which froze
+            // the UI. If already mirroring this display, skip re-retargeting so
+            // reconcile/recovery churn doesn't repeatedly re-issue them.
+            val gid = external.displayId
+            val vdId = overlayDisplay.displayId
+            // Must compare the VD too, not just the glasses display. System mirror
+            // retargets the PHYSICAL panel at the VD's layerStack; when the VD is
+            // destroyed and recreated (service restart, transient-mirror revert, a
+            // force refresh) the glasses id is unchanged but the layerStack is new.
+            // Comparing only `gid` made this look like "already mirroring", so
+            // startSystemMirror was never re-issued and the panel stayed pointed at
+            // the OLD, destroyed layerStack — which produces no frames, so the panel
+            // froze on its last image while the dock/cursor rendered into a new VD
+            // nobody was looking at. (Toggling System mirror off/on repaired it,
+            // because that does stop→start against the current VD.)
+            //
+            // Re-issuing start on a live retarget is safe: startSystemMirror keeps the
+            // originally saved panel layerStack (observed: savedPanelLS=29 across
+            // consecutive starts at vdLS=30 then 31), so restore still returns the
+            // panel to its real layerStack.
+            val alreadyMirroring = systemMirrorGlassesId == gid && systemMirrorVdId == vdId
+            systemMirrorGlassesId = gid
+            systemMirrorVdId = vdId
+            mirrorModeActive = true
+            systemMirrorStarted = true
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                attachVdOverlays(overlayDisplay)
+            }
+            scheduleOverlayReassert(overlayDisplay)
+            dismissTransitionSpinnerWhenReady()
+            if (!alreadyMirroring) {
+                // The retarget + color, off the main thread.
+                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val ok = runCatching {
+                        virtualDisplaySession.startSystemMirror(gid, vdId)
+                    }.getOrDefault(false)
+                    if (ok) Log.w(TAG, "panel-feed: system mirror retargeted glasses=$gid → vd=$vdId")
+                    else Log.w(TAG, "panel-feed: system mirror retarget failed (async) glasses=$gid vd=$vdId")
+                }
+                // Performance overlay (standalone on the VD) + background
+                // SurfaceFlinger fps poll — also off the main thread.
+                runCatching { mirrorHud?.stop() }
+                mirrorFpsJob?.cancel(); mirrorSfFps = -1f
+                mirrorFpsJob = scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    while (true) {
+                        mirrorSfFps = runCatching {
+                            virtualDisplaySession.sampleDisplayFps(vdId)
+                        }.getOrDefault(-1f)
+                        kotlinx.coroutines.delay(1500)
+                    }
+                }
+                mirrorHud = com.portalpad.app.presentation.PerformanceHud.standalone(
+                    this, overlayDisplay, glActive = false,
+                    fpsSampler = { mirrorSfFps },
+                )
+            }
+            if (!suppressAutoStartContent &&
+                ((autoLaunchOnFirstAttach && wasNullBefore) || vdJustCreated)) {
+                mainHandler.postDelayed({ launchAutoStart() }, 400L)
+            }
+            Log.w(TAG, "panel-feed: system mirror active (overlay path skipped, alreadyMirroring=$alreadyMirroring)")
+        }
+        if (usingVd && !systemMirrorStarted) {
+            mirrorModeActive = false
+            // A FRESH VD in overlay mode must ensure the panel is scanning its
+            // own native layerStack — a prior stop-service leaves it retargeted
+            // at the PHONE (the deliberate phone-mirror-on-stop), and the mirror
+            // overlay about to attach renders into the panel's native stack. If
+            // the panel is still pointed elsewhere, the overlay is invisible and
+            // the session looks black until a replug. stopSystemMirror restores
+            // the shell-saved original stack and is a logged SKIP no-op when no
+            // retarget is active, so firing it on every fresh VD is safe. Gated
+            // on vdJustCreated so mid-session reconciles (DOCK/DESKTOP toggles)
+            // don't shell out. Off the main thread (shell binder call).
+            if (vdJustCreated) {
+                val gid = external.displayId
+                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching { virtualDisplaySession.stopSystemMirror(gid) }
+                }
+            }
             try {
                 vdMirror = com.portalpad.app.presentation.VirtualDisplayMirror(
                     this,
@@ -2033,7 +2819,18 @@ class PortalPadForegroundService : Service() {
             }
         }.getOrDefault(true)
 
-        if (dockEnabled) attachDock(overlayDisplay, DockDisplayMode.OVERLAY)
+        // In VD mode the dock is attached from attachVdOverlays (driven off the
+        // mirror's onSurfaceReady), NOT here. Attaching it inline runs during the
+        // displayAdded refresh, before the freshly-created VD's accessibility
+        // overlay token is valid — the 2032 addView throws BadToken and the dock
+        // silently falls back to a Presentation. That stray Presentation dock then
+        // makes attachVdOverlays' re-assert guard treat the dock as "already
+        // showing" and skip the 2032 re-home, so the dock stays on Presentation
+        // for the whole session (and Presentation is NOT exempt from
+        // HIDE_NON_SYSTEM_OVERLAY_WINDOWS, so it vanishes during permission
+        // dialogs — the exact thing 2032 exists to prevent). The non-VD path has
+        // no surface to wait on, so it still attaches inline here.
+        if (dockEnabled && !usingVd) attachDock(overlayDisplay, DockDisplayMode.OVERLAY)
 
         // Cursor + nav overlays.
         //
@@ -2046,13 +2843,22 @@ class PortalPadForegroundService : Service() {
             attachVdOverlays(overlayDisplay)
         }
 
-        if (autoLaunchOnFirstAttach && wasNullBefore) {
-            // Non-VD path: the glasses-visual auto-launch isn't driven by a VD
-            // surface-ready callback, so fire it here (once per fresh attach).
-            // VD path handles its own launchAutoStart() after the surface is live.
-            // Skipped on a flap-recovery so the wallpaper/app doesn't stack over the
-            // session being recovered — but the trackpad re-activation below still runs.
-            if (!usingVd && !suppressAutoStartContent) launchAutoStart()
+        // First-attach actions, keyed on the OBSERVED null→attached transition
+        // (wasNullBefore), NOT on which trigger delivered the attach. The old
+        // gate also required autoLaunchOnFirstAttach, which only the
+        // displayAdded listener passes — so a fresh attach arriving via
+        // vdWatchdog (listener suppressed at replug: seen on-device) or via
+        // onCreate (One UI stopped the FGS on recents Close-All; START_STICKY
+        // relaunched it) could NEVER re-activate the trackpad, leaving the user
+        // on the phone home screen with only the bubble.
+        if (wasNullBefore) {
+            // The glasses-visual auto-launch KEEPS the listener gate
+            // (autoLaunchOnFirstAttach): the VD path drives its own
+            // launchAutoStart off surface-ready, and non-listener reconciles
+            // already recover content via vdJustCreated — an extra launch here
+            // would stack a spurious wallpaper/app over it. Flap-recovery
+            // (suppressAutoStartContent) skips content too, as before.
+            if (autoLaunchOnFirstAttach && !usingVd && !suppressAutoStartContent) launchAutoStart()
             // Only auto-launch trackpad if the user has the pref enabled.
             val autoActivate = runCatching {
                 kotlinx.coroutines.runBlocking {
@@ -2073,9 +2879,16 @@ class PortalPadForegroundService : Service() {
         // Cursor Z-order fix: the dock/taskbar/top-bar each have their own
         // overlay window token, and the cursor must be the newest window in the
         // accessibility-overlay layer to draw above them. Post the recreate so
-        // it runs AFTER this frame's dock/taskbar attaches, and (in VD mode) the
-        // reassert posts another recreate after its delay as a backstop.
-        mainHandler.post { recreateCursorOnTop(overlayDisplay) }
+        // it runs AFTER this frame's dock/taskbar attaches.
+        //
+        // Non-VD path only. In VD mode the cursor is owned end-to-end by
+        // attachVdOverlays (attached at its tail, after the dock, from
+        // onSurfaceReady). Recreating it here too — before the mirror surface is
+        // even ready — just tears down and re-adds a cursor that attachVdOverlays
+        // immediately replaces, adding to the per-attach recreate churn for no
+        // benefit. (The dock's own onWindowAttached reassert still fires the
+        // topmost recreate once the dock actually attaches.)
+        if (!usingVd) mainHandler.post { recreateCursorOnTop(overlayDisplay) }
 
         // Mark this displayId as reconciled. Future onDisplayChanged events
         // for the same display will short-circuit (see the force/lastId
@@ -2083,17 +2896,81 @@ class PortalPadForegroundService : Service() {
         lastReconciledDisplayId = external.displayId
     }
 
-    private fun attachDock(display: Display, mode: DockDisplayMode) {
+    private fun attachDock(display: Display, mode: DockDisplayMode, dockAttempt: Int = 0) {
+        // EXECUTION-TIME validity guard. Attaches get queued/posted by the
+        // flap-recovery flows and can execute AFTER a physical-unplug teardown
+        // already ran (seen in the wild: teardown dismissed the dock at
+        // t+0.899s, a stale queued attach re-added it to the now-removed VD at
+        // t+1.067s — Android parked that window on the PHONE screen, where it
+        // lived until the service was stopped). The display must still exist
+        // in DisplayManager AND still be the display we're currently tracking;
+        // a stale attach logs and does nothing.
+        run {
+            val id = display.displayId
+            val stillExists = runCatching { displayManager.getDisplay(id) != null }.getOrDefault(false)
+            val app = applicationContext as? PortalPadApp
+            val tracked = app?.externalDisplayId?.value
+            if (!stillExists || tracked == null || tracked != id) {
+                Log.w(
+                    TAG,
+                    "attachDock SKIPPED (stale): display=$id exists=$stillExists tracked=$tracked",
+                )
+                return
+            }
+        }
         when (mode) {
             DockDisplayMode.OVERLAY -> {
                 try {
-                    dockOverlay = DockOverlay(this, display).also { it.show() }
+                    dockOverlay = DockOverlay(this, display).also { d ->
+                        // Z-order: recreate the cursor only once the dock window
+                        // has ACTUALLY attached. The old speculative one-hop post
+                        // could run before the dock's traversal attached its
+                        // window (esp. the async VD path), leaving the cursor
+                        // UNDER the dock icons until some later relayout — the
+                        // "cursor hidden behind dock icons at startup" bug.
+                        d.onWindowAttached = {
+                            // Reassert TWICE: the attach fires when the dock
+                            // joins the view hierarchy, but its SURFACE (which
+                            // decides z-order among sibling overlays) and its
+                            // async Compose draw can finalize a frame or two
+                            // later — a single reassert on attach sometimes still
+                            // lands under the dock. The recreate is idempotent
+                            // (dismiss + re-add), so a second pass after the
+                            // surface settles is free insurance and deterministic.
+                            mainHandler.post { recreateCursorOnTop(display) }
+                            mainHandler.postDelayed({ recreateCursorOnTop(display) }, 250L)
+                        }
+                        d.show()
+                    }
                     Log.d(TAG, "Dock overlay attached on display ${display.displayId}")
                 } catch (t: Throwable) {
+                    // A TRANSIENT a11y-token error (fresh VD, token not yet
+                    // valid — validates within ~1-2s, log-proven) must NEVER
+                    // trigger the Presentation fallback: that fallback is a
+                    // fullscreen dialog whose default window background is
+                    // OPAQUE and which takes focus — on 2026-07-09 it obscured
+                    // the ENTIRE session (grey screen, apps launching invisibly
+                    // underneath) until replug. Retry the 2032 instead; only
+                    // genuine, persistent rejection (an OEM that refuses 2032
+                    // on secondary displays) falls through to the Presentation.
+                    val tokenIssue = t is android.view.WindowManager.BadTokenException ||
+                        (t.message?.contains("token", ignoreCase = true) == true)
+                    if (tokenIssue && dockAttempt < 6) {
+                        Log.w(
+                            TAG,
+                            "DockOverlay.show hit a transient token error — retry ${dockAttempt + 1}/6 in 400ms (NOT falling back)",
+                            t,
+                        )
+                        mainHandler.postDelayed({
+                            attachDock(display, mode, dockAttempt + 1)
+                        }, 400L)
+                        return
+                    }
                     // OEM rejected overlay on secondary display, or permission missing
                     Log.w(TAG, "DockOverlay.show failed — falling back to Presentation", t)
                     try {
                         dockPresentation = DockPresentation(this, display).also { it.show() }
+                        mainHandler.post { recreateCursorOnTop(display) }
                     } catch (t2: Throwable) {
                         Log.e(TAG, "Dock presentation also failed", t2)
                     }
@@ -2103,20 +2980,12 @@ class PortalPadForegroundService : Service() {
                 try {
                     dockPresentation = DockPresentation(this, display).also { it.show() }
                     Log.d(TAG, "Dock presentation attached on display ${display.displayId}")
+                    mainHandler.post { recreateCursorOnTop(display) }
                 } catch (t: Throwable) {
                     Log.e(TAG, "Could not show DockPresentation", t)
                 }
             }
         }
-        // Z-order fix: the dock window we just attached lands on TOP of the cursor
-        // (same overlay layer — last-added wins). Re-assert the cursor above it now
-        // that the dock is actually shown — posted so it runs after the dock's view
-        // is attached. Deterministic fix for the cursor sometimes drawing BEHIND
-        // dock icons at startup (the prior reassert at attach time was posted
-        // speculatively and could run before the dock — esp. the async VD path —
-        // actually attached, leaving the cursor under the dock until some later
-        // event happened to recreate it).
-        mainHandler.post { recreateCursorOnTop(display) }
     }
 
     /**
@@ -2302,7 +3171,147 @@ class PortalPadForegroundService : Service() {
      * would otherwise overwrite a good positioned layout). A set with at least one
      * genuinely positioned (windowed) app is saved as-is.
      */
+    /**
+     * The session RECOVERY should restore: MEMBERSHIP from the most-recent
+     * snapshot (the windows actually open when the display went down), BOUNDS
+     * from this width's archive where a package match exists (per-resolution
+     * layout memory), else the window's own bounds scaled to the new canvas.
+     * The old behavior restored the width archive AS the membership list,
+     * resurrecting residue from long-dead sessions (field report: 3 real
+     * windows became 5 — phantom Play Store + Files from earlier testing —
+     * and the retile aligned the phantoms while the real windows hid behind).
+     * Returned scale is always 1f: bounds are already live-canvas space.
+     */
+    private suspend fun mergedRecoverySession(
+        app: PortalPadApp,
+        w: Int,
+        h: Int,
+    ): Triple<com.portalpad.app.data.SavedSession, Float, Float> {
+        val (archive, ax, ay) = app.prefs.sessionForCanvas(w, h)
+        var identity = runCatching { app.prefs.lastSession.first() }.getOrNull()
+        if (identity == null || identity.windows.isEmpty()) return Triple(archive, ax, ay)
+        // LIVENESS FILTER (only when the VD survived the disconnect): empty
+        // snapshots are deliberately never saved, so lastSession can't record
+        // "the user cleared everything" — it forever holds the last non-empty
+        // set. On a SURVIVING VD, a dead task id means the user closed that
+        // window; drop it instead of resurrecting a ghost. taskId<=0 (old
+        // snapshots) can't be judged and is kept.
+        if (vdSurvivedDisconnect) {
+            val liveTasks = runCatching { app.freeform.listTasks() }.getOrDefault(emptyList())
+            val liveIds = liveTasks.map { it.taskId }.toSet()
+            // A dead task id alone is NOT proof of a user close: lastSession is
+            // written on a debounce/poll, so right after a restore-then-flap the
+            // saved ids can be a whole GENERATION stale while the same apps sit
+            // live on the display under new ids (observed: 5 survivors present,
+            // filter dropped all 5 as "user-closed", retile had no targets, and
+            // the survivors were stranded fullscreen). If the package is
+            // visibly live, keep the entry — its BOUNDS are what the retile
+            // needs, and the launch path de-dupes against present windows.
+            // Drop only when the id is dead AND the app is nowhere on screen.
+            val livePkgs = liveTasks.map { it.packageName.lowercase() }.toSet()
+            val alive = identity.windows.filter {
+                it.taskId <= 0 || it.taskId in liveIds ||
+                    it.packageName.lowercase() in livePkgs
+            }
+            if (alive.size != identity.windows.size) {
+                Log.d(
+                    "PortalPadSleep",
+                    "RECOVERY liveness filter: dropped ${identity.windows.size - alive.size} " +
+                        "user-closed window(s); ${alive.size} remain",
+                )
+            }
+            if (alive.isEmpty()) return Triple(com.portalpad.app.data.SavedSession(), 1f, 1f)
+            identity = identity.copy(windows = alive)
+        }
+        // Archive bounds are only trustworthy when the archive describes THIS
+        // set of windows: its positions were computed as an ARRANGEMENT for a
+        // specific window population. Cherry-picking slots out of a layout
+        // made for a different set leaves the missing members' slots as holes
+        // (field report: 3 windows restored into a 4-slot phantom-era layout
+        // — evenly split, with an empty column where a phantom used to be).
+        // Multiset equality on packages, order-independent.
+        val archiveMatchesSet =
+            archive.windows.groupingBy { it.packageName }.eachCount() ==
+                identity.windows.groupingBy { it.packageName }.eachCount()
+        val pool = archive.windows.toMutableList()
+        val iw0 = identity.canvasWidth.takeIf { it > 0 } ?: w
+        val ih0 = identity.canvasHeight.takeIf { it > 0 } ?: h
+        val ix = w.toFloat() / iw0
+        val iy = h.toFloat() / ih0
+        val windows = identity.windows.map { iw ->
+            // Slot claim: EXACT task id first. Package-first-fit assigned each
+            // Chrome whichever Chrome slot came first in the archive — archive
+            // and identity are both saved in FOCUS order, which routinely
+            // differs, so windows #1/#2 swapped positions across switches
+            // (deterministically, once retile paired by id). Clean archives
+            // carry ids; a window reclaims ITS OWN remembered slot. Package
+            // match remains the fallback for id-less archives.
+            val match = if (archiveMatchesSet) {
+                (
+                    pool.firstOrNull { iw.taskId > 0 && it.taskId == iw.taskId }
+                        ?: pool.firstOrNull { it.packageName == iw.packageName }
+                    )?.also { pool.remove(it) }
+            } else null
+            if (match != null) {
+                iw.copy(
+                    left = (match.left * ax).toInt(),
+                    top = (match.top * ay).toInt(),
+                    right = (match.right * ax).toInt(),
+                    bottom = (match.bottom * ay).toInt(),
+                )
+            } else {
+                iw.copy(
+                    left = (iw.left * ix).toInt(),
+                    top = (iw.top * iy).toInt(),
+                    right = (iw.right * ix).toInt(),
+                    bottom = (iw.bottom * iy).toInt(),
+                )
+            }
+        }
+        Log.d(
+            "PortalPadSleep",
+            "RECOVERY merged session: membership=${windows.size} from lastSession " +
+                "(width archive had ${archive.windows.size})",
+        )
+        return Triple(
+            com.portalpad.app.data.SavedSession(windows, identity.savedAtMillis, w, h),
+            1f,
+            1f,
+        )
+    }
+
+    /** After a flap recovery, put the user back on the PortalPad interface the
+     *  HOME-to-recents parking pushed away — but ONLY if it was alive (a user
+     *  who was genuinely on their launcher stays there). singleTask +
+     *  REORDER_TO_FRONT: never recreates, mode preserved. */
+    private fun returnToPortalPadIfAlive() {
+        runCatching {
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            val alive = am.appTasks.any { t ->
+                runCatching {
+                    t.taskInfo.baseActivity?.className == com.portalpad.app.TrackpadActivity::class.java.name
+                }.getOrDefault(false)
+            }
+            if (!alive) return
+            Log.d("PortalPadSleep", "RECOVERY complete → returning to PortalPad interface (was alive)")
+            startActivity(
+                Intent(this, com.portalpad.app.TrackpadActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
+            )
+        }
+    }
+
     private suspend fun captureSessionNow(app: PortalPadApp) {
+        // Recovery gate: a debounced snapshot firing MID-TRANSITION captures a
+        // garbage half-state and OVERWRITES lastSession — the identity source
+        // for refugee recovery (seen in the wild: {chrome=1, vending=1} saved
+        // between VD teardown and restore, poisoning a healthy {chrome=2,
+        // youtube=1} snapshot). Recovery windows mark flapRecoveryUntilMs;
+        // hold snapshots until the dust settles.
+        if (app.isFlapRecovering()) {
+            Log.d(TAG, "captureSessionNow SKIPPED (recovery in progress)")
+            return
+        }
         val displayId = app.externalDisplayId.value ?: return
         runCatching {
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -2322,6 +3331,31 @@ class PortalPadForegroundService : Service() {
                 // Only persist if at least one window is genuinely positioned — else
                 // it's a launch transient / all-maximized state; keep the old session.
                 if (snap.windows.any { isPositioned(it) }) {
+                    // MASS-DEATH GUARD: a window-count collapse of ≥2 within one
+                    // capture interval means LMK reclaim or a crash wave, not
+                    // deliberate closing (log-proven 2026-07-09: lmkd killed 4
+                    // VISIBLE streaming apps in one second under min2x pressure,
+                    // and the next snapshot faithfully saved the wreckage 6→2→1,
+                    // destroying the only restore source). Hold the previous
+                    // snapshot for ONE interval and re-arm the restore offer; if
+                    // the reduced state persists at the NEXT capture (the user
+                    // really closed things and kept working), accept it then.
+                    // Deliberate one-at-a-time closes snapshot between each, so
+                    // they shrink by 1 per capture and never trip this.
+                    val prev = runCatching { app.prefs.lastSession.first() }.getOrNull()
+                    val collapse = (prev?.windows?.size ?: 0) - snap.windows.size
+                    if (collapse >= 2 && !snapshotCollapsePending) {
+                        snapshotCollapsePending = true
+                        Log.w(
+                            TAG,
+                            "captureSessionNow HELD: window count collapsed " +
+                                "${prev?.windows?.size}→${snap.windows.size} (LMK/crash suspected) — " +
+                                "keeping previous snapshot; restore offer re-armed",
+                        )
+                        app.bumpRestoreOfferNudge()
+                        return@withContext
+                    }
+                    snapshotCollapsePending = false
                     app.prefs.setLastSession(snap)
                     // Per-resolution memory: remember this layout under its canvas
                     // width so each display size keeps its own arrangement.
@@ -2341,7 +3375,7 @@ class PortalPadForegroundService : Service() {
             launch {
                 combine(
                     app.appInForeground,
-                    app.externalDisplayId,
+                    app.physicalExternalDisplayId,
                     app.prefs.bool(PreferencesRepository.Keys.FLOATING_BUBBLE, default = true),
                 ) { inForeground, displayId, enabled ->
                     floatingBubbleEnabled = enabled
@@ -2364,23 +3398,55 @@ class PortalPadForegroundService : Service() {
             // Watchdog: re-assert the desired state every few seconds so the bubble
             // self-heals if it ever didn't appear on leaving the app — e.g. a flow
             // transition that settled on stale state, or a transient WindowManager
-            // addView failure. Idempotent (only acts when shown != shouldShow) and
-            // still respects session-hide via bubble.show()'s own guard.
+            // addView failure. Now keyed on isActuallyShown (real window attachment)
+            // rather than the isShown reference flag: a display flap / overlay-hide
+            // can tear the bubble window down without hide() running, leaving
+            // isShown=true but nothing on screen — in which case show() would
+            // early-return and never recover it. reshow() drops the stale reference
+            // and re-adds. Idempotent (only acts when attachment != shouldShow) and
+            // still respects session-hide via show()'s own guard.
             launch {
                 while (true) {
                     kotlinx.coroutines.delay(3000)
                     val shouldShow = floatingBubbleEnabled &&
                         !app.appInForeground.value &&
-                        app.externalDisplayId.value != null
-                    if (shouldShow && !bubble.isShown) {
+                        app.physicalExternalDisplayId.value != null
+                    if (shouldShow && !bubble.isActuallyShown) {
                         Log.d(
                             "BubbleActivate",
-                            "watchdog: SELF-HEAL — shouldShow=true but bubble not shown " +
-                                "(reactive path missed it); calling show()",
+                            "watchdog: SELF-HEAL — shouldShow=true but bubble not attached " +
+                                "(isShown=${bubble.isShown}); reshow()",
                         )
-                        bubble.show()
+                        bubble.reshow()
                     } else if (!shouldShow && bubble.isShown) {
                         Log.d("BubbleActivate", "watchdog: self-heal — hiding stale bubble")
+                        bubble.hide()
+                    }
+                }
+            }
+            // Prompt re-assert on external-display change. A disconnect→replug
+            // arrives as physicalExternalDisplayId null→id; the reactive combine
+            // above can land late or get collapsed by distinctUntilChanged across
+            // the flap (observed in the wild: after a replug the bubble only
+            // reappeared when the 3s watchdog happened to fire ~coincidentally).
+            // Re-assert shortly after the display settles so the bubble returns
+            // promptly instead of waiting up to 3s. drop(1) skips the initial
+            // value (startup is already handled by the reactive path + watchdog);
+            // collectLatest cancels the pending settle-delay if a rapid flap emits
+            // again, so we only act on the settled final id.
+            launch {
+                app.physicalExternalDisplayId.drop(1).collectLatest {
+                    kotlinx.coroutines.delay(500)
+                    val shouldShow = floatingBubbleEnabled &&
+                        !app.appInForeground.value &&
+                        app.physicalExternalDisplayId.value != null
+                    if (shouldShow && !bubble.isActuallyShown) {
+                        Log.d(
+                            "BubbleActivate",
+                            "display-change re-assert: bubble not attached after settle — reshow()",
+                        )
+                        bubble.reshow()
+                    } else if (!shouldShow && bubble.isShown) {
                         bubble.hide()
                     }
                 }
@@ -2496,6 +3562,7 @@ class PortalPadForegroundService : Service() {
         }.start()
     }
 
+
     private fun dismissPhoneExitBandsImpl(closeTask: Boolean) {
         phoneExitGen++                 // invalidate any running poll/watchdog loop
         val tid = phoneExitTaskId
@@ -2564,6 +3631,12 @@ class PortalPadForegroundService : Service() {
      *  (the VD mirror renders through a color-matrix shader). Returns a
      *  diagnostic string. */
     fun applyGlassesColorMatrix(matrix4x4: FloatArray, gamma: Float = 1f): String {
+        // System-mirror path: apply the LINEAR matrix via the display color
+        // transform. Gamma isn't expressible in a display matrix, so it's
+        // dropped (as with the whole system-mirror color path).
+        if (systemMirrorGlassesId >= 0) {
+            return virtualDisplaySession.applySystemMirrorColor(systemMirrorGlassesId, matrix4x4)
+        }
         val m = vdMirror ?: return "FAIL: no active VD mirror (display not connected via VD)"
         return m.setColorMatrix(matrix4x4, gamma)
     }
@@ -2602,6 +3675,31 @@ class PortalPadForegroundService : Service() {
             val svc = instance ?: return
             val disp = svc.lastOverlayDisplay ?: return
             svc.mainHandler.post { svc.recreateCursorOnTop(disp) }
+        }
+
+        /** Lightweight cursor z-lift: restacks the EXISTING cursor window above
+         *  current overlays without rebuilding it (no Compose recreate, so no
+         *  flicker), unlike raiseCursor()'s full dismiss+re-add. Meant for
+         *  frequent triggers like dock hover-enter. Safe no-op if not up. */
+        fun raiseCursorFast() {
+            val svc = instance ?: return
+            svc.mainHandler.post { runCatching { svc.cursorOverlay?.raise() } }
+        }
+
+        /** Flip to a transient system mirror for a permission dialog (overlay-mode
+         *  users), so the native prompt is usable on the external display without
+         *  the security overlay-hide blacking the panel. Reverts on a safety
+         *  timeout. Never touches the saved mirror pref. Safe no-op if not up. */
+        fun beginTransientMirrorForDialog() {
+            val svc = instance ?: return
+            svc.mainHandler.post { svc.beginTransientMirrorInternal() }
+        }
+
+        /** Revert a transient dialog mirror immediately (e.g. once the dialog is
+         *  known to have closed — Stage 2). Safe no-op if none is active. */
+        fun endTransientMirrorForDialog() {
+            val svc = instance ?: return
+            svc.mainHandler.post { svc.endTransientMirrorInternal("dialog-closed") }
         }
 
         /** Temporarily stop reacting to onDisplayChanged storms. Used when
@@ -2692,6 +3790,123 @@ class PortalPadForegroundService : Service() {
             instance?.dismissPhoneExitBandsImpl(closeTask = false)
         }
 
+        /** Phone-side permission consent, called by FreeformManager AFTER it
+         *  force-stopped the app (external display now clear). External side:
+         *  wallpaper repaint (delayed past the ~1s post-kill settle window,
+         *  during which a wallpaper launch is proven to fail) + a "check your
+         *  phone" card. Phone side: the Allow/Deny request is pushed into the
+         *  foreground trackpad's composition via
+         *  [com.portalpad.app.TrackpadActivity.permConsentTrigger] — hosted
+         *  there because a service overlay AND a separate dialog activity were
+         *  both buried under the trackpad on this ROM. The caller verified the
+         *  trigger was non-null before force-stopping; if it vanished in the
+         *  gap (user left the trackpad), we log and stop — nothing granted,
+         *  the user just relaunches the app. */
+        fun showPermissionConsentFlow(
+            pkg: String,
+            permissions: List<String>,
+            onDecision: (approved: List<String>) -> Unit,
+        ) {
+            val svc = instance ?: return
+            val appLabel = runCatching {
+                val pm = svc.packageManager
+                pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+            }.getOrDefault(pkg)
+            // Group raw permissions the way Android's own App-info page does,
+            // one checkbox per group (e.g. the three READ_MEDIA_* are one
+            // "Photos and videos" row).
+            val groups = permissions
+                .groupBy { permissionGroupLabel(it) }
+                .map { (label, perms) -> label to perms }
+                .sortedBy { it.first }
+
+            // External display: wallpaper after the post-kill settle window,
+            // then the card once the wallpaper is up.
+            svc.mainHandler.postDelayed({ showWallpaper() }, 1000L)
+            svc.mainHandler.postDelayed({
+                runCatching {
+                    val app = PortalPadApp.instance
+                    val dm = svc.getSystemService(android.hardware.display.DisplayManager::class.java)
+                    val disp = dm?.getDisplay(app.injector.displayId) ?: return@runCatching
+                    com.portalpad.app.presentation.GlassesToast.show(
+                        svc.applicationContext, disp,
+                        "Check your phone to allow or deny them.",
+                        durationMs = 120_000L,
+                        title = "$appLabel is asking for permissions",
+                    )
+                }
+            }, 1800L)
+
+            val request = com.portalpad.app.ui.trackpad.PermConsentRequest(
+                appLabel = appLabel,
+                groups = groups,
+                onDecision = { approved ->
+                    runCatching { com.portalpad.app.presentation.GlassesToast.dismiss() }
+                    onDecision(approved)
+                },
+                onDismissed = {
+                    // Ask-later: clear the card; the app stays closed until the
+                    // user relaunches it (which re-runs this whole flow).
+                    runCatching { com.portalpad.app.presentation.GlassesToast.dismiss() }
+                    Log.w(TAG, "perm consent: dialog dismissed — no grants, $pkg stays closed")
+                },
+            )
+            svc.mainHandler.post {
+                val trigger = com.portalpad.app.TrackpadActivity.permConsentTrigger
+                if (trigger != null) {
+                    trigger(request)
+                } else {
+                    runCatching { com.portalpad.app.presentation.GlassesToast.dismiss() }
+                    Log.w(TAG, "perm consent: trackpad UI left before dialog could show — aborting, nothing granted")
+                }
+            }
+        }
+
+        /** Human-readable permission GROUP for a raw dangerous permission —
+         *  mirrors how Android's own App-info page groups them. */
+        private fun permissionGroupLabel(perm: String): String = when (perm) {
+            "android.permission.POST_NOTIFICATIONS" -> "Notifications"
+            "android.permission.CAMERA" -> "Camera"
+            "android.permission.RECORD_AUDIO" -> "Microphone"
+            "android.permission.ACCESS_FINE_LOCATION",
+            "android.permission.ACCESS_COARSE_LOCATION",
+            "android.permission.ACCESS_BACKGROUND_LOCATION",
+            -> "Location"
+            "android.permission.READ_CONTACTS",
+            "android.permission.WRITE_CONTACTS",
+            "android.permission.GET_ACCOUNTS",
+            -> "Contacts"
+            "android.permission.READ_CALENDAR",
+            "android.permission.WRITE_CALENDAR",
+            -> "Calendar"
+            "android.permission.READ_EXTERNAL_STORAGE",
+            "android.permission.WRITE_EXTERNAL_STORAGE",
+            -> "Files and media"
+            "android.permission.READ_MEDIA_IMAGES",
+            "android.permission.READ_MEDIA_VIDEO",
+            -> "Photos and videos"
+            "android.permission.READ_MEDIA_AUDIO" -> "Music and audio"
+            "android.permission.READ_PHONE_STATE",
+            "android.permission.READ_PHONE_NUMBERS",
+            "android.permission.CALL_PHONE",
+            -> "Phone"
+            "android.permission.READ_CALL_LOG",
+            "android.permission.WRITE_CALL_LOG",
+            -> "Call logs"
+            "android.permission.SEND_SMS",
+            "android.permission.RECEIVE_SMS",
+            "android.permission.READ_SMS",
+            -> "SMS"
+            "android.permission.BODY_SENSORS" -> "Body sensors"
+            "android.permission.ACTIVITY_RECOGNITION" -> "Physical activity"
+            "android.permission.NEARBY_WIFI_DEVICES",
+            "android.permission.BLUETOOTH_SCAN",
+            "android.permission.BLUETOOTH_CONNECT",
+            "android.permission.BLUETOOTH_ADVERTISE",
+            -> "Nearby devices"
+            else -> perm.removePrefix("android.permission.")
+        }
+
         /** Dismiss the on-display app-search overlay if it's showing — used by
          *  the Home button so pressing Home brings the home app forward instead
          *  of leaving the search panel on top. Safe no-op if nothing's up. */
@@ -2744,12 +3959,85 @@ class PortalPadForegroundService : Service() {
          *  display goes empty after closing apps. The activity itself reads the
          *  selected wallpaper from prefs (and draws black for "None"). This never
          *  touches the Android system wallpaper. */
+        /**
+         * Lay PortalPad's wallpaper backdrop on [displayId], idempotently.
+         *
+         * The backdrop is the BASE LAYER of the external display — whatever else is
+         * showing (restored freeform windows, an auto-launched app) sits on top of
+         * it. It was previously only ever laid down inside [launchAutoStart], which
+         * is gated on `!suppressAutoStartContent && ((autoLaunchOnFirstAttach &&
+         * wasNullBefore) || vdJustCreated)`. When a connect ran twice (observed: two
+         * "VD created" passes ~200ms apart, mirror dismissed and re-added between
+         * them), the first pass could be suppressed and the second had
+         * vdJustCreated=false — so NO pass laid the backdrop and a restored freeform
+         * window floated on pure black.
+         *
+         * Making it unconditional here fixes that: the base layer never depends on
+         * auto-start policy, which now only decides what goes ON TOP. Deduped per
+         * display so the VD-created call, [launchAutoStart], and the refocus fallback
+         * can all call it freely — the first wins, the rest are no-ops.
+         */
+        @Volatile private var lastBackdropDisplayId = -1
+        @Volatile private var lastBackdropAt = 0L
+        private const val BACKDROP_DEDUP_MS = 2500L
+        private val backdropLock = Any()
+
+        fun ensureBackdrop(displayId: Int, reason: String) {
+            if (displayId < 0) return
+            val svc = instance ?: return
+            val app = svc.applicationContext as PortalPadApp
+            val now = android.os.SystemClock.uptimeMillis()
+            synchronized(backdropLock) {
+                if (displayId == lastBackdropDisplayId && now - lastBackdropAt < BACKDROP_DEDUP_MS) {
+                    Log.d(TAG, "ensureBackdrop($reason) deduped — laid ${now - lastBackdropAt}ms ago on display=$displayId")
+                    return
+                }
+                lastBackdropDisplayId = displayId
+                lastBackdropAt = now
+            }
+            val component = "${app.packageName}/com.portalpad.app.WallpaperActivity"
+            // Dispatchers.IO, NOT the service's MainScope. `svc.scope` is a MainScope(),
+            // so this body used to queue behind the connect path's overlay attach and its
+            // ~13 runBlocking pref reads on the main thread — measured stalls of 100ms to
+            // 5.1s before the `am start` even fired, i.e. seconds of an empty display.
+            // Nothing here touches UI; it's a shell call.
+            svc.scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                if (!app.access.isReady) {
+                    Log.d(TAG, "ensureBackdrop($reason) skipped — access not ready (display=$displayId)")
+                    return@launch
+                }
+                // Idempotence by STATE, not by clock. The time-based dedup above still
+                // coalesces bursts, but it stamps the INVOCATION; when the launch was
+                // stalled (see above) the window could expire before the backdrop landed
+                // and a second one was launched (observed: two backdrops for the same
+                // taskId). Checking for an existing WallpaperActivity task makes a
+                // duplicate impossible regardless of timing.
+                val alreadyUp = runCatching {
+                    listTasksForBackdrop(app, displayId).any { rt ->
+                        rt.packageName == app.packageName &&
+                            rt.topActivity?.contains("WallpaperActivity", ignoreCase = true) == true
+                    }
+                }.getOrDefault(false)
+                if (alreadyUp) {
+                    Log.d(TAG, "ensureBackdrop($reason) skipped — backdrop already on display=$displayId")
+                    return@launch
+                }
+                Log.d(TAG, "ensureBackdrop($reason) launching backdrop display=$displayId")
+                runCatching { app.access.startActivityOnDisplay(component, displayId) }
+            }
+        }
+
+        /** Tasks on [displayId], for the backdrop-presence check. Isolated so a
+         *  listTasks failure can never block laying the backdrop down. */
+        private fun listTasksForBackdrop(app: PortalPadApp, displayId: Int) =
+            runCatching { app.freeform.listTasks(displayId) }.getOrDefault(emptyList())
+
         fun showWallpaper() {
-            Log.w(TAG, "DIAG-WALLPAPER showWallpaper() called", Throwable("caller trace"))
             val svc = instance ?: return
             val app = svc.applicationContext as PortalPadApp
             val displayId = app.externalDisplayId.value ?: app.injector.displayId
             val component = "${app.packageName}/com.portalpad.app.WallpaperActivity"
+            Log.d(TAG, "showWallpaper() display=$displayId accessReady=${app.access.isReady}")
             svc.scope.launch {
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                     if (app.access.isReady) {
@@ -2757,6 +4045,40 @@ class PortalPadForegroundService : Service() {
                     }
                 }
             }
+        }
+
+        /**
+         * Self-heal the VD wallpaper backdrop after its task was destroyed out
+         * from under us (recents swipe / trimInactiveRecentTasks). Called from
+         * [WallpaperActivity.onDestroy] on a NON-intentional destroy. Relaunches
+         * the backdrop only while the external is still physically connected — a
+         * normal unplug finishes the backdrop deliberately and needs no heal, and
+         * relaunching onto a dead display would be pointless. A short delay lets
+         * any in-flight task transition settle, and the physical-id re-check
+         * guards against a disconnect that lands during the delay.
+         */
+        @Volatile private var lastBackdropRelaunchAt = 0L
+        private const val BACKDROP_RELAUNCH_DEBOUNCE_MS = 2500L
+
+        fun onBackdropDestroyedUnexpectedly() {
+            val svc = instance ?: return
+            val app = svc.applicationContext as PortalPadApp
+            if (app.physicalExternalDisplayId.value == null) return
+            // Anti-fight guard: coalesce rapid relaunch requests so a backdrop
+            // that's relaunched then immediately re-destroyed can't loop, and so
+            // this can't race the fresh-attach launch. A genuine later re-clear
+            // (beyond the window) still self-heals.
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastBackdropRelaunchAt < BACKDROP_RELAUNCH_DEBOUNCE_MS) {
+                Log.w(TAG, "backdrop relaunch suppressed (debounce) — avoiding loop")
+                return
+            }
+            lastBackdropRelaunchAt = now
+            svc.mainHandler.postDelayed({
+                if (app.physicalExternalDisplayId.value == null) return@postDelayed
+                Log.w(TAG, "backdrop task destroyed unexpectedly (recents?) → relaunching wallpaper")
+                showWallpaper()
+            }, 500L)
         }
 
         /**
@@ -2776,10 +4098,41 @@ class PortalPadForegroundService : Service() {
          * trackpad re-launch. Falls back to the wallpaper backdrop when there's
          * nothing to restore.
          */
+        /** Coalesces duplicate launchAutoStart() calls. The VD connect path invokes
+         *  it twice (a direct call plus a postDelayed 400ms one), and each fired a
+         *  redundant backdrop `am start` — observed as two identical site=B lines at
+         *  the same millisecond. Keyed on displayId so a genuine new attach still
+         *  runs; a repeat within the window is dropped. */
+        @Volatile private var lastAutoStartDisplayId = -1
+        @Volatile private var lastAutoStartAt = 0L
+        private const val AUTOSTART_DEDUP_MS = 3000L
+        private val autoStartLock = Any()
+
         fun launchAutoStart() {
             val svc = instance ?: return
             val app = svc.applicationContext as PortalPadApp
+            val dedupDisplay = app.externalDisplayId.value ?: app.injector.displayId
+            val now = android.os.SystemClock.uptimeMillis()
+            synchronized(autoStartLock) {
+                if (dedupDisplay == lastAutoStartDisplayId &&
+                    now - lastAutoStartAt < AUTOSTART_DEDUP_MS
+                ) {
+                    Log.d(TAG, "autoLaunchOnStart deduped (ran ${now - lastAutoStartAt}ms ago for display=$dedupDisplay)")
+                    return
+                }
+                lastAutoStartDisplayId = dedupDisplay
+                lastAutoStartAt = now
+            }
             svc.scope.launch {
+                val displayId = app.externalDisplayId.value ?: app.injector.displayId
+
+                // Base layer first, before any pref read. Normally already laid down at
+                // VD creation, in which case this dedups to a no-op; it still matters on
+                // the non-VD path and on re-attach.
+                ensureBackdrop(displayId, "autoLaunchOnStart")
+                if (!app.access.isReady) return@launch
+
+                // Now resolve what (if anything) goes on top of the backdrop.
                 val mode = runCatching { app.prefs.autoLaunchOnStart.first() }
                     .getOrDefault(com.portalpad.app.data.AutoLaunch.Wallpaper)
                 val entry: AppEntry? = when (mode) {
@@ -2788,20 +4141,10 @@ class PortalPadForegroundService : Service() {
                         runCatching { app.prefs.lastForegroundApp.first() }.getOrNull()
                     is com.portalpad.app.data.AutoLaunch.Launch -> mode.entry
                 }
-                val displayId = app.externalDisplayId.value ?: app.injector.displayId
-                val wallpaperComponent = "${app.packageName}/com.portalpad.app.WallpaperActivity"
+                // Wallpaper-only mode: nothing else to launch on top.
+                if (entry == null) return@launch
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                     if (!app.access.isReady) return@withContext
-                    // ALWAYS lay down the wallpaper backdrop FIRST, as the base
-                    // layer beneath whatever else launches. This makes the display
-                    // never black: the wallpaper shows on start, and when the user
-                    // closes every app the wallpaper underneath is revealed instead
-                    // of black. (Previously the backdrop was only launched in
-                    // Wallpaper mode or on launch failure, so Last-App / specific-
-                    // app modes left the display black once their app was closed.)
-                    runCatching { app.access.startActivityOnDisplay(wallpaperComponent, displayId) }
-                    // Wallpaper-only mode: nothing else to launch on top.
-                    if (entry == null) return@withContext
                     // Launch the configured auto-start app ON TOP of the backdrop.
                     val component = if (entry.componentName != null) {
                         "${entry.packageName}/${entry.componentName}"
@@ -2854,15 +4197,32 @@ class PortalPadForegroundService : Service() {
                                     rt.packageName != "com.portalpad.app"
                             }
                         }.getOrDefault(false)
+                        // The backdrop IS PortalPad, so `realAppPresent` (which excludes
+                        // our own package) reads FALSE even when the backdrop is already
+                        // up — the display looks "genuinely empty" and we relaunch a
+                        // backdrop that's already showing. Observed: site=C firing 23ms
+                        // after site=B's launch, then again ~1.7s later, for a total of
+                        // 4 backdrop `am start`s per connect on the same taskId. Detect
+                        // the existing backdrop and leave it alone; there's nothing to
+                        // fall back to when the fallback is already on screen.
+                        val backdropAlreadyUp = runCatching {
+                            val ids = listOf(displayId, app.physicalExternalDisplayId.value)
+                                .filterNotNull().distinct()
+                            ids.flatMap { app.freeform.listTasks(it) }.any { rt ->
+                                rt.packageName == "com.portalpad.app" &&
+                                    rt.topActivity?.contains("WallpaperActivity", ignoreCase = true) == true
+                            }
+                        }.getOrDefault(false)
                         if (app.launchedRecently()) {
                             // Skip wallpaper fallback briefly after a launch (the
                             // refocus can race the launch and wrongly blank it).
                         } else if (realAppPresent) {
                             // A real app is on the display; refocus just couldn't
                             // see it. Don't replace it with the wallpaper.
+                        } else if (backdropAlreadyUp) {
+                            Log.d(TAG, "refocus-fallback skipped — backdrop already up on display=$displayId")
                         } else if (app.access.isReady) {
-                            val component = "${app.packageName}/com.portalpad.app.WallpaperActivity"
-                            runCatching { app.access.startActivityOnDisplay(component, displayId) }
+                            ensureBackdrop(displayId, "refocus-fallback")
                         }
                     }
                 }
@@ -2898,11 +4258,31 @@ class PortalPadForegroundService : Service() {
         private const val CHANNEL_ID = "portalpad_service"
 
         fun start(context: Context) {
+            // Deliberate start — clear the user-stopped marker BEFORE launching
+            // so the onCreate relaunch guard can't misread this as a zombie
+            // relaunch and immediately stop itself.
+            runCatching {
+                kotlinx.coroutines.runBlocking {
+                    (context.applicationContext as PortalPadApp).prefs.setBool(
+                        PreferencesRepository.Keys.SERVICE_USER_STOPPED, false,
+                    )
+                }
+            }
             val i = Intent(context, PortalPadForegroundService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(i)
             else context.startService(i)
         }
         fun stop(context: Context) {
+            // Deliberate stop — mark it so a later START_STICKY relaunch knows
+            // the difference between "the system killed us, come back" (recents
+            // Close-All) and "the user said stop, stay stopped".
+            runCatching {
+                kotlinx.coroutines.runBlocking {
+                    (context.applicationContext as PortalPadApp).prefs.setBool(
+                        PreferencesRepository.Keys.SERVICE_USER_STOPPED, true,
+                    )
+                }
+            }
             context.stopService(Intent(context, PortalPadForegroundService::class.java))
         }
     }

@@ -1,6 +1,8 @@
 package com.portalpad.app.presentation
 
 import android.graphics.Typeface
+import android.content.Context
+import android.view.WindowManager
 import android.graphics.drawable.GradientDrawable
 import android.view.Display
 import android.view.Gravity
@@ -14,6 +16,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.launch
 
 /**
@@ -36,6 +40,13 @@ import kotlinx.coroutines.launch
 class PerformanceHud(
     private val parent: FrameLayout,
     private val display: Display,
+    // When false (system-mirror mode: no GL pipeline), the GL-sourced rows
+    // (fps, draw time, "behind") are meaningless, so only the resolution/Hz
+    // row — read straight from the Display — is shown.
+    private val glActive: Boolean = true,
+    // Optional delivered-fps source for system-mirror mode (SurfaceFlinger
+    // frame stats). Returns a non-positive value when unavailable.
+    private val fpsSampler: (() -> Float)? = null,
 ) {
     private val ctx = parent.context
     private val prefs = PortalPadApp.instance.prefs
@@ -53,6 +64,12 @@ class PerformanceHud(
     // fps derivation: delta of frameCount over wall-clock between ticks.
     private var lastCount = 0L
     private var lastTickNs = 0L
+
+    // Standalone mode (system mirror): the HUD owns its overlay window instead
+    // of parenting into the VD mirror's host. Set by [standalone]; removed in
+    // [stop].
+    private var ownWindowManager: android.view.WindowManager? = null
+    private var ownContainer: FrameLayout? = null
 
     fun start() {
         if (scope != null) return
@@ -96,6 +113,10 @@ class PerformanceHud(
         scope?.cancel(); scope = null
         view?.let { runCatching { parent.removeView(it) } }
         view = null
+        // Standalone mode: also remove our own overlay window.
+        ownContainer?.let { c -> runCatching { ownWindowManager?.removeView(c) } }
+        ownContainer = null
+        ownWindowManager = null
     }
 
     private fun applyVisibility() {
@@ -132,9 +153,29 @@ class PerformanceHud(
         if (showMode) {
             sb.append("${mode.physicalWidth}×${mode.physicalHeight} · ${"%.0f".format(hz)} Hz\n")
         }
-        if (showFps) sb.append("${"%.0f".format(fps)} fps\n")
-        if (showFrameTime) sb.append("draw ${"%.1f".format(drawMs)} ms\n")
-        if (showDropped) sb.append("vsync ${"%.0f".format(hz)} · ~$dropped behind\n")
+        // fps / draw / behind are derived from the GL renderer telemetry, which
+        // only exists on the overlay path. In system-mirror mode there's no GL
+        // pipeline, so these are suppressed rather than shown as a false 0.
+        if (glActive) {
+            if (showFps) sb.append("${"%.0f".format(fps)} fps\n")
+            if (showFrameTime) sb.append("draw ${"%.1f".format(drawMs)} ms\n")
+            if (showDropped) sb.append("vsync ${"%.0f".format(hz)} · ~$dropped behind\n")
+        } else {
+            // System-mirror mode: no GL loop to count, but SurfaceFlinger can
+            // report delivered frames for the display. Show the same rows overlay
+            // mode would (fps, and the vsync/behind row derived as hz − fps) so
+            // the overlay reaches parity. The GL draw-time row is the only one
+            // with no equivalent here (nothing is GL-drawn), so it stays
+            // overlay-only rather than showing a meaningless value.
+            val sfFps = fpsSampler?.invoke() ?: -1f
+            if (sfFps > 0f) {
+                if (showFps) sb.append("${"%.0f".format(sfFps)} fps\n")
+                if (showDropped) {
+                    val sfDropped = (hz - sfFps).coerceAtLeast(0f).let { Math.round(it) }
+                    sb.append("vsync ${"%.0f".format(hz)} · ~$sfDropped behind\n")
+                }
+            }
+        }
         v.text = sb.toString().trimEnd('\n')
     }
 
@@ -168,5 +209,60 @@ class PerformanceHud(
         const val CORNER_TOP_RIGHT = "top_right"
         const val CORNER_BOTTOM_LEFT = "bottom_left"
         const val CORNER_BOTTOM_RIGHT = "bottom_right"
+
+        /** Map a corner constant to a window Gravity for the standalone window. */
+        private fun windowGravity(corner: String): Int = when (corner) {
+            CORNER_TOP_LEFT -> Gravity.TOP or Gravity.START
+            CORNER_BOTTOM_LEFT -> Gravity.BOTTOM or Gravity.START
+            CORNER_BOTTOM_RIGHT -> Gravity.BOTTOM or Gravity.END
+            else -> Gravity.TOP or Gravity.END
+        }
+
+        /**
+         * Build a HUD that owns its own overlay window on [display] (used in
+         * system-mirror mode, where there's no VD-mirror host to parent into).
+         * The window is WRAP_CONTENT pinned to the configured corner — NOT
+         * full-display — so it obscures only a tiny corner region and can't trip
+         * Android's untrusted-touch occlusion (which would drop injected scroll
+         * touches across the whole display). Non-touchable / non-focusable.
+         * [fpsSampler], if provided, returns a delivered-fps to display (from
+         * SurfaceFlinger); glActive is false here so GL rows are suppressed.
+         */
+        fun standalone(
+            serviceContext: Context,
+            display: Display,
+            glActive: Boolean,
+            fpsSampler: (() -> Float)? = null,
+        ): PerformanceHud? {
+            return runCatching {
+                val corner = runCatching {
+                    kotlinx.coroutines.runBlocking {
+                        com.portalpad.app.PortalPadApp.instance.prefs
+                            .string(com.portalpad.app.data.PreferencesRepository.Keys.HUD_CORNER, CORNER_TOP_RIGHT)
+                            .first()
+                    }
+                }.getOrDefault(CORNER_TOP_RIGHT)
+                val host = OverlayHost.forDisplay(display, serviceContext)
+                val container = FrameLayout(host.context)
+                val lp = WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    host.windowType,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                    android.graphics.PixelFormat.TRANSLUCENT,
+                ).apply {
+                    gravity = windowGravity(corner)
+                    x = 12; y = 12
+                }
+                host.windowManager.addView(container, lp)
+                PerformanceHud(container, display, glActive, fpsSampler).also {
+                    it.ownWindowManager = host.windowManager
+                    it.ownContainer = container
+                    it.start()
+                }
+            }.getOrNull()
+        }
     }
 }

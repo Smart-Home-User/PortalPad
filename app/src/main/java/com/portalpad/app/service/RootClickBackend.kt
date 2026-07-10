@@ -140,6 +140,14 @@ class RootClickBackend(private val context: Context) : BoundShellBackend {
         svcCall("<not bound>") { it.setDisplayColorMode(displayId, colorMode) }
     override fun setLayerColorTransform(layer: android.view.SurfaceControl, matrix12: FloatArray): String =
         svcCall("<not bound>") { it.setLayerColorTransform(layer, matrix12) }
+    override fun probeMirrorCapability(physicalDisplayHint: Int): String =
+        svcCall("<not bound>") { it.probeMirrorCapability(physicalDisplayHint) }
+    override fun startLayerStackMirror(glassesDisplayId: Int, vdDisplayId: Int): String =
+        svcCall("<not bound>") { it.startLayerStackMirror(glassesDisplayId, vdDisplayId) }
+    override fun stopLayerStackMirror(glassesDisplayId: Int): String =
+        svcCall("<not bound>") { it.stopLayerStackMirror(glassesDisplayId) }
+    override fun sampleDisplayFps(displayId: Int): Float =
+        svcCall(-1f) { it.sampleDisplayFps(displayId) }
 
     // ─── diagnostics ────────────────────────────────────────────────
     override fun streamLogcat(filter: String?): android.os.ParcelFileDescriptor? =

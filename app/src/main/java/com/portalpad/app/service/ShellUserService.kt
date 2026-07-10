@@ -1069,30 +1069,11 @@ class ShellUserService : IShellService.Stub {
             val sc = Class.forName("android.view.SurfaceControl")
             val log = StringBuilder()
 
-            // Find a display token.
-            var token: android.os.IBinder? = null
-            runCatching {
-                val ids = sc.getMethod("getPhysicalDisplayIds").invoke(null) as? LongArray
-                log.append("physicalIds=${ids?.toList()}; ")
-                // Heuristic: the external (glasses) is usually the non-zero /
-                // second id. Try each until one accepts the transform.
-                if (ids != null && ids.isNotEmpty()) {
-                    val getToken = sc.getMethod("getPhysicalDisplayToken", Long::class.javaPrimitiveType)
-                    // Prefer the LAST id (external tends to enumerate after internal).
-                    for (pid in ids.reversed()) {
-                        val t = getToken.invoke(null, pid) as? android.os.IBinder
-                        if (t != null) {
-                            token = t
-                            log.append("usingPid=$pid; ")
-                            break
-                        }
-                    }
-                }
-            }.onFailure { log.append("tokenLookup:${it.javaClass.simpleName}; ") }
-
-            if (token == null) {
-                return "FAIL: no display token. [$log]"
-            }
+            // Find the EXTERNAL display token (never the internal panel — see
+            // resolvePanelToken; grabbing internal here would tint/disturb the
+            // phone's own screen when the glasses are absent).
+            val token: android.os.IBinder = resolvePanelToken(sc, log)
+                ?: return "FAIL: no display token. [$log]"
 
             // Apply the color matrix. The exact API varies by Android version,
             // so try several known shapes and, if none work, dump the available
@@ -1204,17 +1185,8 @@ class ShellUserService : IShellService.Stub {
             // our process; the reachable path is SurfaceControl static
             // setDisplayColorMode/setActiveColorMode(IBinder token, int mode).
             val sc = Class.forName("android.view.SurfaceControl")
-            var token: android.os.IBinder? = null
-            runCatching {
-                val ids = sc.getMethod("getPhysicalDisplayIds").invoke(null) as? LongArray
-                if (ids != null && ids.isNotEmpty()) {
-                    val getToken = sc.getMethod("getPhysicalDisplayToken", Long::class.javaPrimitiveType)
-                    for (pid in ids.reversed()) {
-                        val t = getToken.invoke(null, pid) as? android.os.IBinder
-                        if (t != null) { token = t; log.append("usingPid=$pid; "); break }
-                    }
-                }
-            }
+            // External display token only (never the internal panel).
+            val token: android.os.IBinder? = resolvePanelToken(sc, log)
             if (token != null) {
                 for (name in listOf("setDisplayColorMode", "setActiveColorMode")) {
                     if (applied) break
@@ -1508,6 +1480,263 @@ class ShellUserService : IShellService.Stub {
             "setDisplayLayerStack", IBinder::class.java, Int::class.javaPrimitiveType,
         ).also { scSetDisplayLayerStack = it }
         m.invoke(null, token, layerStack)
+    }
+
+    /**
+     * EXPERIMENT (permfix / AirBeam parity): passively report whether the
+     * SurfaceControl display-mirror primitives are reachable on this ROM. Does
+     * NOT retarget or disturb any live display — it only resolves the physical
+     * token, creates + immediately destroys a throwaway SF display, and checks
+     * which primitives resolve. Every step is logged; the return value is a
+     * compact summary. This is the go/no-go for an overlay-free system mirror.
+     */
+    // Original panel layerStack per glasses logical id, captured at mirror
+    // start so stop can restore it exactly.
+    private val mirrorOriginalLayerStack = java.util.concurrent.ConcurrentHashMap<Int, Int>()
+
+    /** Resolve the physical glasses panel token (same heuristic as the color
+     *  transform: prefer the last-enumerated physical id, which is the external
+     *  display). */
+    private fun resolvePanelToken(sc: Class<*>, log: StringBuilder): IBinder? {
+        var token: IBinder? = null
+        runCatching {
+            val ids = sc.getMethod("getPhysicalDisplayIds").invoke(null) as? LongArray
+            // CRITICAL: only resolve a token when a REAL external panel is
+            // present. With the glasses unplugged (or mid-flap), this returns
+            // just the internal panel — and the old code grabbed it, retargeting
+            // the PHONE'S OWN screen to the VD layerStack, which freezes the
+            // phone until a screen off/on resets the compositor. Confirmed via a
+            // frozen-state SurfaceFlinger dump (internal display bound to a dead
+            // VD layerStack). So: require >=2 physical displays, and never pick
+            // the primary/internal id (enumerates first).
+            if (ids == null || ids.size < 2) {
+                log.append("noExternalPanel(n=${ids?.size ?: 0}); ")
+                return@runCatching
+            }
+            val internalPid = ids.first()
+            val getToken = sc.getMethod("getPhysicalDisplayToken", Long::class.javaPrimitiveType)
+            for (pid in ids.reversed()) {
+                if (pid == internalPid) continue // never retarget the phone's panel
+                val t = getToken.invoke(null, pid) as? IBinder
+                if (t != null) { token = t; log.append("panelPid=$pid; "); break }
+            }
+        }.onFailure { log.append("tokenLookup:${it.javaClass.simpleName}; ") }
+        return token
+    }
+
+    /** Read a logical display's current layerStack via DisplayManagerGlobal +
+     *  DisplayInfo reflection (system context sees all displays). */
+    private fun readLayerStack(logicalDisplayId: Int): Int? = runCatching {
+        val dmg = Class.forName("android.hardware.display.DisplayManagerGlobal")
+            .getMethod("getInstance").invoke(null)
+        val info = dmg.javaClass.getMethod("getDisplayInfo", Int::class.javaPrimitiveType)
+            .invoke(dmg, logicalDisplayId)
+        info?.javaClass?.getField("layerStack")?.getInt(info)
+    }.getOrNull()
+
+    /** Apply setDisplayLayerStack(token, layerStack) via the Transaction form
+     *  (the static form was removed on this ROM — probe confirmed it lives on
+     *  SurfaceControl.Transaction). */
+    private fun txSetDisplayLayerStack(token: IBinder, layerStack: Int) {
+        val txClass = Class.forName("android.view.SurfaceControl\$Transaction")
+        val tx = txClass.getConstructor().newInstance()
+        txClass.getMethod("setDisplayLayerStack", IBinder::class.java, Int::class.javaPrimitiveType)
+            .invoke(tx, token, layerStack)
+        txClass.getMethod("apply").invoke(tx)
+        runCatching { txClass.getMethod("close").invoke(tx) }
+    }
+
+    override fun startLayerStackMirror(glassesDisplayId: Int, vdDisplayId: Int): String {
+        val id = Binder.clearCallingIdentity()
+        val log = StringBuilder()
+        return try {
+            val sc = getSurfaceControlClass() ?: return "FAIL: no SurfaceControl"
+            val token = resolvePanelToken(sc, log) ?: return "FAIL: no panel token. [$log]"
+            val vdLayerStack = readLayerStack(vdDisplayId)
+                ?: return "FAIL: no VD layerStack for disp=$vdDisplayId. [$log]"
+            val panelLayerStack = readLayerStack(glassesDisplayId)
+            if (panelLayerStack != null) {
+                // putIfAbsent: keep the FIRST-saved (true native) layerStack so
+                // repeated retargets (e.g. the staggered wake re-apply) don't
+                // overwrite it with the VD's stack — otherwise stop() would
+                // "restore" the panel to the VD's dead stack.
+                val prior = mirrorOriginalLayerStack.putIfAbsent(glassesDisplayId, panelLayerStack)
+                log.append("savedPanelLS=${prior ?: panelLayerStack}; ")
+            } else {
+                log.append("panelLS=unknown; ")
+            }
+            log.append("vdLS=$vdLayerStack; ")
+            txSetDisplayLayerStack(token, vdLayerStack)
+            val msg = "OK: retargeted panel→vdLayerStack=$vdLayerStack. [$log]"
+            Log.w(TAG, "LAYERSTACK-MIRROR start: $msg")
+            msg
+        } catch (t: Throwable) {
+            val s = "EXCEPTION: ${t.javaClass.simpleName}: ${t.message} [$log]"
+            Log.w(TAG, "LAYERSTACK-MIRROR start: $s"); s
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    override fun stopLayerStackMirror(glassesDisplayId: Int): String {
+        val id = Binder.clearCallingIdentity()
+        val log = StringBuilder()
+        return try {
+            val original = mirrorOriginalLayerStack.remove(glassesDisplayId)
+                ?: return "SKIP: no saved layerStack for disp=$glassesDisplayId"
+            val sc = getSurfaceControlClass() ?: return "FAIL: no SurfaceControl"
+            val token = resolvePanelToken(sc, log) ?: return "FAIL: no panel token. [$log]"
+            txSetDisplayLayerStack(token, original)
+            val msg = "OK: restored panel layerStack=$original. [$log]"
+            Log.w(TAG, "LAYERSTACK-MIRROR stop: $msg")
+            msg
+        } catch (t: Throwable) {
+            val s = "EXCEPTION: ${t.javaClass.simpleName}: ${t.message} [$log]"
+            Log.w(TAG, "LAYERSTACK-MIRROR stop: $s"); s
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    /**
+     * Best-effort delivered-fps from SurfaceFlinger's per-layer latency stats.
+     * `dumpsys SurfaceFlinger --latency <layer>` prints, after a refresh-period
+     * header line, rows of "desiredPresent actualPresent frameReady" timestamps
+     * (ns). We pick a busy app layer, count distinct recent present timestamps,
+     * and derive fps from their span. Fully defensive: any parse failure / no
+     * layer → -1f, so the HUD shows no fps rather than a wrong number.
+     */
+    override fun sampleDisplayFps(displayId: Int): Float {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val list = runCommand("dumpsys SurfaceFlinger --list")
+            val layer = list.lines()
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .firstOrNull {
+                    (it.startsWith("SurfaceView") || it.contains("com.")) &&
+                        !it.contains("PortalPad", ignoreCase = true) &&
+                        !it.contains("Wallpaper", ignoreCase = true) &&
+                        !it.contains("Toast") && !it.contains("StatusBar") &&
+                        it.contains("#")
+                } ?: return -1f
+            val out = runCommand("dumpsys SurfaceFlinger --latency \"$layer\"")
+            val lines = out.lines().map { it.trim() }.filter { it.isNotEmpty() }
+            if (lines.size < 3) return -1f
+            val present = lines.drop(1).mapNotNull { row ->
+                val cols = row.split(Regex("\\s+"))
+                if (cols.size >= 2) cols[1].toLongOrNull() else null
+            }.filter { it > 0L }.distinct().sorted()
+            if (present.size < 2) return -1f
+            val spanNs = (present.last() - present.first()).toDouble()
+            if (spanNs <= 0.0) return -1f
+            val fps = (present.size - 1) * 1e9 / spanNs
+            if (fps.isFinite() && fps in 1.0..240.0) fps.toFloat() else -1f
+        } catch (t: Throwable) {
+            -1f
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    override fun probeMirrorCapability(physicalDisplayHint: Int): String {
+        val id = Binder.clearCallingIdentity()
+        val log = StringBuilder()
+        return try {
+            val sc = getSurfaceControlClass() ?: return "FAIL: no SurfaceControl class"
+
+            // 1) Physical panel token (same resolution setDisplayColorTransform uses).
+            var token: IBinder? = null
+            runCatching {
+                val ids = sc.getMethod("getPhysicalDisplayIds").invoke(null) as? LongArray
+                log.append("physicalIds=${ids?.toList()}; ")
+                if (ids != null && ids.isNotEmpty()) {
+                    val getToken = sc.getMethod("getPhysicalDisplayToken", Long::class.javaPrimitiveType)
+                    for (pid in ids.reversed()) {
+                        val t = getToken.invoke(null, pid) as? IBinder
+                        if (t != null) { token = t; log.append("panelToken=ok(pid=$pid); "); break }
+                    }
+                }
+            }.onFailure { log.append("tokenLookup:${it.javaClass.simpleName}; ") }
+            if (token == null) log.append("panelToken=NULL; ")
+
+            // 2) createDisplay round-trip (create → destroy). This is the API
+            //    most likely to be blocked on One UI 16; if it returns a token,
+            //    the AirBeam-style SF mirror is probably reachable.
+            runCatching {
+                val d = createSurfaceControlDisplay()
+                if (d != null) {
+                    log.append("createDisplay=OK; ")
+                    runCatching { destroySurfaceControlDisplay(d) }
+                        .onSuccess { log.append("destroyDisplay=OK; ") }
+                        .onFailure { log.append("destroyDisplay:${it.javaClass.simpleName}; ") }
+                } else {
+                    log.append("createDisplay=NULL; ")
+                }
+            }.onFailure { log.append("createDisplay:${it.javaClass.simpleName}; ") }
+
+            // 3) Are the retarget primitives even present (method resolution only —
+            //    NOT invoked, so the live panel is untouched)?
+            for (mName in listOf("setDisplayLayerStack", "setDisplaySurface", "setDisplayProjection")) {
+                val present = runCatching {
+                    sc.declaredMethods.any { it.name == mName } || sc.methods.any { it.name == mName }
+                }.getOrDefault(false)
+                log.append("$mName=${if (present) "present" else "MISSING"}; ")
+            }
+            // Same on Transaction, the modern home for these. Dump FULL
+            // signatures (name + param types) for the mirror family so the real
+            // build targets exact overloads instead of guessing.
+            runCatching {
+                val txClass = Class.forName("android.view.SurfaceControl\$Transaction")
+                val wanted = txClass.declaredMethods
+                    .filter {
+                        val n = it.name
+                        n.contains("LayerStack") || n.contains("mirror", true) ||
+                            n == "setDisplaySurface" || n == "setDisplayProjection" ||
+                            n == "reparent" || n.contains("Mirror")
+                    }
+                    .map { "${it.name}(${it.parameterTypes.joinToString(",") { p -> p.simpleName }})" }
+                    .distinct()
+                log.append("txSigs=$wanted; ")
+            }.onFailure { log.append("txScan:${it.javaClass.simpleName}; ") }
+
+            // SurfaceControl.mirrorSurface(SurfaceControl) — the likely AirBeam
+            // mechanism (a mirror is a COPY of a layer tree, which explains its
+            // separate layerStacks). Report its exact signature if present.
+            runCatching {
+                val ms = sc.methods.filter { it.name == "mirrorSurface" }
+                    .map { "mirrorSurface(${it.parameterTypes.joinToString(",") { p -> p.simpleName }})" }
+                log.append("scMirror=$ms; ")
+            }.onFailure { log.append("scMirrorScan:${it.javaClass.simpleName}; ") }
+
+            // createDisplay replacement moved to android.view.DisplayControl on
+            // newer builds. Check whether it (and its methods) are reachable.
+            runCatching {
+                val dc = Class.forName("android.view.DisplayControl")
+                val names = dc.declaredMethods.map { it.name }.distinct()
+                log.append("DisplayControl=present methods=$names; ")
+            }.onFailure { log.append("DisplayControl=${it.javaClass.simpleName}; ") }
+
+            // How do we get a SurfaceControl handle for the VD's root layer to
+            // mirror? Check DisplayManagerGlobal / SurfaceControl for a
+            // display-token→SurfaceControl bridge.
+            runCatching {
+                val scMethods = sc.methods
+                    .filter { it.name.contains("isplay", false) && it.returnType.simpleName == "SurfaceControl" }
+                    .map { "${it.name}(${it.parameterTypes.joinToString(",") { p -> p.simpleName }})" }
+                    .distinct()
+                log.append("scDisplay→SC=$scMethods; ")
+            }.onFailure {}
+
+            val summary = "MIRROR-PROBE: [$log]"
+            Log.w(TAG, summary)
+            summary
+        } catch (t: Throwable) {
+            val s = "MIRROR-PROBE EXCEPTION: ${t.javaClass.simpleName}: ${t.message} [$log]"
+            Log.w(TAG, s); s
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
     }
 
     // ─── Task management ────────────────────────────────────────────────

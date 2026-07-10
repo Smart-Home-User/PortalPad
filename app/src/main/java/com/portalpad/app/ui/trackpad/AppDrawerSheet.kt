@@ -58,10 +58,13 @@ fun AppDrawerSheet(
 
     val filtered = remember(query, apps) {
         if (query.text.isBlank()) apps
-        else apps.filter {
-            it.label.contains(query.text, ignoreCase = true) ||
-                it.packageName.contains(query.text, ignoreCase = true)
-        }
+        else com.portalpad.app.ui.common.SearchRank
+            .filterApps(apps, query.text) { it.label }
+            .ifEmpty {
+                // Legacy fallback: package-name substring (lets power users
+                // find apps by package when the label doesn't match at all).
+                apps.filter { it.packageName.contains(query.text, ignoreCase = true) }
+            }
     }
 
     // ─── In-sheet voice dictation ───────────────────────────────────────────

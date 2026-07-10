@@ -59,6 +59,7 @@ import androidx.compose.ui.unit.sp
 import com.portalpad.app.data.BackAction
 import com.portalpad.app.service.InputInjector
 import com.portalpad.app.ui.mediacontrols.MediaControlsPanel
+import com.portalpad.app.ui.common.DisconnectBanner
 import com.portalpad.app.ui.theme.AbBackground
 import com.portalpad.app.ui.theme.AbSurface
 import com.portalpad.app.ui.theme.AbOnSurfaceMuted
@@ -140,7 +141,23 @@ class TrackpadActivity : PinnedDensityActivity() {
                 ).first()
             }
         }.getOrDefault(true)
+        // BIRTH ATTRIBUTE: set unconditionally at create, exactly like the
+        // pre-gating build — a window BORN with SHOW_WHEN_LOCKED is always
+        // honored by WM's keyguard evaluation, whereas a runtime
+        // setShowWhenLocked isn't re-evaluated until the window relayouts
+        // (measured on-device: first screen-off showed the lock screen, and
+        // occlusion only worked after an unrelated relayout shipped the
+        // pending flag). The collector below applies the display-gated value
+        // on its immediate first emission, so a no-display launch flips false
+        // within the same frame.
         setShowWhenLocked(showOverLock)
+        if (showOverLock) {
+            lifecycleScope.launch {
+                PortalPadApp.instance.physicalExternalDisplayId.collect { phys ->
+                    applyShowWhenLocked(phys != null)
+                }
+            }
+        }
         // Same as MainActivity: if the glasses attach while locked, prompt unlock —
         // the desktop can't extend onto them until the phone is unlocked.
         promptUnlockWhenDisplayAttachesLocked(enabled = showOverLock)
@@ -188,7 +205,14 @@ class TrackpadActivity : PinnedDensityActivity() {
             val goneGraceMs = 5000L
             repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
                 val watcherScope = this
-                app.externalDisplayId.collect { id ->
+                // Watch the PHYSICAL display id, not externalDisplayId: the
+                // latter points at the trusted VD, which the service keeps alive
+                // for up to 60s after a real unplug (grace/reconnect model). So
+                // watching it left the trackpad stuck on-screen (unresponsive)
+                // for the whole grace window before returning to main. The
+                // physical id is nulled the instant the panel unplugs, and a
+                // brief resolution flap restores it within the 5s grace below.
+                app.physicalExternalDisplayId.collect { id ->
                     if (id != null) {
                         sawDisplay = true
                         // (Re)attached — the prior null was a flap, not an unplug.
@@ -229,7 +253,7 @@ class TrackpadActivity : PinnedDensityActivity() {
                                 kotlinx.coroutines.delay(remaining)
                                 // Re-check against the live value (the flow may not
                                 // re-emit while it stays null).
-                                if (app.externalDisplayId.value == null) {
+                                if (app.physicalExternalDisplayId.value == null) {
                                     Log.d(TAG, "External display gone >${goneGraceMs}ms — finishing trackpad")
                                     // Return to PortalPad rather than dropping to whatever
                                     // app was behind the trackpad in the task stack.
@@ -311,6 +335,23 @@ class TrackpadActivity : PinnedDensityActivity() {
      *  the DPI number keypad even amid display/Shizuku state churn (which otherwise
      *  re-schedules a setWindowFocusable(false) that clobbers it). */
     internal val displaySubpageOpen = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    /** setShowWhenLocked + a FORCED RELAYOUT so WindowManager re-evaluates
+     *  keyguard occlusion NOW. A bare runtime setShowWhenLocked isn't picked
+     *  up until the next incidental relayout (measured on-device: first
+     *  screen-off after a runtime-only change showed the lock screen; the
+     *  second worked only because an unrelated relayout had shipped the
+     *  flag in between). Logged so captures show our side of any race.
+     */
+    private fun applyShowWhenLocked(show: Boolean) {
+        runCatching {
+            setShowWhenLocked(show)
+            // Attribute self-assignment forces a relayout of this window,
+            // pushing the updated flag to WM immediately.
+            window.attributes = window.attributes
+            Log.d(TAG, "applyShowWhenLocked($show) + relayout")
+        }
+    }
 
     /**
      * Toggle whether this window can hold input focus. NOT_FOCUSABLE protects
@@ -399,6 +440,20 @@ class TrackpadActivity : PinnedDensityActivity() {
         runCatching {
             if (app.externalDisplayId.value == null) {
                 Log.d(TAG, "refocusExternalDisplay: no external display, skipping")
+                return
+            }
+            // Returning from the RELAY: skip once. refocusGlasses() works by
+            // relaunching the top app's launcher component (no reliable
+            // move-to-front primitive exists here) — for Chrome that's
+            // onNewIntent → omnibox reset → the suggestion dropdown the user
+            // is about to CLICK dies (measured at +260ms after relay close).
+            // Redundant here anyway: the user's next act is a tap on the
+            // glass, and an injected touch restores that display's window
+            // focus natively — volume keys are phone-bound only for the
+            // seconds in between.
+            val sinceRelay = System.currentTimeMillis() - app.relayClosedAt
+            if (sinceRelay in 0..3000) {
+                Log.d(TAG, "refocusExternalDisplay: SKIPPED (relay closed ${sinceRelay}ms ago; dropdown survives)")
                 return
             }
             com.portalpad.app.service.PortalPadForegroundService.refocusGlasses()
@@ -522,6 +577,16 @@ class TrackpadActivity : PinnedDensityActivity() {
          *  Trackpad) honors the chosen interface — not just the first cold start. */
         @Volatile
         var applyAutoLaunchInterface: (() -> Unit)? = null
+
+        /** Set by the trackpad screen while composed: shows the phone-side
+         *  permission consent dialog for an app on the external display. Hosted
+         *  in THIS activity's composition because One UI buried both a service
+         *  overlay AND a separate dialog activity under the foreground trackpad
+         *  (proven on hardware twice). Null when no trackpad UI is composed —
+         *  callers must check BEFORE force-stopping anything and leave the
+         *  system dialog alone if so. */
+        @Volatile
+        var permConsentTrigger: ((com.portalpad.app.ui.trackpad.PermConsentRequest) -> Unit)? = null
     }
 }
 
@@ -547,14 +612,36 @@ private fun RestoreSessionOffer() {
     val app = PortalPadApp.instance
     val ctx = androidx.compose.ui.platform.LocalContext.current
     var offer by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<Int?>(null) }
-    var decided by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+    // One decision per display ATTACH, not per composition. The old one-shot
+    // `decided` flag raced the service: composed before the reconcile set
+    // externalDisplayId (exactly the stop→start timing) or before the binder
+    // was ready, the offer was silently burned for the activity's whole
+    // lifetime — the reason a service restart never showed this popup. Keying
+    // on the id and remembering which id was decided re-arms the offer on
+    // every fresh attach while still asking only once per attach; a detach
+    // resets it so a reused display id re-offers too.
+    var decidedForDisplay by androidx.compose.runtime.remember {
+        androidx.compose.runtime.mutableStateOf<Int?>(null)
+    }
+    val extDisplayId by app.externalDisplayId.collectAsState()
+    // Mass-death re-arm: when the snapshotter holds a snapshot because the
+    // system killed windows (LMK/crash), it bumps this — clear the per-attach
+    // decision so the offer fires again mid-session with the preserved layout.
+    val offerNudge by app.restoreOfferNudge.collectAsState()
+    var lastNudge by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(0) }
 
-    // Decide once when the trackpad opens: offer restore if there's a saved
-    // multi-window session we can actually restore and it's not already open.
-    androidx.compose.runtime.LaunchedEffect(Unit) {
-        if (decided) return@LaunchedEffect
-        decided = true
-        val displayId = app.externalDisplayId.value ?: return@LaunchedEffect
+    androidx.compose.runtime.LaunchedEffect(extDisplayId, offerNudge) {
+        if (offerNudge != lastNudge) {
+            lastNudge = offerNudge
+            decidedForDisplay = null
+        }
+        val displayId = extDisplayId
+        if (displayId == null) {
+            decidedForDisplay = null
+            return@LaunchedEffect
+        }
+        if (decidedForDisplay == displayId) return@LaunchedEffect
+        decidedForDisplay = displayId
         // A flap auto-recovery (quick unplug/replug) is already restoring this
         // session on the external display — don't pop a phone dialog asking to do
         // what's already underway. Cold reconnects don't set this, so the offer
@@ -571,6 +658,14 @@ private fun RestoreSessionOffer() {
                 .first()
         }.getOrDefault(false)
         if (!desktop) return@LaunchedEffect
+        // The launch privilege (Shizuku/root binder) can lag the display attach
+        // by a few hundred ms on a service start — wait briefly instead of
+        // dropping the offer on the race.
+        var waited = 0
+        while (!app.hasLaunchPrivilege && waited < 5_000) {
+            kotlinx.coroutines.delay(250)
+            waited += 250
+        }
         if (!app.hasLaunchPrivilege) return@LaunchedEffect
         val session = runCatching { app.prefs.lastSession.first() }.getOrNull() ?: return@LaunchedEffect
         val count = session.windows.size
@@ -704,6 +799,23 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
             if (homeAction != null) launchEntry(homeAction, injector) else injector.home()
         }
         onDispose { TrackpadActivity.homeTrigger = null }
+    }
+    // Phone-side permission consent for apps on the external display. Hosted
+    // here — inside the foreground activity's own composition — because One UI
+    // buried both a service overlay and a separate dialog activity under this
+    // activity. The service pushes requests through the companion trigger.
+    var permConsentRequest by remember {
+        mutableStateOf<com.portalpad.app.ui.trackpad.PermConsentRequest?>(null)
+    }
+    DisposableEffect(Unit) {
+        TrackpadActivity.permConsentTrigger = { req -> permConsentRequest = req }
+        onDispose { TrackpadActivity.permConsentTrigger = null }
+    }
+    permConsentRequest?.let { req ->
+        com.portalpad.app.ui.trackpad.PermissionConsentDialog(
+            request = req,
+            onClose = { permConsentRequest = null },
+        )
     }
     // Register the interface re-apply trigger so onNewIntent (service start /
     // display connect bringing this singleTask instance forward) can switch the
@@ -1540,134 +1652,15 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
     // depleting countdown bar the moment the display goes null, and slides away if
     // the display reconnects within the grace window. Driven off the same
     // externalDisplayId signal the watcher uses, so timing stays aligned.
-    DisconnectBanner(externalDisplayId = externalDisplayId)
+    // PHYSICAL id, not the VD id: under the grace-period disconnect model
+                // the VD (and its windows) stays alive ~10s after an unplug, so the
+                // VD id would show this banner 10 seconds late. The physical id
+                // clears the instant the panel disconnects — and its return within
+                // the banner's window drives the "Display Reconnected" flash.
+                DisconnectBanner(externalDisplayId = physicalExternalDisplayId)
 }
 
-/**
- * Centered "External Display Disconnected" card shown over the trackpad / air-mouse
- * / remote interface while the display is gone. A thin bar depletes left over the
- * grace window. If the display reconnects within the window (e.g. a screen-off
- * flap), the card flips to an amber "reconnected" state briefly, then dismisses —
- * the user is NOT returned to the main screen. A real unplug leaves the display
- * null; the auto-finish watcher (onCreate) returns to MainActivity as the bar
- * empties. This composable is purely the visual; it doesn't call finish().
- */
-@Composable
-private fun DisconnectBanner(externalDisplayId: Int?) {
-    // Grace window — keep in sync with the auto-finish watcher's goneGraceMs.
-    val graceMs = 5000
-    // Only engage after we've actually seen a display, so the initial null at
-    // launch doesn't flash the banner.
-    var sawDisplay by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
-    androidx.compose.runtime.LaunchedEffect(externalDisplayId) {
-        if (externalDisplayId != null) sawDisplay = true
-    }
-    val disconnected = sawDisplay && externalDisplayId == null
 
-    // Reconnect flash: when we were disconnected and the display returns, show a
-    // brief amber "reconnected" state before dismissing.
-    var showReconnected by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
-    var visible by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
-    val progress = androidx.compose.runtime.remember { androidx.compose.animation.core.Animatable(1f) }
-
-    androidx.compose.runtime.LaunchedEffect(disconnected) {
-        if (disconnected) {
-            showReconnected = false
-            visible = true
-            progress.snapTo(1f)
-            // Deplete to 0 over the grace window.
-            progress.animateTo(
-                targetValue = 0f,
-                animationSpec = androidx.compose.animation.core.tween(
-                    durationMillis = graceMs,
-                    easing = androidx.compose.animation.core.LinearEasing,
-                ),
-            )
-            // Bar emptied and we're still disconnected → the watcher is returning
-            // to main; keep the card up through the transition.
-        } else if (visible) {
-            // Reconnected within the window — flash amber, then dismiss.
-            showReconnected = true
-            kotlinx.coroutines.delay(850)
-            visible = false
-            showReconnected = false
-        }
-    }
-
-    if (!visible) return
-
-    val danger = com.portalpad.app.ui.theme.AbDanger
-    val warning = com.portalpad.app.ui.theme.AbWarning
-    val accent = if (showReconnected) warning else danger
-
-    Box(
-        Modifier
-            .fillMaxSize()
-            .background(androidx.compose.ui.graphics.Color(0xFF080510).copy(alpha = 0.62f)),
-        contentAlignment = Alignment.Center,
-    ) {
-        androidx.compose.foundation.layout.Column(
-            Modifier
-                .fillMaxWidth(0.78f)
-                .clip(androidx.compose.foundation.shape.RoundedCornerShape(18.dp))
-                .background(com.portalpad.app.ui.theme.AbSurface)
-                .border(
-                    1.dp,
-                    accent.copy(alpha = 0.45f),
-                    androidx.compose.foundation.shape.RoundedCornerShape(18.dp),
-                ),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            androidx.compose.foundation.layout.Column(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(top = 22.dp, bottom = 16.dp, start = 20.dp, end = 20.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                androidx.compose.material3.Icon(
-                    imageVector = if (showReconnected) {
-                        androidx.compose.material.icons.Icons.Default.CheckCircle
-                    } else {
-                        androidx.compose.material.icons.Icons.Default.Close
-                    },
-                    contentDescription = null,
-                    tint = accent,
-                    modifier = Modifier.size(40.dp),
-                )
-                Spacer(Modifier.height(10.dp))
-                androidx.compose.material3.Text(
-                    if (showReconnected) "Display Reconnected" else "External Display Disconnected",
-                    color = com.portalpad.app.ui.theme.AbOnSurface,
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleMedium,
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                )
-                Spacer(Modifier.height(4.dp))
-                androidx.compose.material3.Text(
-                    if (showReconnected) "Staying on this screen" else "Returning to main screen…",
-                    color = AbOnSurfaceMuted,
-                    style = MaterialTheme.typography.bodySmall,
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                )
-            }
-            // Depleting countdown bar (full → empty, shrinking left). Frozen on the
-            // reconnect flash.
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .height(4.dp)
-                    .background(accent.copy(alpha = 0.18f)),
-            ) {
-                Box(
-                    Modifier
-                        .fillMaxHeight()
-                        .fillMaxWidth(if (showReconnected) 1f else progress.value)
-                        .background(accent),
-                )
-            }
-        }
-    }
-}
 
 @Composable
 private fun ButtonLongPressMenu(
@@ -1865,7 +1858,11 @@ internal fun launchEntry(entry: com.portalpad.app.data.AppEntry, injector: Input
     // fresh id.
     val liveExternalId = app.resolveLiveExternalDisplayId()
     if (liveExternalId != null && app.access.isReady) {
-        app.launchAppOnExternal(component)
+        // Honor the entry's per-assignment launch mode: freeform=false (the
+        // default for new nav-button assignments) launches fullscreen for
+        // TV-launcher-style apps. Entries from before the flag existed
+        // deserialize freeform=true and behave exactly as they always did.
+        app.launchAppOnExternal(component, forceFullscreen = !entry.freeform)
         // Auto-return to trackpad if the pref is set.
         val autoReturn = runCatching {
             kotlinx.coroutines.runBlocking {

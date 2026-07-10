@@ -1,5 +1,12 @@
 # PortalPad — Trackpad & Remote for External Displays
 
+> **Update (07/09/2026):** DRM-protected streaming now works with PortalPad's latest v1.3-beta release on several major services.
+>
+> **Tested working:** Amazon Prime Video, Disney+, Hulu (via the Disney+ app), Peacock, Paramount+\
+> **Not working:** Hulu (standalone app)
+>
+> **Getting DRM apps to play:** turn on **System mirror** in Display settings — from the Start page, or from the display settings inside the Trackpad / Air Mouse / Remote interface.
+
 PortalPad turns your Android phone into a **trackpad, air mouse, and TV-style remote** for any external screen you connect it to — AR glasses (XREAL, VITURE, RayNeo, Rokid, and similar), HDMI monitors, TVs, or projectors.
 
 It's built with Jetpack Compose, and uses Android's Virtual Display plus Shizuku (or root) to inject input and manage the external display.
@@ -13,7 +20,10 @@ It's built with Jetpack Compose, and uses Android's Virtual Display plus Shizuku
 ## Requirements
 
 - **A compatible Android device with USB-C DisplayPort Alt Mode** (Android 11 / API 30 or newer). This is what lets the phone drive an external display. Most AR glasses appear to the phone as a normal USB-C DisplayPort screen. Performance varies by device.
-- **Shizuku** (recommended) **or root** — required. PortalPad needs elevated access to inject input into the external display and manage it; Shizuku grants this without rooting. The recommended build is [thedjchi's Shizuku fork](https://github.com/thedjchi/Shizuku), which adds **start-on-boot** (waits for Wi-Fi, then starts the service after a reboot), **TCP mode** (`adb tcpip`, so once it's started over Wi-Fi after a reboot you can stop/restart without a Wi-Fi connection), and a **watchdog** that automatically restarts Shizuku if it stops unexpectedly, and can alert you to crashes and suggest fixes.
+- **Shizuku** (recommended) **or root** — required. PortalPad needs elevated access to inject input into the external display and manage it; Shizuku grants this without rooting. The recommended build is [thedjchi's Shizuku fork](https://github.com/thedjchi/Shizuku). It adds three things stock Shizuku lacks:
+  * **Start-on-boot** — waits for Wi-Fi after a reboot, then starts the service automatically.
+  * **TCP mode** (`adb tcpip`) — once started over Wi-Fi after a reboot, you can stop/restart it without a Wi-Fi connection.
+  * A **watchdog** — restarts Shizuku automatically if it stops unexpectedly, and can alert you to crashes and suggest fixes.
 - **Extinguish** (recommended) — the power button on the Air Mouse, Trackpad, and Remote screens uses Extinguish to turn the phone's display off while keeping the external display running. It's the only way to blank the phone without dropping the external display, so you'll likely want it. Get it from the [Play Store](https://play.google.com/store/apps/details?id=own.moderpach.extinguish) or [GitHub](https://github.com/Moderpach/Extinguish) (it also requires Shizuku).
 
 ## What it does
@@ -28,6 +38,8 @@ You can also connect a **physical Bluetooth or USB mouse** to drive the cursor o
 
 On the external display itself, there's a dock (like the macOS dock) for launching apps, organizing them into folders, and renaming them. A searchable app drawer on the phone lets you add any installed app to that dock.
 
+And with **desktop windows** enabled, the external display becomes a multi-window desktop: apps open in freeform windows you manage from the display's top bar or a right-click radial menu — **arrange evenly**, **arrange in order**, **stack**, maximize, minimize, close. PortalPad remembers your layout per resolution and can restore your whole session after a disconnect or restart.
+
 ## Features
 
 **Input and control**
@@ -35,7 +47,7 @@ On the external display itself, there's a dock (like the macOS dock) for launchi
 - Three input modes (Trackpad, Air Mouse, Remote) in one app, switchable from the top bar.
 - **Physical mouse support** — connect a Bluetooth or USB mouse to move the cursor and click on the external display directly.
 - Adjustable input feel: cursor speed, scroll speed, scroll direction, and air-mouse sensitivity, smoothing, and axis inversion.
-- A bottom row of Back / Home / App Drawer buttons. Long-pressing Home offers "Recenter cursor."
+- A bottom row of Back / Home / App Drawer buttons. Long-pressing Home offers "Recenter cursor." **Home and Back are assignable**: point either at any app or activity (or a phone-side shortcut) instead of the system action. Assigned apps launch **full screen by default** — made for Android-TV-style launchers that should own the whole display — with a per-assignment toggle to launch as a freeform window instead (a change applies on the app's next launch).
 - Four programmable buttons on the Remote tab. Long-press one to assign an app, activity, or shortcut to launch, or to rename it. Unassigned, a button does nothing when tapped.
 - One vibration setting (Off / Light / Medium / Strong) controls haptic feedback everywhere — trackpad, buttons, and the floating controls.
 
@@ -58,7 +70,8 @@ On the external display itself, there's a dock (like the macOS dock) for launchi
 - Phone-side lists are available for precision when you'd rather pick from a list than work on the display.
 - On the dock itself, an **open-windows bar** and a **minimized-windows bar** appear just above the dock while you're running windows. Tap either to expand a list on the external display — focus or close an open window, or restore a minimized one — without reaching for the phone. The two bars sit side by side when there's room and stack otherwise.
 - **Per-resolution window memory** — PortalPad remembers your window layout per display resolution, so switching between standard and ultrawide keeps each layout intact.
-- **Session save/restore** — PortalPad can remember your open windows and their positions, then reopen and re-arrange them after a disconnect or restart. It offers this on reconnect, from a top-bar button, or from Settings.
+- **Session save/restore** — PortalPad can remember your open windows and their positions, then reopen and re-arrange them after a disconnect or restart. It offers this on reconnect, when the service restarts, from a top-bar button, or from Settings. (Heads-up: clearing your phone's recent-apps list closes the windows on the external display too — they're the same tasks — but the restore offer brings them back.)
+- **Quick disconnects keep everything alive** — unplug and replug within a few seconds (including glasses-side resolution switches, which are really a brief disconnect), and your windows come back exactly as they were, in-app state and all — Chrome keeps its tabs. Longer disconnects fall back to session restore above.
 
 **Customizable external display**
 
@@ -71,6 +84,7 @@ On the external display itself, there's a dock (like the macOS dock) for launchi
 - When you tap a text field on the glasses, a **"Type to external display"** page opens on your phone. Whatever you type there is sent to that field — even fields that normally refuse a keyboard, like Chrome's address bar.
 - It can **open automatically** when you tap a field. This auto-open needs **PortalPad's accessibility service** turned on (see Permissions). It only opens on a real tap, so a field that an app auto-focuses on launch won't trigger it.
 - The typing page opens showing the field's **current text**, so you can edit it — type to append, backspace to delete. Empty fields open blank.
+- Two typing paths: a **custom keyboard** (the most reliable for editing existing text — exact backspace, caret, and selection) and your **Android keyboard** (autocorrect, swipe, and voice input). The custom keyboard adds **voice dictation** (long-press the mic for continuous dictation), an **emoji picker**, **gesture typing**, accented characters, and a clipboard row (select all / cut / copy / paste).
 
 (See Known limitations for the one case this can't handle: typing continuously into in-page web search boxes like google.com's.)
 
@@ -80,6 +94,7 @@ On the external display itself, there's a dock (like the macOS dock) for launchi
 - **Screen-off control (Extinguish)** — the power button on the Air Mouse, Trackpad, and Remote screens turns the phone's screen off while keeping the external display running (works with the Extinguish app).
 - **Screenshot and screen recording** — tap the capture button to screenshot the external display, or long-press to screen-record it.
 - **Smooth connect/disconnect** — a brief cover hides the attach/detach so it looks like a clean transition instead of a flash.
+- **Stopping mirrors the phone** — stopping the service leaves the external display mirroring your phone screen instead of going dark, so the glasses stay useful between sessions.
 
 ## How input works (Shizuku or root)
 
@@ -154,8 +169,8 @@ Most of these are optional and only asked for when you use the related feature.
 
 ## Known limitations
 
-- **DRM-protected streaming** (Netflix HD, Hulu, etc.) won't play on the external display. These services require HDCP-protected output, which PortalPad's virtual-display layer can't provide. Workaround: use your phone's normal screen-mirroring for DRM video.
-- **Switching resolutions relaunches fullscreen windows** — when the display re-enumerates on a resolution/aspect change, windows running fullscreen are closed and relaunched into place, which can lose in-app state (for example, the current page in a browser tab).
+- **DRM-protected streaming needs System mirror** — with **System mirror** enabled (Display settings, from the Start page or the Trackpad / Air Mouse / Remote interface), many services play on the external display. Tested working: Amazon Prime Video, Disney+, Hulu via the Disney+ app, Peacock, and Paramount+. The standalone Hulu app still refuses, and untested services may vary. Without System mirror, DRM playback generally won't start — the overlay display path looks like screen capture to these apps.
+- **Several streaming apps open at once can pause each other** — in desktop-windows mode every visible window stays active, and a streaming app's home screen autoplaying preview trailers grabs audio focus from the one actually playing, which then politely pauses. This is standard Android audio-focus behavior meeting multi-window; PortalPad isn't involved. Fix: turn off autoplay previews in each streaming app's settings, or park idle streaming windows on a screen that doesn't autoplay.
 
 ## License
 

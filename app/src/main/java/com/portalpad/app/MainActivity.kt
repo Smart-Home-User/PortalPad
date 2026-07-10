@@ -88,6 +88,10 @@ class MainActivity : PinnedDensityActivity() {
         installSplashScreen()
         super.onCreate(savedInstanceState)
         lockOrientationDefault()
+        // Throttled update auto-check (v1.3+): at most once per 24h, only when
+        // the user toggle is on and a network is up; silent on every failure.
+        // Also refreshes the top-bar "« New" badge from the offline cache.
+        com.portalpad.app.service.UpdateChecker.autoCheckOnLaunch(applicationContext)
         // Mirror TrackpadActivity: when the user has opted to drive PortalPad over
         // the lock screen (ALLOW_LOCKSCREEN), let the settings host show over the
         // keyguard too. Without this, tapping the gear from the over-lock trackpad
@@ -104,7 +108,21 @@ class MainActivity : PinnedDensityActivity() {
                 ).first()
             }
         }.getOrDefault(true)
+        // Only ride over the keyguard while an external display is actually
+        // connected; the ALLOW_LOCKSCREEN pref remains the master switch.
+        // BIRTH ATTRIBUTE first (unconditional, like the pre-gating build) —
+        // WM reliably honors a window born with SHOW_WHEN_LOCKED, while a
+        // runtime change isn't re-evaluated until a relayout (see
+        // TrackpadActivity). The collector's immediate first emission applies
+        // the display-gated value within the same frame.
         setShowWhenLocked(showOverLock)
+        if (showOverLock) {
+            lifecycleScope.launch {
+                PortalPadApp.instance.physicalExternalDisplayId.collect { phys ->
+                    applyShowWhenLocked(phys != null)
+                }
+            }
+        }
         // If the glasses are plugged in while the phone is locked, the desktop
         // can't extend onto them (the system keyguard claims the display) — prompt
         // the unlock so the user isn't stuck staring at two lock screens.
@@ -225,6 +243,23 @@ class MainActivity : PinnedDensityActivity() {
                     )
                 }
             }
+        }
+    }
+
+    /** setShowWhenLocked + a FORCED RELAYOUT so WindowManager re-evaluates
+     *  keyguard occlusion NOW. A bare runtime setShowWhenLocked isn't picked
+     *  up until the next incidental relayout (measured on-device: first
+     *  screen-off after a runtime-only change showed the lock screen; the
+     *  second worked only because an unrelated relayout had shipped the
+     *  flag in between). Logged so captures show our side of any race.
+     */
+    private fun applyShowWhenLocked(show: Boolean) {
+        runCatching {
+            setShowWhenLocked(show)
+            // Attribute self-assignment forces a relayout of this window,
+            // pushing the updated flag to WM immediately.
+            window.attributes = window.attributes
+            Log.d(TAG, "applyShowWhenLocked($show) + relayout")
         }
     }
 

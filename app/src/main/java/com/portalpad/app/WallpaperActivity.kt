@@ -60,12 +60,44 @@ class WallpaperActivity : ComponentActivity() {
             kotlinx.coroutines.runBlocking { app.prefs.customWallpaperPath.first() }
         }.getOrNull()
         setContent {
-            val raw by app.prefs.homeWallpaperRaw(canvasUltrawide).collectAsState(initial = initialRaw)
+            // LIVE canvas classification, keyed on the configuration: a
+            // resolution switch resizes the VD IN PLACE and (per the manifest's
+            // configChanges=screenSize) does NOT recreate this activity — so the
+            // onCreate-time classification went stale and the STANDARD wallpaper
+            // stuck on an ultrawide canvas (log: scheduleConfigurationChanged
+            // delivered to the live record at the 3840x1080 resize, no restart).
+            // Compose updates LocalConfiguration on exactly that delivery, so
+            // keying the re-read on it re-classifies at every resize, both
+            // directions. The onCreate-time value stays as the seed/fallback.
+            val cfg = androidx.compose.ui.platform.LocalConfiguration.current
+            val canvasUltrawideLive = remember(cfg.screenWidthDp, cfg.screenHeightDp) {
+                runCatching {
+                    val m = android.util.DisplayMetrics().also {
+                        @Suppress("DEPRECATION") display?.getRealMetrics(it)
+                    }
+                    Wallpaper.isUltrawideCanvas(m.widthPixels, m.heightPixels)
+                }.getOrDefault(canvasUltrawide)
+            }
+            val raw by remember(canvasUltrawideLive) {
+                app.prefs.homeWallpaperRaw(canvasUltrawideLive)
+            }.collectAsState(initial = initialRaw)
             val customPath by app.prefs.customWallpaperPath.collectAsState(initial = initialCustomPath)
-            val wallpaper = raw ?: Wallpaper.effectiveDefault(canvasUltrawide)
+            val wallpaper = raw ?: Wallpaper.effectiveDefault(canvasUltrawideLive)
+            // GREY-BACKDROP FIX: on a freshly (re)created VD (e.g. replug) the first
+            // presented frame can be the grey window background before the wallpaper
+            // Image composes/draws, and the follow-up frame doesn't reliably fire on
+            // its own on the VD — leaving a grey backdrop until something relaunches
+            // it. Nudge a few extra recomposition+draw passes shortly after launch so
+            // the content is guaranteed to paint, with no relaunch/flicker. Harmless
+            // once it's already painted (redraws the same content).
+            val repaintKick = remember { androidx.compose.runtime.mutableStateOf(0) }
+            androidx.compose.runtime.LaunchedEffect(Unit) {
+                repeat(4) { kotlinx.coroutines.delay(200); repaintKick.value++ }
+            }
             Box(Modifier.fillMaxSize().background(Color.Black)) {
-                val res = wallpaper.drawableRes
-                when {
+                androidx.compose.runtime.key(repaintKick.value) {
+                    val res = wallpaper.drawableRes
+                    when {
                     wallpaper == Wallpaper.CUSTOM && customPath != null -> {
                         val bmp = remember(customPath) {
                             runCatching { android.graphics.BitmapFactory.decodeFile(customPath) }.getOrNull()
@@ -89,6 +121,7 @@ class WallpaperActivity : ComponentActivity() {
                     }
                     // NONE (or CUSTOM with no path) → black background above.
                 }
+                }
             }
         }
     }
@@ -102,7 +135,19 @@ class WallpaperActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        val wasIntentional = intentionalFinish
+        intentionalFinish = false
         if (instance === this) instance = null
+        // If the backdrop's TASK was torn down out from under us — e.g. swiped
+        // from recents, or swept by trimInactiveRecentTasks when another app is
+        // cleared — nothing else relaunches it and the VD goes black behind the
+        // overlays. Ask the service to self-heal; it only relaunches while the
+        // external is still connected, so a normal unplug (which calls
+        // finishIfShowing() → intentional) and any stray destroy after the
+        // display is gone are both ignored.
+        if (!wasIntentional) {
+            com.portalpad.app.service.PortalPadForegroundService.onBackdropDestroyedUnexpectedly()
+        }
     }
 
     private fun isOnDefaultDisplay(): Boolean {
@@ -118,10 +163,16 @@ class WallpaperActivity : ComponentActivity() {
     companion object {
         @Volatile private var instance: WallpaperActivity? = null
 
+        /** Set by [finishIfShowing] so onDestroy can distinguish OUR finish
+         *  (external unplug) from an external task removal (recents swipe /
+         *  trim). Only the latter triggers a self-heal relaunch. */
+        @Volatile private var intentionalFinish = false
+
         /** Finish the backdrop activity if it's currently showing. Called on
          *  external-display disconnect so the orphaned task can't migrate to the
          *  phone screen. */
         fun finishIfShowing() {
+            intentionalFinish = true
             instance?.let { act -> act.runOnUiThread { runCatching { act.finish() } } }
             instance = null
         }

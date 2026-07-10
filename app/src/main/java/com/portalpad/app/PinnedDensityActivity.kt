@@ -116,35 +116,54 @@ abstract class PinnedDensityActivity : ComponentActivity() {
         val app = application as? PortalPadApp ?: return
         val km = getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager ?: return
         lifecycleScope.launch {
+            // State OUTSIDE repeatOnLifecycle so it SURVIVES lifecycle
+            // restarts. The original kept `prompted` inside the restarted
+            // block: every screen-off/on re-ran the collector against the
+            // replayed (still-connected) display id and re-prompted — and the
+            // resulting requestDismissKeyguard CANCELED the keyguard occlusion
+            // mid-grant. That was the ENTIRE "first wake shows the lock
+            // screen" bug (measured: DOZING→OCCLUDED STARTED, then
+            // dismissKeyguardLw from this prompt, then CANCELED →
+            // PRIMARY_BOUNCER). Two failed mechanisms (a reorder relaunch and
+            // a trampoline activity) were built to overpower a dismiss this
+            // code was issuing every wake.
             var prompted = false
+            // Seed with the CURRENT id: a display already connected when this
+            // registers is NOT an attach. Only an OBSERVED null→id transition
+            // is — including one that happened while the activity was stopped
+            // (lastSeen=null persists across the collector restart, so the
+            // replayed non-null id reads as the edge it truly is).
+            var lastSeen: Int? = app.externalDisplayId.value
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 app.externalDisplayId.collect { id ->
-                    when {
-                        id == null -> prompted = false // reset so a later attach re-prompts
-                        km.isKeyguardLocked && !prompted -> {
-                            prompted = true
-                            Log.i(
-                                "DIAG-KEYGUARD",
-                                "${this@PinnedDensityActivity.javaClass.simpleName}: display attached while locked — requesting unlock",
+                    val attachEdge = lastSeen == null && id != null
+                    lastSeen = id
+                    if (id == null) {
+                        prompted = false // reset so a later attach re-prompts
+                        return@collect
+                    }
+                    if (attachEdge && km.isKeyguardLocked && !prompted) {
+                        prompted = true
+                        Log.i(
+                            "DIAG-KEYGUARD",
+                            "${this@PinnedDensityActivity.javaClass.simpleName}: display attached while locked — requesting unlock",
+                        )
+                        runCatching {
+                            km.requestDismissKeyguard(
+                                this@PinnedDensityActivity,
+                                object : android.app.KeyguardManager.KeyguardDismissCallback() {
+                                    override fun onDismissSucceeded() {
+                                        Log.i("DIAG-KEYGUARD", "unlock succeeded — desktop can show")
+                                    }
+                                    override fun onDismissCancelled() {
+                                        Log.i("DIAG-KEYGUARD", "unlock cancelled")
+                                    }
+                                    override fun onDismissError() {
+                                        Log.w("DIAG-KEYGUARD", "unlock error")
+                                    }
+                                },
                             )
-                            runCatching {
-                                km.requestDismissKeyguard(
-                                    this@PinnedDensityActivity,
-                                    object : android.app.KeyguardManager.KeyguardDismissCallback() {
-                                        override fun onDismissSucceeded() {
-                                            Log.i("DIAG-KEYGUARD", "unlock succeeded — desktop can show")
-                                        }
-                                        override fun onDismissCancelled() {
-                                            Log.i("DIAG-KEYGUARD", "unlock cancelled")
-                                        }
-                                        override fun onDismissError() {
-                                            Log.w("DIAG-KEYGUARD", "unlock error")
-                                        }
-                                    },
-                                )
-                            }
                         }
-                        !km.isKeyguardLocked -> prompted = false // unlocked — allow re-prompt if it re-locks
                     }
                 }
             }

@@ -136,6 +136,7 @@ fun GestureGuideDialog(
             SectionLabel("Two fingers")
             GestureLine(GestureRow("Slide", "scroll"))
             GestureLine(GestureRow("Tap", "right click"))
+            GestureLine(GestureRow("Pinch", "zoom"))
 
             SectionLabel("Three fingers")
             // Reflect the user-configured swipe actions. Hidden if set to None.

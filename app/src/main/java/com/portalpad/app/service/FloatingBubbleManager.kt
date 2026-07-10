@@ -18,6 +18,7 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.portalpad.app.presentation.OverlayHost
 import androidx.core.graphics.toColorInt
 import com.portalpad.app.MainActivity
 import kotlinx.coroutines.flow.first
@@ -42,6 +43,21 @@ class FloatingBubbleManager(private val context: Context) {
 
     private val windowManager =
         context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+
+    // The bubble + its menu live on the phone (DEFAULT_DISPLAY). They are hosted
+    // as TYPE_ACCESSIBILITY_OVERLAY (2032) via the bound AccessibilityService when
+    // it's available, falling back to TYPE_APPLICATION_OVERLAY (2038) otherwise —
+    // the same OverlayHost path the cursor/dock use. 2032 matters here because a
+    // 2038 overlay is force-hidden by HIDE_NON_SYSTEM_OVERLAY_WINDOWS while a
+    // permission dialog is up (confirmed via dumpsys: the bubble window carried
+    // mIsForceHiddenNonSystemOverlayWindow=true during a GrantPermissions dialog),
+    // which is why the bubble vanished through Kindle's permission flow. The WM
+    // that ACTUALLY added each view is stored so hide()/drag/dismiss remove or
+    // update via the SAME one — it can differ from the plain field when 2032 is in
+    // use. Default to the plain WM (the 2038 fallback path) until show() resolves.
+    private var bubbleWm: WindowManager = windowManager
+    private var menuWm: WindowManager = windowManager
+
     private val handler = Handler(Looper.getMainLooper())
 
     private var bubbleView: View? = null
@@ -53,6 +69,25 @@ class FloatingBubbleManager(private val context: Context) {
         private set
 
     val isShown: Boolean get() = bubbleView != null
+
+    /** True only when the bubble view exists AND is still attached to a window.
+     *  [isShown] tracks only the reference, which can go stale if the OS tears
+     *  the window down (a display flap, or a security overlay-hide) without
+     *  hide() running — leaving callers believing the bubble is up when it's
+     *  gone. The watchdog / post-settle re-assert check THIS so they can heal
+     *  that desync. (addView attaches on the next traversal, so this reads false
+     *  for a frame right after show(); the callers that use it run seconds later,
+     *  so that transient doesn't matter.) */
+    val isActuallyShown: Boolean get() = bubbleView?.isAttachedToWindow == true
+
+    /** Force a clean re-add. show() early-returns while bubbleView != null, so a
+     *  stale-but-detached reference cannot be healed by show() alone — this drops
+     *  it first. hide() safely catches an already-gone window. Respects
+     *  session-hide via show()'s own guard. */
+    fun reshow() {
+        hide()
+        show()
+    }
 
     fun show() {
         if (bubbleView != null) {
@@ -68,54 +103,80 @@ class FloatingBubbleManager(private val context: Context) {
             return
         }
 
-        val sizePx = (BUBBLE_SIZE_DP * context.resources.displayMetrics.density).toInt()
-        val container = FrameLayout(context).apply {
+        // Resolve the overlay host (2032 via a11y when available, else 2038) and
+        // build the view from ITS context so the accessibility window token
+        // attaches — building from the plain service context strips the token and
+        // the 2032 add throws BadToken. bubbleWm is the WM that owns this window;
+        // hide()/drag must use the same one.
+        val host = resolveHost()
+        bubbleWm = host.windowManager
+        val ctx = host.context
+
+        val sizePx = (BUBBLE_SIZE_DP * ctx.resources.displayMetrics.density).toInt()
+        val container = FrameLayout(ctx).apply {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 setColor("#9B5BFF".toColorInt())
                 setStroke(
-                    (2 * context.resources.displayMetrics.density).toInt(),
+                    (2 * ctx.resources.displayMetrics.density).toInt(),
                     "#C8A6FF".toColorInt(),
                 )
             }
-            elevation = 12f * context.resources.displayMetrics.density
+            elevation = 12f * ctx.resources.displayMetrics.density
             isClickable = true
             isFocusable = false
         }
-        val icon = ImageView(context).apply {
+        val icon = ImageView(ctx).apply {
             setImageResource(R.mipmap.ic_launcher_round)
-            val padPx = (10 * context.resources.displayMetrics.density).toInt()
+            val padPx = (10 * ctx.resources.displayMetrics.density).toInt()
             setPadding(padPx, padPx, padPx, padPx)
         }
         container.addView(icon, FrameLayout.LayoutParams(sizePx, sizePx, Gravity.CENTER))
 
         val params = WindowManager.LayoutParams(
             sizePx, sizePx,
-            overlayType(),
+            host.windowType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = context.resources.displayMetrics.widthPixels - sizePx - 32
-            y = (context.resources.displayMetrics.heightPixels * 0.35f).toInt()
+            x = ctx.resources.displayMetrics.widthPixels - sizePx - 32
+            y = (ctx.resources.displayMetrics.heightPixels * 0.35f).toInt()
         }
 
         attachInputHandling(container, params)
         try {
-            windowManager.addView(container, params)
+            bubbleWm.addView(container, params)
             bubbleView = container
             bubbleParams = params
-            Log.d(TAG, "show(): bubble added successfully")
+            Log.d(
+                TAG,
+                "show(): bubble added (type=${host.windowType} a11y=${host.isAccessibilityOverlay})",
+            )
         } catch (t: Throwable) {
             Log.e(TAG, "Could not add bubble view", t)
         }
     }
 
+    /** Resolve an overlay host for the phone (DEFAULT_DISPLAY): 2032 via the bound
+     *  AccessibilityService when available, else 2038 via the service context.
+     *  Views added through the returned WM MUST be built from the returned context
+     *  (see show()/showMenu()) or the 2032 window token won't attach. */
+    private fun resolveHost(): OverlayHost {
+        val display = runCatching {
+            (context.getSystemService(Context.DISPLAY_SERVICE)
+                as android.hardware.display.DisplayManager)
+                .getDisplay(android.view.Display.DEFAULT_DISPLAY)
+        }.getOrNull()
+        return if (display != null) OverlayHost.forDisplay(display, context)
+        else OverlayHost(context, windowManager, overlayType())
+    }
+
     fun hide() {
         dismissMenu()
         bubbleView?.let {
-            runCatching { windowManager.removeView(it) }
+            runCatching { bubbleWm.removeView(it) }
                 .onFailure { Log.w(TAG, "removeView failed", it) }
         }
         bubbleView = null
@@ -167,7 +228,7 @@ class FloatingBubbleManager(private val context: Context) {
                     if (moved) {
                         params.x = (initialX + dx).toInt()
                         params.y = (initialY + dy).toInt()
-                        runCatching { windowManager.updateViewLayout(view, params) }
+                        runCatching { bubbleWm.updateViewLayout(view, params) }
                     }
                     true
                 }
@@ -197,17 +258,24 @@ class FloatingBubbleManager(private val context: Context) {
         val centerX = params.x + viewWidth / 2
         params.x = if (centerX < screenWidth / 2) 16
         else screenWidth - viewWidth - 16
-        runCatching { windowManager.updateViewLayout(view, params) }
+        runCatching { bubbleWm.updateViewLayout(view, params) }
     }
 
     private fun showMenu(anchor: View, bubble: WindowManager.LayoutParams) {
         dismissMenu()
 
-        val density = context.resources.displayMetrics.density
+        // Host the menu the same way as the bubble (2032 when a11y is bound) so it
+        // isn't force-hidden during a permission dialog either. The container added
+        // to WM must be built from the host context for the token to attach.
+        val host = resolveHost()
+        menuWm = host.windowManager
+        val menuCtx = host.context
+
+        val density = menuCtx.resources.displayMetrics.density
         val menuWidthPx = (230 * density).toInt()
         val padPx = (12 * density).toInt()
 
-        val container = LinearLayout(context).apply {
+        val container = LinearLayout(menuCtx).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
                 cornerRadius = 18 * density
@@ -245,11 +313,11 @@ class FloatingBubbleManager(private val context: Context) {
 
         // Position the menu just to the left or right of the bubble, depending
         // on which edge it's snapped to.
-        val screenWidth = context.resources.displayMetrics.widthPixels
+        val screenWidth = menuCtx.resources.displayMetrics.widthPixels
         val params = WindowManager.LayoutParams(
             menuWidthPx,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            overlayType(),
+            host.windowType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
                 WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
@@ -271,7 +339,7 @@ class FloatingBubbleManager(private val context: Context) {
         }
 
         try {
-            windowManager.addView(container, params)
+            menuWm.addView(container, params)
             menuView = container
         } catch (t: Throwable) {
             Log.e(TAG, "Could not show bubble menu", t)
@@ -308,7 +376,7 @@ class FloatingBubbleManager(private val context: Context) {
 
     private fun dismissMenu() {
         menuView?.let {
-            runCatching { windowManager.removeView(it) }
+            runCatching { menuWm.removeView(it) }
         }
         menuView = null
     }
@@ -355,13 +423,25 @@ class FloatingBubbleManager(private val context: Context) {
         val intent = Intent(context, TrackpadActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
             .putExtra(TrackpadActivity.EXTRA_MODE, mode)
-        context.startActivity(intent)
+        // Force the trackpad interface onto the PHONE (display 0). Without an
+        // explicit target, a singleTask TrackpadActivity whose task got stranded
+        // on the external display (after a recents-clear + replug) resumes THERE —
+        // so the trackpad UI (and any popup it shows on start) flashes on the
+        // glasses instead of returning to the phone.
+        val opts = android.app.ActivityOptions.makeBasic()
+            .setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY)
+        runCatching { context.startActivity(intent, opts.toBundle()) }
+            .onFailure { context.startActivity(intent) }
     }
 
     private fun launchSettings() {
         val intent = Intent(context, MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(intent)
+        // Settings is a phone UI too — pin it to display 0 for the same reason.
+        val opts = android.app.ActivityOptions.makeBasic()
+            .setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY)
+        runCatching { context.startActivity(intent, opts.toBundle()) }
+            .onFailure { context.startActivity(intent) }
     }
 
     private fun overlayType(): Int =

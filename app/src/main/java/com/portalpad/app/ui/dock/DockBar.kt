@@ -266,6 +266,12 @@ fun DockBar(
     var lastInteraction by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var visible by remember { mutableStateOf(true) }
 
+    // Live "cursor is currently parked over the visible dock band" flag. The
+    // idle-hide loop reads this each tick (movement-independent, mirroring the
+    // Top Bar's cursorOverBar() poll) so a STATIONARY cursor on the dock never
+    // has the dock hide out from under it. Written by the band effect below.
+    val cursorOnBandState = remember { mutableStateOf(false) }
+
     // Preview isolation. While the Dock Customization page is open, keep the dock
     // pinned visible so the user can see their edits live (no auto-hide). While
     // the Top Bar Customization page is open (zonePreviewActive), HIDE the dock so
@@ -325,6 +331,7 @@ fun DockBar(
             // the dock — hiding the dock out from under it looks broken).
             val newVisible = pinnedToWallpaper || reorderMode || removeMode ||
                 com.portalpad.app.PortalPadApp.instance.quickSettingsOpen.value ||
+                cursorOnBandState.value ||
                 idleSec < config.autoHideAfterSec
             if (visible && !newVisible) {
                 android.util.Log.d(
@@ -611,7 +618,24 @@ fun DockBar(
     // right-click is handled in-process (item menu) instead of being injected as
     // a launch tap. Reset to false when the dock isn't visible / on dispose.
     LaunchedEffect(cursorOnDockBand, visible) {
-        app.injector.cursorOverDock = cursorOnDockBand && visible
+        val onVisibleBand = cursorOnDockBand && visible
+        app.injector.cursorOverDock = onVisibleBand
+        // AUTO-HIDE HOLD (live): publish band membership into a snapshot the idle
+        // loop polls each tick, so a STATIONARY cursor holds the dock open. The
+        // old edge-triggered stamp only fired on ENTRY, so a parked cursor still
+        // timed out and the dock hid under it. Restart the idle countdown on the
+        // enter AND leave edges (this effect fires on both) so the dock lingers a
+        // full auto-hide duration after the cursor finally leaves — matching the
+        // Top Bar's hover-hold behavior.
+        cursorOnBandState.value = onVisibleBand
+        if (visible) lastInteraction = System.currentTimeMillis()
+        // Z-ORDER: the instant the cursor enters the visible dock, lift the cursor
+        // overlay back above the dock window (lightweight restack, no rebuild) so
+        // it can never sit under the icons — independent of any startup dock/cursor
+        // attach ordering (the "cursor hidden behind dock icons" bug).
+        if (onVisibleBand) {
+            com.portalpad.app.service.PortalPadForegroundService.raiseCursorFast()
+        }
     }
     androidx.compose.runtime.DisposableEffect(Unit) {
         onDispose { app.injector.cursorOverDock = false }
@@ -625,7 +649,11 @@ fun DockBar(
     // user's Dock-settings values map to a consistent on-screen size no matter
     // what Display DPI is set to. Dock size is controlled ONLY here.
     val displayDensity = androidx.compose.ui.platform.LocalDensity.current.density
-    val dpiComp = (BASELINE_DENSITY / displayDensity).coerceIn(0.4f, 2.5f)
+    // Clamp wide enough that it NEVER binds across the full DPI slider (80–640 dpi
+    // ⇒ density 0.5–4.0 ⇒ dpiComp 2.66–0.33). If it clamps, the density stops fully
+    // cancelling and the chrome bleeds with the slider — the old 0.4 floor did
+    // exactly that above ~530 dpi. These bounds are only an out-of-range safety net.
+    val dpiComp = (BASELINE_DENSITY / displayDensity).coerceIn(0.25f, 3.0f)
     // "Overall scale" was removed (it only multiplied icon + label size, which have
     // their own sliders). Fixed at 1.0 so those sliders apply directly.
     val scale = 1f
@@ -637,7 +665,12 @@ fun DockBar(
     // least ~3 app slots always fit in whatever width remains — otherwise large
     // icon×scale on a narrow dock left no room and showed "just the dock".
     val iconSizeDp = run {
-        val raw = (config.iconSizeDp * dpiComp * scale).coerceIn(36f, 220f)
+        // Clamp the icon in BASELINE-dp (the user's setting space) BEFORE applying
+        // dpiComp, not after. Clamping the already-compensated value floors it in
+        // shrunken high-DPI dp, which then renders back UP at the high density and
+        // bleeds bigger (36.dp × 4.0 density = 144px vs the intended 80px). Clamping
+        // first keeps the on-screen size fixed at any DPI.
+        val raw = (config.iconSizeDp * scale).coerceIn(36f, 220f) * dpiComp
         val dockWindowDp = run {
             val metrics = displayMetrics ?: return@run Float.NaN
             // Convert px → dp using THIS dock's pinned baseline density (the dock's
@@ -2339,6 +2372,28 @@ private fun dockTextShadow(): androidx.compose.ui.graphics.Shadow =
 private fun nonScalingSp(value: Float): androidx.compose.ui.unit.TextUnit =
     with(androidx.compose.ui.platform.LocalDensity.current) { value.dp.toSp() }
 
+/**
+ * Re-pins [LocalDensity] to the dock's baseline inside a `Popup`.
+ *
+ * DockOverlay pins the dock's density once at its ComposeView root, which covers
+ * the whole dock body. A `Popup`, however, is hosted in its OWN AndroidComposeView
+ * (a separate window), and that view re-provides LocalDensity from its context —
+ * i.e. the LIVE VD density that the DPI slider drives via `wm density`. So popup
+ * CONTENT escapes the root pin and scales with the slider (tooltips grew/shrank
+ * while the dock body stayed fixed). Wrapping popup content here restores the pin.
+ *
+ * Positioning is unaffected: PopupPositionProvider math is computed outside the
+ * popup, in the parent's already-pinned coordinate space.
+ */
+@Composable
+private fun PinnedDockDensity(content: @Composable () -> Unit) {
+    androidx.compose.runtime.CompositionLocalProvider(
+        androidx.compose.ui.platform.LocalDensity provides
+            androidx.compose.ui.unit.Density(BASELINE_DENSITY, 1f),
+        content = content,
+    )
+}
+
 @Composable
 private fun DockTooltip(text: String, visible: Boolean, labelSizeSp: Float, gapDp: Float = 7f, anchorWidthDp: Float = 0f, above: Boolean = false) {
     if (!visible) return
@@ -2374,19 +2429,31 @@ private fun DockTooltip(text: String, visible: Boolean, labelSizeSp: Float, gapD
         }
     }
     androidx.compose.ui.window.Popup(popupPositionProvider = positioner) {
-        Box(
-            Modifier
-                .clip(RoundedCornerShape(8.dp))
-                .background(Color.Black.copy(alpha = 0.55f))
-                .border(0.5.dp, Color.White.copy(alpha = 0.18f), RoundedCornerShape(8.dp))
-                .padding(horizontal = 10.dp, vertical = 5.dp),
-        ) {
-            Text(
-                text = text,
-                color = AbOnSurfaceMuted,
-                fontSize = nonScalingSp(labelSizeSp * 0.95f),
-                maxLines = 1,
-            )
+        PinnedDockDensity {
+            Box(
+                Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .border(0.5.dp, Color.White.copy(alpha = 0.18f), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+            ) {
+                Text(
+                    text = text,
+                    color = AbOnSurfaceMuted,
+                    // Sized to match the TOP BAR's tooltip, which reads better than the
+                    // dock's old size. Top bar: setTextSize(PX, 13f * 2.25) ≈ 29.3px
+                    // (its pinned density). Dock renders at BASELINE_DENSITY (1.33), so
+                    // to land on the same ~29.2px from the default labelSizeSp of 13:
+                    //   13 × 1.69 × 1.33 ≈ 29.2px
+                    // (the old 0.95 gave 13 × 0.95 × 1.33 ≈ 16.4px — ~1.78× smaller).
+                    // Still DERIVED from labelSizeSp, so the dock's label-size slider
+                    // under Workspace continues to scale tooltips with it, and the
+                    // pinned density above keeps this fixed at any DPI. The pill is
+                    // wrap-content, so it grows around the larger text on its own.
+                    fontSize = nonScalingSp(labelSizeSp * 1.69f),
+                    maxLines = 1,
+                )
+            }
         }
     }
 }
@@ -4122,7 +4189,11 @@ private fun IconPackPicker(
                     modifier = Modifier.fillMaxWidth(),
                 )
                 val filtered = remember(names, query) {
-                    (if (query.isBlank()) names else names.filter { it.contains(query, ignoreCase = true) })
+                    (
+                        if (query.isBlank()) names
+                        else com.portalpad.app.ui.common.SearchRank
+                            .filterApps(names, query) { it }
+                        )
                         .take(300) // cap for responsiveness
                 }
                 val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()

@@ -220,6 +220,17 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         }
         // Give the task a beat to appear, then place it at our bounds.
         Thread.sleep(LAUNCH_SETTLE_MS)
+        // Arm the permission-dialog watch for this launch: a first-run app can
+        // spawn GrantPermissionsActivity on the external display (transparent →
+        // display freezes black) while the a11y EVENT stream is silent
+        // (kindle_black3), so the service polls the window list for ~8s instead
+        // of waiting for an event that may never arrive.
+        runCatching {
+            PortalPadAccessibilityService.instance?.armPermissionDialogWatch(displayId)
+        }
+        // Shizuku-side watch: the a11y layer can be entirely blind under the
+        // freeze; this one needs no a11y at all (see armDialogShellWatch).
+        runCatching { armDialogShellWatch(component, displayId, freeform = true) }
         val task = listTasks(displayId).firstOrNull { it.packageName == packageOf(component) }
         if (task != null) {
             setWindowingModeFreeform(task.taskId)
@@ -231,17 +242,393 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         Log.e(TAG, "launchFreeform failed", it); false
     }
 
-    /** Force a task into freeform windowing mode (mode id 5). */
-    fun setWindowingModeFreeform(taskId: Int) {
-        runCatching {
-            // Newer: `am task ... `; widely available: move task to a freeform
-            // stack. Try the modern spelling first.
-            val out = access.execShell("am task $taskId set-windowing-mode 5")
-            if (out.containsError() || out.contains("Unknown", ignoreCase = true)) {
-                // Older devices: move the task into the freeform stack id.
-                access.execShell("am stack move-task $taskId 2 true")
+    /**
+     * Reparent a root task to another display via `am display move-stack`
+     * (on modern Android a freeform task IS its root task, so the task id is
+     * the stack id). Used to bring "refugee" windows — tasks the system moved
+     * to the phone display when the external display was torn down — back
+     * onto the glass with their state intact. VERIFIES arrival by re-listing
+     * the target display: never trust the verb's silence (StageCoordinator
+     * lesson), and never let callers chain ops onto a move that didn't land.
+     */
+    fun moveTaskToDisplay(taskId: Int, displayId: Int): Boolean = runCatching {
+        val out = access.execShell("am display move-stack $taskId $displayId")
+        if (out.containsError() || out.contains("Unknown", ignoreCase = true)) {
+            Log.w(TAG, "move-stack $taskId → display $displayId refused: '${out.trim().take(180)}'")
+            return@runCatching false
+        }
+        val arrived = listTasks(displayId).any { it.taskId == taskId }
+        if (!arrived) {
+            Log.w(TAG, "move-stack $taskId reported ok but task NOT on display $displayId — falling back")
+        }
+        arrived
+    }.getOrDefault(false)
+
+    /** Which `am task` set-windowing-mode spelling this ROM accepts.
+     *  0 = undetermined, 1 = id-first, 2 = verb-first, 3 = NEITHER exists.
+     *  Discovered at first use; cached so every later call is one shell trip.
+     *  (Field evidence: on One UI / Android 16 the id-first spelling returns
+     *  "Error: unknown command '<id>'" — it has NEVER worked there; the old
+     *  legacy move-task fallback was silently doing the work until it was
+     *  removed for crashing SystemUI.) */
+    @Volatile private var modeVerbStyle = 0
+
+    /** Set a task's windowing mode via shell, probing both `am task`
+     *  spellings. Returns true only when a spelling executed cleanly. */
+    private fun setWindowingMode(taskId: Int, mode: Int): Boolean {
+        fun clean(out: String) =
+            !out.containsError() && !out.contains("Unknown", ignoreCase = true) &&
+                !out.contains("unknown command", ignoreCase = true)
+        return runCatching {
+            if (modeVerbStyle == 0 || modeVerbStyle == 1) {
+                val a = access.execShell("am task $taskId set-windowing-mode $mode")
+                if (clean(a)) { modeVerbStyle = 1; return@runCatching true }
+                if (modeVerbStyle == 1) return@runCatching false
+                Log.d(TAG, "set-windowing-mode id-first refused ('${a.trim().take(120)}') — probing verb-first")
+            }
+            if (modeVerbStyle == 0 || modeVerbStyle == 2) {
+                val b = access.execShell("am task set-windowing-mode $taskId $mode")
+                if (clean(b)) { modeVerbStyle = 2; return@runCatching true }
+                if (modeVerbStyle == 0) {
+                    modeVerbStyle = 3
+                    Log.w(TAG, "set-windowing-mode: NEITHER spelling exists on this ROM ('${b.trim().take(120)}') — callers must use their launch-based fallbacks")
+                }
+            }
+            false
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Move the foreground app task on [externalDisplayId] to the phone
+     * (display 0). Used to rescue a task frozen behind a transparent system
+     * dialog that launched onto the external display (runtime permission
+     * prompts): relocating the task brings the app AND its dialog to the phone,
+     * where the prompt is visible and tappable — automating the manual
+     * "open it from recents" workaround. Best-effort; logs and no-ops on
+     * failure rather than throwing.
+     */
+    // ── Permission-dialog shell watch ──────────────────────────────────────
+    // Generation counter: each freeform launch re-arms with a fresh generation;
+    // an older watch thread sees the bump and exits, so at most one runs.
+    @Volatile private var dialogWatchGen = 0
+
+    /** Generation counter for the dialog-CLOSE watch (Stage 2 transient-mirror
+     *  revert). Independent of [dialogWatchGen]. */
+    @Volatile private var dialogCloseWatchGen = 0
+
+    /**
+     * After an overlay-mode permission dialog triggers a transient system-mirror
+     * flip, watch for that dialog to CLOSE and then revert the mirror — so the
+     * flip-back happens the instant the user picks Allow/Deny, never while the
+     * prompt is still up (which would revert into a black screen). This is the
+     * PRIMARY revert; the service's timeout is only a backstop. Polls the same
+     * way [armDialogShellWatch] detects appearance, requiring the dialog to be
+     * gone for two consecutive ticks to debounce recomposition flicker.
+     */
+    /** Cancel any in-flight dialog-close watch. Bumping the generation makes the
+     *  running poll thread (which checks `gen == dialogCloseWatchGen` each tick)
+     *  exit at its next tick without calling endTransientMirror. Used on physical
+     *  disconnect: the watch polls the task list independently of display state,
+     *  so without this a late tick could fire a revert against a display that has
+     *  already been unplugged (and, on a fast replug, against the FRESH display).
+     *  Idempotent. */
+    fun cancelDialogCloseWatch() {
+        dialogCloseWatchGen++
+    }
+
+    fun armDialogCloseWatch() {
+        if (!isReady) return
+        val gen = ++dialogCloseWatchGen
+        val t = Thread {
+            Log.d(TAG, "perm-dialog CLOSE watch ARMED gen=$gen")
+            var goneTicks = 0
+            var n = 0
+            while (n < DIALOG_CLOSE_WATCH_TICKS && gen == dialogCloseWatchGen) {
+                runCatching { Thread.sleep(DIALOG_WATCH_INTERVAL_MS) }
+                if (gen != dialogCloseWatchGen) return@Thread
+                n++
+                val present = runCatching { findGrantPermissionsTaskId() != null }.getOrDefault(false)
+                if (!present) {
+                    goneTicks++
+                    if (goneTicks >= 2) {
+                        Log.w(TAG, "perm-dialog CLOSE watch: dialog gone (tick=$n) → revert transient mirror")
+                        PortalPadForegroundService.endTransientMirrorForDialog()
+                        return@Thread
+                    }
+                } else {
+                    goneTicks = 0
+                }
+            }
+            // Ran out of budget without seeing a clean close — leave the
+            // service's safety-net timeout to revert.
+            if (gen == dialogCloseWatchGen) {
+                Log.w(TAG, "perm-dialog CLOSE watch: budget exhausted gen=$gen — safety net will revert")
             }
         }
+        t.isDaemon = true
+        t.name = "pp-dialog-close-watch"
+        t.start()
+    }
+
+    /**
+     * Shizuku-side permission-dialog watch. The a11y-based watchers failed on
+     * hardware twice: the frozen display delivers no a11y events AND the a11y
+     * window list can be blind to the transparent dialog, while
+     * [moveForegroundExternalTaskToPhone]'s display-filtered task query can
+     * return zero tasks on this ROM (kindle_black3: `ListTasks req disp=42 …
+     * kept=0`; same fact recorded at the launch window-cap). This watch removes
+     * BOTH dependencies: it asks ActivityManager directly (dumpsys) for an
+     * ActivityRecord of GrantPermissionsActivity and takes the task id from
+     * that record (`… GrantPermissionsActivity t13380}`), so detection needs no
+     * a11y and the move needs no display-filtered listing.
+     */
+    fun armDialogShellWatch(component: String, externalDisplayId: Int, freeform: Boolean = true) {
+        if (!isReady) return
+        val gen = ++dialogWatchGen
+        val t = Thread {
+            Log.d(TAG, "perm-dialog shell watch ARMED disp=$externalDisplayId gen=$gen freeform=$freeform for $component")
+            var n = 0
+            while (n < DIALOG_WATCH_TICKS && gen == dialogWatchGen) {
+                try {
+                    Thread.sleep(DIALOG_WATCH_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                if (gen != dialogWatchGen) return@Thread
+                val taskId = findGrantPermissionsTaskId()
+                if (taskId != null) {
+                    Log.w(TAG, "perm-dialog shell watch HIT task=$taskId tick=$n → phone consent")
+                    handlePermissionDialog(component, externalDisplayId, taskId, gen, freeform)
+                    return@Thread
+                }
+                n++
+            }
+            if (gen == dialogWatchGen) Log.d(TAG, "perm-dialog shell watch expired gen=$gen (no dialog)")
+        }
+        t.name = "portalpad-perm-watch"
+        t.isDaemon = true
+        t.start()
+    }
+
+    /**
+     * Phone-side consent for the external-display permission dialog. The app's
+     * GrantPermissionsActivity has spawned INSIDE the app's own translucent
+     * freeform task on the external display, where One UI composites it
+     * against black (permfix1 log: isActivityStackTransparent=false, and a
+     * separate wallpaper task behind it never shows through). Seven logs
+     * proved there is no layer we control between that dialog and the black —
+     * so the dialog is unusable where it is, and we route consent to the
+     * phone:
+     *   1. verify the trackpad UI is composed on the phone FIRST — the consent
+     *      dialog lives inside TrackpadActivity's composition (a service
+     *      overlay and a separate dialog activity were BOTH buried under the
+     *      foreground trackpad; hosting in the activity itself is the only
+     *      placement proven to be on top). No trackpad → leave the system
+     *      dialog alone, touch nothing.
+     *   2. read the app's declared-but-ungrantable-nowhere-else dangerous
+     *      permissions; nothing pm-grantable → leave the system dialog alone.
+     *   3. force-stop the app — removes the app AND its stranded dialog from
+     *      the external display in one move.
+     *   4. service repaints the external (wallpaper + "check your phone" card)
+     *      and pushes the Allow/Deny request into the trackpad's composition.
+     *   5. Allow → `pm grant` each approved permission, relaunch the app fresh
+     *      on the external display (grants pre-empt the prompt). Deny all →
+     *      relaunch with no grants. Dismiss → nothing (ask later).
+     */
+    private fun handlePermissionDialog(component: String, externalDisplayId: Int, dialogTaskId: Int, gen: Int, freeform: Boolean) {
+        val enabled = runCatching {
+            kotlinx.coroutines.runBlocking {
+                PortalPadApp.instance.prefs.bool(
+                    com.portalpad.app.data.PreferencesRepository.Keys.PERM_DIALOG_KEEP_ON_EXTERNAL,
+                    default = true,
+                ).first()
+            }
+        }.getOrDefault(true)
+        if (!enabled) {
+            Log.d(TAG, "perm consent: disabled by pref — leaving system dialog as-is")
+            return
+        }
+        // System-mirror path keeps the external display lit through the dialog,
+        // so the real Android prompt is usable right where it is on the glasses.
+        // The phone-side consent popup is redundant then — skip it and leave the
+        // system dialog in place. (It stays for the overlay fallback path, where
+        // the panel would otherwise blank.)
+        val systemMirror = runCatching {
+            kotlinx.coroutines.runBlocking {
+                PortalPadApp.instance.prefs.panelSystemMirror.first()
+            }
+        }.getOrDefault(false)
+        if (systemMirror) {
+            Log.w(TAG, "perm consent: system mirror active — dialog usable on external, skipping phone popup")
+            return
+        }
+        // Overlay mode: instead of the phone-side kill/relaunch consent flow, flip
+        // to a TRANSIENT system mirror for the duration of the dialog. The native
+        // Android prompt then shows on the external display (mirror composites it —
+        // no black screen), the app is NOT killed/relaunched, and the display
+        // reverts to the user's overlay mode automatically after a safety timeout
+        // (Stage 1; a later stage reverts the moment the dialog closes). Mirror
+        // needs privilege — which the consent flow below also needs (force-stop /
+        // pm grant) — so this supersedes it whenever access is ready; the consent
+        // flow remains only as the no-privilege fallback. The saved mirror pref is
+        // never touched.
+        if (isReady) {
+            Log.w(TAG, "perm consent: overlay mode → transient system mirror for dialog ($component)")
+            PortalPadForegroundService.beginTransientMirrorForDialog()
+            // Stage 2: revert the mirror the instant the dialog closes (primary),
+            // rather than waiting out the service's safety-net timeout.
+            armDialogCloseWatch()
+            return
+        }
+        // Trigger availability check BEFORE any destructive step: if the
+        // trackpad UI isn't composed there is nowhere to show consent, and
+        // force-stopping the app would strand the user with nothing.
+        if (com.portalpad.app.TrackpadActivity.permConsentTrigger == null) {
+            Log.w(TAG, "perm consent: trackpad UI not composed — leaving system dialog as-is")
+            return
+        }
+        val pkg = packageOf(component)
+        val perms = readDeclaredDangerousPermissions(pkg)
+        Log.w(TAG, "perm consent: pkg=$pkg declared-dangerous=[${perms.joinToString(",").take(200)}]")
+        if (perms.isEmpty()) {
+            // Nothing pm-grantable (e.g. a special-access-only prompt). Leave the
+            // system dialog as-is rather than kill the app for no benefit.
+            Log.w(TAG, "perm consent: no pm-grantable permissions — leaving system dialog")
+            return
+        }
+
+        // Kill the app: removes BOTH the app and its stranded black dialog from
+        // the external display in one move. Everything after happens with the
+        // external display clear.
+        runCatching { access.execShell("am force-stop $pkg") }
+        Log.w(TAG, "perm consent: force-stopped $pkg (cleared external display)")
+
+        // External display: wallpaper + "check your phone" card. Phone: the
+        // Allow/Deny dialog inside the trackpad's composition. Both driven by
+        // the service.
+        PortalPadForegroundService.showPermissionConsentFlow(
+            pkg = pkg,
+            permissions = perms,
+            onDecision = { grantedPerms ->
+                Thread {
+                    // Apply the user's choices via Shizuku/root. Granting BEFORE
+                    // relaunch pre-empts the prompt, so the app finds these
+                    // already granted and won't re-ask on the external display.
+                    for (p in grantedPerms) {
+                        val out = access.execShell("pm grant $pkg $p")
+                        Log.w(TAG, "perm consent: pm grant $pkg $p → '${out.trim().take(80)}'")
+                    }
+                    // Relaunch the app fresh on the EXTERNAL display in freeform
+                    // where it started.
+                    val metrics = runCatching {
+                        val dm = PortalPadApp.instance.getSystemService(
+                            android.hardware.display.DisplayManager::class.java,
+                        )
+                        val d = dm.getDisplay(externalDisplayId)
+                        android.util.DisplayMetrics().also { @Suppress("DEPRECATION") d.getRealMetrics(it) }
+                    }.getOrNull()
+                    // Relaunch in the SAME windowing mode the app was originally
+                    // launched in: freeform → a cascaded freeform window; extend/
+                    // fullscreen (freeform=false) → a plain fullscreen launch. Coming
+                    // back as a freeform window after a fullscreen launch would be a
+                    // regression (a fullscreen app suddenly floating in a window).
+                    val bounds = if (freeform && metrics != null) {
+                        WindowBounds.cascade(nextLaunchIndex(), metrics.widthPixels, metrics.heightPixels)
+                    } else {
+                        null
+                    }
+                    val ok = if (bounds != null) {
+                        // launchFreeform re-arms the shell watch itself (freeform=true).
+                        launchFreeform(component, externalDisplayId, bounds)
+                    } else {
+                        val r = access.startActivityOnDisplay(component, externalDisplayId)
+                        // A fullscreen relaunch does NOT re-arm the watch on its own,
+                        // so arm it here — if the app requests a DIFFERENT permission
+                        // next, the same flow catches it.
+                        runCatching { armDialogShellWatch(component, externalDisplayId, freeform = false) }
+                        r
+                    }
+                    Log.w(TAG, "perm consent: relaunched $component on external $externalDisplayId (freeform=$freeform ok=$ok)")
+                    // The freeform relaunch re-arms the shell watch (via
+                    // launchFreeform); the fullscreen relaunch re-arms explicitly
+                    // above. Either way a second prompt is still handled — though
+                    // since we offer the whole declared set up front, a well-behaved
+                    // app won't re-prompt.
+                }.also { it.isDaemon = true }.start()
+            },
+        )
+    }
+
+    /** The app's DECLARED dangerous (runtime) permissions, read from
+     *  `dumpsys package <pkg>`. Unlike the runtime-state section (which is only
+     *  populated after a first grant and is empty on a truly fresh app — the bug
+     *  that made the popup never show), the "requested permissions:" block is
+     *  always present. Parsing is restricted to THAT block (a greedy whole-dump
+     *  regex previously swept in legacy/install-time entries and produced extra
+     *  checkboxes the system's own App-info page doesn't show). Entries capped
+     *  with `maxSdkVersion=N` below the device SDK are dead on this device
+     *  (e.g. READ_EXTERNAL_STORAGE maxSdkVersion=32 on Android 16) and are
+     *  skipped. Only known runtime-dangerous permissions are kept, so we never
+     *  try to pm-grant a normal or special-access permission. */
+    private fun readDeclaredDangerousPermissions(pkg: String): List<String> = runCatching {
+        val dump = access.execShell("dumpsys package $pkg")
+        val sdk = android.os.Build.VERSION.SDK_INT
+        val out = mutableListOf<String>()
+        var inRequested = false
+        for (raw in dump.lines()) {
+            val line = raw.trim()
+            if (line.startsWith("requested permissions:")) { inRequested = true; continue }
+            if (inRequested) {
+                // The block ends at the next section header (a non-permission
+                // line ending in ':') or a blank line after content.
+                val m = DECLARED_PERM.find(line)
+                if (m == null) {
+                    if (line.isEmpty() || line.endsWith(":")) {
+                        if (out.isNotEmpty() || line.endsWith(":")) break
+                    }
+                    continue
+                }
+                // Respect maxSdkVersion caps: dead declarations never prompt.
+                val cap = MAX_SDK.find(line)?.groupValues?.get(1)?.toIntOrNull()
+                if (cap != null && cap < sdk) continue
+                out += m.groupValues[1]
+            }
+        }
+        out.filter { it in DANGEROUS_PERMISSIONS }.distinct()
+    }.getOrDefault(emptyList())
+
+    /** Task id hosting a live GrantPermissionsActivity, from the AM dump —
+     *  ActivityRecord lines end `… GrantPermissionsActivity t<taskId>}`.
+     *  `t-1` (record not yet in a task) deliberately doesn't match. */
+    private fun findGrantPermissionsTaskId(): Int? = runCatching {
+        val dump = access.execShell("dumpsys activity activities")
+        GRANT_PERM_TASK.find(dump)?.groupValues?.get(1)?.toIntOrNull()
+    }.getOrNull()
+
+    fun moveForegroundExternalTaskToPhone(externalDisplayId: Int): Boolean = runCatching {
+        val tasks = listTasks(externalDisplayId)
+            .filter { rt ->
+                !rt.packageName.contains("launcher", ignoreCase = true) &&
+                    rt.packageName != PortalPadApp.instance.packageName
+            }
+        // The frontmost such task is the one carrying the dialog.
+        val target = tasks.firstOrNull() ?: run {
+            Log.w(TAG, "moveForegroundExternalTaskToPhone: no candidate task on display $externalDisplayId")
+            return@runCatching false
+        }
+        val moved = moveTaskToDisplay(target.taskId, 0)
+        if (moved) {
+            setWindowingModeFullscreen(target.taskId)
+            Log.w(TAG, "rescued task ${target.taskId} (${target.packageName}) to phone for its system dialog")
+        }
+        moved
+    }.getOrDefault(false)
+
+    /** Force a task into freeform windowing mode (mode id 5). */
+    fun setWindowingModeFreeform(taskId: Int): Boolean {
+        val ok = setWindowingMode(taskId, 5)
+        if (!ok) Log.w(TAG, "set-windowing-mode 5 failed for task $taskId (no legacy fallback)")
+        return ok
     }
 
     /** Switch a task to TRUE fullscreen windowing mode (mode 1). Unlike a
@@ -249,14 +636,10 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
      *  different window layer the system draws OVER freeform windows — so it
      *  cleanly occludes other windows' caption bars (which Samsung otherwise
      *  keeps on-screen). This is the basis of the "maximize" action. */
-    fun setWindowingModeFullscreen(taskId: Int) {
-        runCatching {
-            val out = access.execShell("am task $taskId set-windowing-mode 1")
-            if (out.containsError() || out.contains("Unknown", ignoreCase = true)) {
-                // Older devices: fullscreen stack id is 1.
-                access.execShell("am stack move-task $taskId 1 true")
-            }
-        }
+    fun setWindowingModeFullscreen(taskId: Int): Boolean {
+        val ok = setWindowingMode(taskId, 1)
+        if (!ok) Log.w(TAG, "set-windowing-mode 1 failed for task $taskId (no legacy fallback)")
+        return ok
     }
 
     // ── Exclusive-maximize state ──────────────────────────────────────────
@@ -499,9 +882,12 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
             val out = access.execShell("am task $taskId move-to-front")
             Log.d(TAG, "focus($taskId) move-to-front out='${out.trim().take(180)}'")
             if (out.containsError() || out.contains("Unknown", ignoreCase = true)) {
-                // Fallback spelling used on some builds.
-                val fb = access.execShell("am stack move-task $taskId 1 true")
-                Log.d(TAG, "focus($taskId) fallback move-task out='${fb.trim().take(180)}'")
+                // NO move-task fallback: this file's own bringToFront() doc
+                // already established it fails for external-display tasks and
+                // would yank the window to the phone — and (see
+                // setWindowingModeFreeform) it can reparent into a
+                // SystemUI-owned root task and crash SystemUI.
+                Log.w(TAG, "focus($taskId) move-to-front failed (no legacy fallback)")
             }
         }.onFailure { Log.e(TAG, "focus($taskId) failed", it) }
     }
@@ -609,7 +995,15 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         }.getOrNull() ?: return false
         val target = e.bounds ?: if (displayH > 0) WindowBounds.restored(displayW, displayH) else null
         if (target == null) return false
-        return launchFreeform(component, displayId, target)
+        val ok = launchFreeform(component, displayId, target)
+        // Same one-shot-resize gap as restoreSession: if the app comes back fullscreen
+        // and launchFreeform's single resize is dropped, nothing re-asserts freeform.
+        // Bails early on a genuinely non-resizeable task. Callers pass real display
+        // bounds; skip the check when they're unknown (can't detect "fullscreen").
+        if (ok && displayW > 0 && displayH > 0) {
+            ensureTiledWithReroll(e.packageName, component, displayId, target, displayW, displayH)
+        }
+        return ok
     }
 
     /**
@@ -687,6 +1081,7 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
                     component = rt.topActivity,
                     left = b.left, top = b.top,
                     right = b.right, bottom = b.bottom,
+                    taskId = rt.taskId,
                 )
             }
         }.getOrDefault(emptyList())
@@ -723,6 +1118,12 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         displayId: Int,
         displayW: Int,
         displayH: Int,
+        // Task ids of the windows that were on the display MOST RECENTLY — the
+        // identity source for refugee recovery. The [session] being restored is
+        // the TARGET canvas's archive (layout memory) and its ids can be from an
+        // old session of that width; identity must come from the last snapshot,
+        // i.e. the tasks that were just torn down. null → fetched from prefs.
+        identityTaskIds: Set<Int>? = null,
     ): Int {
         var launched = 0
         // Don't relaunch apps already live on the display. On a physical replug the
@@ -744,6 +1145,31 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         // would refocus the existing window instead of making a new one, so we
         // force a fresh task to actually recreate the duplicate window.
         val established = liveCounts.toMutableMap()
+        // REFUGEE POOL: when the external display was torn down (resolution
+        // switch), the system reparented its freeform tasks to the phone
+        // display — alive, tabs and all. Pool membership is VETTED by task id
+        // against the most-recent snapshot (plus any ids in this session), so
+        // a phone-side window the user opened themselves can never be yanked
+        // onto the glass. WITHIN the vetted pool, claims may fall back to
+        // package matching — needed because the target-canvas archive being
+        // restored typically carries ids from an OLD session of this width
+        // (or -1 from pre-taskId builds), never the ids just torn down.
+        val identity: Set<Int> = identityTaskIds ?: runCatching {
+            kotlinx.coroutines.runBlocking {
+                PortalPadApp.instance.prefs.lastSession.first().windows
+                    .mapNotNull { sw -> sw.taskId.takeIf { it > 0 } }
+                    .toSet()
+            }
+        }.getOrDefault(emptySet())
+        val vettedIds = identity + session.windows.mapNotNull { sw -> sw.taskId.takeIf { it > 0 } }
+        val refugeePool = if (vettedIds.isEmpty()) mutableListOf() else {
+            runCatching { listTasks(0) }.getOrDefault(emptyList())
+                .filter { it.taskId in vettedIds }
+                .toMutableList()
+        }
+        if (refugeePool.isNotEmpty()) {
+            Log.d(TAG, "restoreSession: vetted refugee pool=${refugeePool.map { "${it.packageName}#${it.taskId}" }}")
+        }
         // `session.windows` is stored in `am stack list` order, which is
         // front-to-back (most-recently-focused first). Each launch comes up on
         // top, so to reproduce the original stacking we launch BACK-to-front:
@@ -758,24 +1184,83 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
             }
             val bounds = if (w.right > w.left && w.bottom > w.top) w.bounds
             else WindowBounds.restored(displayW, displayH)
+            // Refugee recovery: a task that was just on the display survived on
+            // the phone — move it back (state intact), re-freeform, re-place at
+            // this canvas's bounds. Exact-id claim first (same window returns to
+            // its own spot), then same-package within the vetted pool. Any
+            // failure falls through to the relaunch path below.
+            val claim = refugeePool.firstOrNull { w.taskId > 0 && it.taskId == w.taskId }
+                ?: refugeePool.firstOrNull { it.packageName == w.packageName }
+            if (claim != null) {
+                refugeePool.remove(claim)
+                val moved = runCatching { moveTaskToDisplay(claim.taskId, displayId) }.getOrDefault(false)
+                if (moved) {
+                    setWindowingModeFreeform(claim.taskId)
+                    resize(claim.taskId, bounds)
+                    // Arm the permission-dialog watches for this task. `launchFreeform`
+                    // arms them for apps PortalPad launches, but a REFUGEE arrives by
+                    // being moved here — no launch, so nothing was ever armed. An app
+                    // with a pending permission request (e.g. a backgrounded Kindle)
+                    // then spawns GrantPermissionsActivity inside its own translucent
+                    // freeform task ON THIS DISPLAY, which One UI composites against
+                    // black — the user sees the freeform window floating on black and
+                    // no backdrop can show through (see handlePermissionDialog). The
+                    // watches poll for that activity and route consent to the phone.
+                    val claimComponent = claim.topActivity
+                        ?: runCatching {
+                            PortalPadApp.instance.packageManager
+                                .getLaunchIntentForPackage(claim.packageName)
+                                ?.component?.flattenToShortString()
+                        }.getOrNull()
+                    if (claimComponent != null) {
+                        runCatching {
+                            PortalPadAccessibilityService.instance?.armPermissionDialogWatch(displayId)
+                        }
+                        runCatching { armDialogShellWatch(claimComponent, displayId, freeform = true) }
+                    }
+                    launched++
+                    established[w.packageName] = (established[w.packageName] ?: 0) + 1
+                    Log.d(TAG, "restoreSession: moved refugee task ${claim.taskId} (${w.packageName}) back to display $displayId")
+                    runCatching { Thread.sleep(120) }
+                    continue
+                }
+                Log.w(TAG, "restoreSession: refugee move failed for task ${claim.taskId} (${w.packageName}) — relaunching instead")
+            }
             val comp = w.component
+            // Resolve the actual launch component up front (saved component, or
+            // the package's launcher activity) so the reroll below can relaunch
+            // the same thing ensureTiled watched.
+            val launchComp = if (!comp.isNullOrBlank()) comp else runCatching {
+                PortalPadApp.instance.packageManager
+                    .getLaunchIntentForPackage(w.packageName)?.component?.flattenToShortString()
+            }.getOrNull()
             // If this app already has a window (a survivor, or one relaunched
             // earlier in this pass), force a new task so the duplicate appears
             // instead of refocusing the existing one.
             val needNewTask = (established[w.packageName] ?: 0) > 0
             val ok = runCatching {
-                if (!comp.isNullOrBlank()) {
-                    launchFreeform(comp, displayId, bounds, forceNewTask = needNewTask)
-                } else {
-                    // No component recorded — resolve the package's launcher activity.
-                    val pm = PortalPadApp.instance.packageManager
-                    val intentComp = pm.getLaunchIntentForPackage(w.packageName)?.component?.flattenToShortString()
-                    if (intentComp != null) launchFreeform(intentComp, displayId, bounds, forceNewTask = needNewTask) else false
-                }
+                if (launchComp != null) {
+                    launchFreeform(launchComp, displayId, bounds, forceNewTask = needNewTask)
+                } else false
             }.getOrDefault(false)
             if (ok) {
                 launched++
                 established[w.packageName] = (established[w.packageName] ?: 0) + 1
+                // launchFreeform resizes ONCE right after `am start --windowingMode 5`.
+                // If the app comes up fullscreen and that single resize is dropped, the
+                // window stays maximized with nothing to correct it — this path had no
+                // retry at all (ensureTiled previously guarded only retileToSaved's
+                // relaunch branch). That's why a recents-clear, which destroys the VD's
+                // tasks and then restores them through here, brought Kindle back
+                // FULLSCREEN instead of freeform. Re-assert as it settles; bails early
+                // on a task the platform flatly refuses to resize. Needs real display
+                // bounds to tell "fullscreen" from "tiled", so skip when unknown.
+                if (displayW > 0 && displayH > 0) {
+                    ensureTiledWithReroll(
+                        w.packageName, launchComp, displayId, bounds, displayW, displayH,
+                        forceNewTask = needNewTask,
+                    )
+                }
             }
             // Small gap so each launch settles before the next (matches arrange).
             runCatching { Thread.sleep(120) }
@@ -816,6 +1301,17 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         if (!isReady) return 0
         val live = runCatching { listExternalTasks() }.getOrDefault(emptyList())
         if (live.isEmpty()) return 0
+        // Identity ids (same source as restoreSession's refugee pool): task ids
+        // from the most-recent snapshot = the ORIGINAL windows. Used below to
+        // rescue parked-fullscreen originals in place instead of relaunching
+        // them blank. Empty set (old snapshots / fetch failure) = no rescues.
+        val identityIds: Set<Int> = runCatching {
+            kotlinx.coroutines.runBlocking {
+                PortalPadApp.instance.prefs.lastSession.first().windows
+                    .mapNotNull { sw -> sw.taskId.takeIf { it > 0 } }
+                    .toSet()
+            }
+        }.getOrDefault(emptySet())
         val used = HashSet<Int>()
         var applied = 0
         // Process BACK-to-front (reversed): session.windows is `am stack list`
@@ -825,12 +1321,20 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         // reproducing the original stacking — matching restoreSession's order.
         // (Forward iteration fronted the backmost window last, inverting the stack.)
         for (w in session.windows.reversed()) {
-            val task = live.firstOrNull { t ->
-                t.taskId !in used && (
-                    (!w.component.isNullOrBlank() && t.topActivity?.equals(w.component, ignoreCase = true) == true) ||
-                        t.packageName.equals(w.packageName, ignoreCase = true)
-                )
-            } ?: continue
+            // Pairing order: EXACT task id first — two same-package windows
+            // (e.g. two Chromes) are interchangeable under component/package
+            // matching, so the pairing was a coin flip and windows could swap
+            // positions across a resolution switch. Snapshot ids are stable
+            // under the grace model (tasks survive), making the exact match
+            // deterministic; component/package remain the fallback for old
+            // snapshots and post-teardown relaunches (fresh ids).
+            val task = live.firstOrNull { t -> w.taskId > 0 && t.taskId == w.taskId && t.taskId !in used }
+                ?: live.firstOrNull { t ->
+                    t.taskId !in used && (
+                        (!w.component.isNullOrBlank() && t.topActivity?.equals(w.component, ignoreCase = true) == true) ||
+                            t.packageName.equals(w.packageName, ignoreCase = true)
+                        )
+                } ?: continue
             used += task.taskId
             val rawBounds = if (w.right > w.left && w.bottom > w.top) w.bounds
             else WindowBounds.restored(displayW, displayH)
@@ -861,6 +1365,38 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
                     "fullscreen=$isFullscreen relaunch=${isFullscreen && relaunchFullscreen}",
             )
             if (isFullscreen && relaunchFullscreen) {
+                // RESCUE PATH for identity-vetted ORIGINALS first. The parked
+                // tasks from the disconnect flow arrive here fullscreen because
+                // WE set them fullscreen (phone parking) — a different species
+                // from the platform-rehomed stuck windows this relaunch was
+                // built for. On those, freeform+resize demonstrably works (the
+                // refugee-moved window proves it every switch). VERIFIED: if the
+                // resize doesn't actually take, fall through to the relaunch —
+                // the "ignores mode changes" stubbornness stays covered.
+                if (task.taskId in identityIds) {
+                    setWindowingModeFreeform(task.taskId)
+                    resize(task.taskId, bounds)
+                    runCatching { Thread.sleep(200) }
+                    val after = runCatching { listTasks(displayId) }.getOrDefault(emptyList())
+                        .firstOrNull { it.taskId == task.taskId }?.bounds
+                    val stuck = after == null || (
+                        after.left <= 2 && after.top <= 2 &&
+                            after.right >= displayW - 2 && after.bottom >= displayH - 2
+                    )
+                    if (!stuck) {
+                        android.util.Log.d(
+                            "PortalPadSleep",
+                            "RECOVERY retile RESCUED original task=${task.taskId} (${task.packageName}) in place — state preserved",
+                        )
+                        applied++
+                        runCatching { Thread.sleep(120) }
+                        continue
+                    }
+                    android.util.Log.w(
+                        "PortalPadSleep",
+                        "RECOVERY retile rescue did not stick for task=${task.taskId} — relaunching (state lost)",
+                    )
+                }
                 // Close + relaunch fresh into freeform. A brand-new --windowingMode 5
                 // task comes up freeform reliably (that's how every normal launch
                 // works here), so the resize inside launchFreeform actually sticks.
@@ -880,6 +1416,13 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
                     // relaunch below isn't blocked by the max-windows check.
                     runCatching { Thread.sleep(350) }
                     runCatching { launchFreeform(comp, displayId, bounds) }
+                    // launchFreeform resizes ONCE, right after the relaunch. If the task
+                    // isn't resizeable at that instant the resize is dropped and the
+                    // window stays fullscreen. Re-assert a few times as it settles.
+                    // Bails early (with a diagnostic) when the task is flatly
+                    // non-resizeable — e.g. Kindle's first-run/OOB activity — since no
+                    // amount of retrying can tile that.
+                    ensureTiledWithReroll(task.packageName, comp, displayId, bounds, displayW, displayH)
                     applied++
                     runCatching { Thread.sleep(120) }
                     continue
@@ -899,6 +1442,129 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         }
         if (applied > 0) PortalPadApp.instance.signalWindowsChanged()
         return applied
+    }
+
+    /**
+     * Bounded post-relaunch tiling guard for a fullscreen survivor. `launchFreeform`
+     * resizes exactly once, immediately after the relaunch; if the task isn't
+     * resizeable at that instant the resize is dropped and the window stays
+     * fullscreen. This re-asserts freeform + resize a few times as the task settles.
+     *
+     * Scope, verified on-device: this recovers a task that merely needed another tick.
+     * It CANNOT recover a task the platform flatly refuses to resize — a first-run/OOB
+     * activity such as Kindle's `com.amazon.kcp.oob.MainActivity` / `UpgradePage` is
+     * NON-RESIZEABLE, and no amount of retrying changes that. So it detects that case
+     * (bounds never move) and bails early with a diagnostic naming the top activity,
+     * instead of grinding — the previous 6×500ms budget stalled recovery ~4s and
+     * overlapped the VD restarts that transient-mirror flips trigger.
+     *
+     * Runs on the recovery IO dispatcher, so the short sleeps are fine. Idempotent: a
+     * task that's already tiled (the common case) returns on the first check.
+     */
+    /** @return true when the window tiled (or vanished / kept moving — nothing
+     *  actionable); false ONLY on the flat refusal (bounds never moved), which
+     *  is the reroll-worthy case. */
+    private fun ensureTiled(pkg: String, displayId: Int, bounds: WindowBounds, dw: Int, dh: Int): Boolean {
+        // 4 tries × 400ms ≈ 1.6s worst case. Deliberately NOT longer: a task that
+        // the platform flatly refuses to resize (`resizeTask not allowed`, logged
+        // server-side by ActivityTaskManager — we get no return value to inspect)
+        // will never yield, so grinding on it only stalls recovery and overlaps the
+        // VD restarts that a transient-mirror flip triggers. Observed in the wild:
+        // a `pm clear`-ed Kindle sits in com.amazon.kcp.oob.MainActivity / UpgradePage,
+        // which is NON-RESIZEABLE — 6 retries, 0 successes, 14 refusals.
+        var lastBounds: WindowBounds? = null
+        var unchanged = 0
+        repeat(4) { attempt ->
+            val t = runCatching { listTasks(displayId) }.getOrDefault(emptyList())
+                .firstOrNull { it.packageName.equals(pkg, ignoreCase = true) } ?: return true
+            val b = t.bounds
+            val stillFullscreen = b == null || (
+                b.left <= 2 && b.top <= 2 && b.right >= dw - 2 && b.bottom >= dh - 2
+            )
+            if (!stillFullscreen) {
+                android.util.Log.d(
+                    "PortalPadSleep",
+                    "RECOVERY ensureTiled: $pkg tiled (task=${t.taskId})",
+                )
+                return true
+            }
+            // Bounds identical to the previous post-resize sample ⇒ the resize isn't
+            // landing at all. Two such samples and we stop: bail out naming the top
+            // activity so the log says WHY (a first-run/OOB or otherwise
+            // non-resizeable activity, vs a task that merely needed another tick).
+            if (attempt > 0 && b == lastBounds) {
+                unchanged++
+                if (unchanged >= 2) {
+                    android.util.Log.w(
+                        "PortalPadSleep",
+                        "RECOVERY ensureTiled: giving up on $pkg task=${t.taskId} — bounds never moved " +
+                            "across retries (top=${t.topActivity}). The platform is refusing the resize; " +
+                            "this is a NON-RESIZEABLE activity (e.g. a first-run/OOB screen), not a timing race.",
+                    )
+                    return false
+                }
+            } else {
+                unchanged = 0
+            }
+            lastBounds = b
+            runCatching { Thread.sleep(400) }
+            setWindowingModeFreeform(t.taskId)
+            runCatching { resize(t.taskId, bounds) }
+            android.util.Log.d(
+                "PortalPadSleep",
+                "RECOVERY ensureTiled retry: $pkg still fullscreen — re-asserted freeform+resize (task=${t.taskId})",
+            )
+        }
+        return true
+    }
+
+    /** Timestamps of the last close-and-relaunch reroll per package: a refused
+     *  tiling is rerolled at most once per minute — one reroll per restore in
+     *  practice, and structurally never a close/launch loop. */
+    private val lastRerollAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * [ensureTiled], plus ONE close-and-relaunch reroll when the platform
+     * flatly refuses to tile a RESTORE-launched window. Rationale (log-proven,
+     * 2026-07-08): whether `am start --windowingMode 5` actually yields a
+     * freeform task is a per-launch dice roll during some apps' first-run/OOB
+     * flows — the same Kindle UpgradePage component tiled 3 of 4 launches in
+     * one session. A losing roll can't be repaired in place on this ROM (no
+     * live set-windowing-mode), but it CAN be rerolled: close the refused task
+     * and launch the same component once more (~75% → ~94% expected restore
+     * success per the observed rate). Restore paths only — user-launched or
+     * user-moved windows never come through here, so a deliberate fullscreen
+     * window is never touched.
+     */
+    private fun ensureTiledWithReroll(
+        pkg: String,
+        component: String?,
+        displayId: Int,
+        bounds: WindowBounds,
+        dw: Int,
+        dh: Int,
+        forceNewTask: Boolean = false,
+    ) {
+        if (ensureTiled(pkg, displayId, bounds, dw, dh)) return
+        if (component.isNullOrBlank()) return
+        val key = pkg.lowercase()
+        val now = System.currentTimeMillis()
+        if (now - (lastRerollAt[key] ?: 0L) < 60_000L) return
+        lastRerollAt[key] = now
+        val t = runCatching { listTasks(displayId) }.getOrDefault(emptyList())
+            .firstOrNull { it.packageName.equals(pkg, ignoreCase = true) } ?: return
+        android.util.Log.w(
+            "PortalPadSleep",
+            "RECOVERY reroll: $pkg task=${t.taskId} refused tiling — closing and relaunching once " +
+                "(launch-time freeform is intermittent on this ROM; no reroll again for 60s)",
+        )
+        close(t.taskId)
+        // Same settle the retile relaunch branch uses — also frees the
+        // window-cap slot for the relaunch.
+        runCatching { Thread.sleep(350) }
+        if (runCatching { launchFreeform(component, displayId, bounds, forceNewTask) }.getOrDefault(false)) {
+            ensureTiled(pkg, displayId, bounds, dw, dh)
+        }
     }
 
 
@@ -1085,6 +1751,58 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
     companion object {
         private const val TAG = "FreeformManager"
         private const val LAUNCH_SETTLE_MS = 350L
+        // Permission-dialog shell watch: ~8.4s coverage (dialog appeared 1.1s
+        // after launch in kindle_black3).
+        private const val DIALOG_WATCH_TICKS = 12
+        private const val DIALOG_WATCH_INTERVAL_MS = 700L
+        /** Poll budget for the transient-mirror dialog-CLOSE watch: 165 × 700ms
+         *  ≈ 115s, comfortably inside the service's 120s safety-net timeout so
+         *  the close watch is the one that normally reverts. */
+        private const val DIALOG_CLOSE_WATCH_TICKS = 165
+        /** Matches `…GrantPermissionsActivity t13380` inside an ActivityRecord
+         *  dump line; group 1 = task id. */
+        private val GRANT_PERM_TASK = Regex("""GrantPermissionsActivity[^}\n]*?\bt(\d+)""")
+        /** Matches a declared android.permission.* name anywhere in
+         *  `dumpsys package` (requested/declared permission lists). */
+        private val DECLARED_PERM = Regex("""(android\.permission\.[A-Z_]+)""")
+        /** Matches a `maxSdkVersion=NN` annotation on a requested-permission
+         *  line — a declaration capped below the device SDK never prompts. */
+        private val MAX_SDK = Regex("""maxSdkVersion=(\d+)""")
+        /** The runtime "dangerous" permissions — the ones that trigger a
+         *  GrantPermissionsActivity prompt and that `pm grant` can grant. Normal
+         *  and special-access permissions are deliberately excluded. */
+        private val DANGEROUS_PERMISSIONS = setOf(
+            "android.permission.POST_NOTIFICATIONS",
+            "android.permission.CAMERA",
+            "android.permission.RECORD_AUDIO",
+            "android.permission.ACCESS_FINE_LOCATION",
+            "android.permission.ACCESS_COARSE_LOCATION",
+            "android.permission.ACCESS_BACKGROUND_LOCATION",
+            "android.permission.READ_CONTACTS",
+            "android.permission.WRITE_CONTACTS",
+            "android.permission.GET_ACCOUNTS",
+            "android.permission.READ_CALENDAR",
+            "android.permission.WRITE_CALENDAR",
+            "android.permission.READ_EXTERNAL_STORAGE",
+            "android.permission.WRITE_EXTERNAL_STORAGE",
+            "android.permission.READ_MEDIA_IMAGES",
+            "android.permission.READ_MEDIA_VIDEO",
+            "android.permission.READ_MEDIA_AUDIO",
+            "android.permission.READ_PHONE_STATE",
+            "android.permission.READ_PHONE_NUMBERS",
+            "android.permission.CALL_PHONE",
+            "android.permission.READ_CALL_LOG",
+            "android.permission.WRITE_CALL_LOG",
+            "android.permission.SEND_SMS",
+            "android.permission.RECEIVE_SMS",
+            "android.permission.READ_SMS",
+            "android.permission.BODY_SENSORS",
+            "android.permission.ACTIVITY_RECOGNITION",
+            "android.permission.NEARBY_WIFI_DEVICES",
+            "android.permission.BLUETOOTH_SCAN",
+            "android.permission.BLUETOOTH_CONNECT",
+            "android.permission.BLUETOOTH_ADVERTISE",
+        )
 
         // Forgiving regexes for `am stack list` / dumpsys lines.
         private val TASK_ID = Regex("""(?:taskId=|Task id #|task #)\s*(\d+)""")

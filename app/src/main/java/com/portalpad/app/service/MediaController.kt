@@ -151,8 +151,8 @@ class MediaController(private val context: Context) {
     fun playPause() = sendMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
     fun next() = sendMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
     fun prev() = sendMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
-    fun fastForward() = sendMediaKey(KeyEvent.KEYCODE_MEDIA_FAST_FORWARD)
-    fun rewind() = sendMediaKey(KeyEvent.KEYCODE_MEDIA_REWIND)
+    fun fastForward() = seekRelativeOrKey(SKIP_MS, KeyEvent.KEYCODE_MEDIA_FAST_FORWARD)
+    fun rewind() = seekRelativeOrKey(-SKIP_MS, KeyEvent.KEYCODE_MEDIA_REWIND)
     fun stop() = sendMediaKey(KeyEvent.KEYCODE_MEDIA_STOP)
 
     /**
@@ -162,8 +162,7 @@ class MediaController(private val context: Context) {
     fun getCurrentPlaybackPosition(): Pair<Long, Long>? {
         if (!hasNotificationAccess) return null
         return try {
-            val session = mediaSessionManager.getActiveSessions(listenerComponent)
-                .firstOrNull() ?: return null
+            val session = pickAppSession() ?: return null
             val state = session.playbackState ?: return null
             val duration = session.metadata?.getLong(
                 android.media.MediaMetadata.METADATA_KEY_DURATION
@@ -184,10 +183,8 @@ class MediaController(private val context: Context) {
     fun isPlaying(): Boolean {
         if (!hasNotificationAccess) return false
         return try {
-            mediaSessionManager.getActiveSessions(listenerComponent).any { ctrl ->
-                ctrl.playbackState?.state ==
-                    android.media.session.PlaybackState.STATE_PLAYING
-            }
+            pickAppSession()?.playbackState?.state ==
+                android.media.session.PlaybackState.STATE_PLAYING
         } catch (t: Throwable) {
             Log.w(TAG, "isPlaying check failed", t)
             false
@@ -198,8 +195,7 @@ class MediaController(private val context: Context) {
     fun seekTo(positionMs: Long) {
         if (!hasNotificationAccess) return
         try {
-            val session = mediaSessionManager.getActiveSessions(listenerComponent)
-                .firstOrNull() ?: return
+            val session = pickAppSession() ?: return
             session.transportControls.seekTo(positionMs)
         } catch (t: Throwable) {
             Log.w(TAG, "seekTo failed", t)
@@ -212,11 +208,64 @@ class MediaController(private val context: Context) {
         Log.w(TAG, "No path worked for media key $keyCode")
     }
 
+    /**
+     * The REAL app's media session to act on — never PortalPad's own
+     * `PortalPadVolume` decoy. That decoy is created active + PLAYING (so
+     * hardware volume keys route to it), and Android frequently pushes it to the
+     * TOP of the session stack — so a naive getActiveSessions().firstOrNull()
+     * would dispatch transport keys / seeks / position reads to IT, where they
+     * are silently swallowed. That was the "media controls dead / slider blank
+     * until I tap OK on the app" bug: tapping the app just happened to push its
+     * real session back above ours. Skip our own package, then prefer the
+     * session that's actually PLAYING/BUFFERING (what the user is watching), then
+     * a PAUSED one, then any remaining external session — preserving the system's
+     * priority order within each tier.
+     */
+    private fun pickAppSession(): android.media.session.MediaController? {
+        if (!hasNotificationAccess) return null
+        val sessions = runCatching {
+            mediaSessionManager.getActiveSessions(listenerComponent)
+        }.getOrNull() ?: return null
+        val own = context.packageName
+        val external = sessions.filter { it.packageName != own }
+        return external.firstOrNull {
+            val s = it.playbackState?.state
+            s == android.media.session.PlaybackState.STATE_PLAYING ||
+                s == android.media.session.PlaybackState.STATE_BUFFERING
+        } ?: external.firstOrNull {
+            it.playbackState?.state == android.media.session.PlaybackState.STATE_PAUSED
+        } ?: external.firstOrNull()
+    }
+
+    /**
+     * Skip by [deltaMs] via an absolute seek when the app's session supports
+     * seeking (advertises ACTION_SEEK_TO and reports a position) — this is what
+     * actually works on apps like Netflix, which ignore the FAST_FORWARD/REWIND
+     * media keys. Falls back to the media key otherwise, since some players only
+     * respond to those.
+     */
+    private fun seekRelativeOrKey(deltaMs: Long, fallbackKey: Int) {
+        val session = pickAppSession()
+        val state = session?.playbackState
+        val canSeek = state != null && state.position >= 0 &&
+            (state.actions and android.media.session.PlaybackState.ACTION_SEEK_TO) != 0L
+        if (session != null && canSeek) {
+            val dur = session.metadata?.getLong(
+                android.media.MediaMetadata.METADATA_KEY_DURATION,
+            ) ?: -1L
+            var target = state!!.position + deltaMs
+            if (target < 0L) target = 0L
+            if (dur > 0L && target > dur) target = dur
+            runCatching { session.transportControls.seekTo(target) }
+            return
+        }
+        sendMediaKey(fallbackKey)
+    }
+
     private fun sendViaMediaSession(keyCode: Int): Boolean {
         if (!hasNotificationAccess) return false
         return try {
-            val sessions = mediaSessionManager.getActiveSessions(listenerComponent)
-            val active = sessions.firstOrNull() ?: return false
+            val active = pickAppSession() ?: return false
             val now = SystemClock.uptimeMillis()
             active.dispatchMediaButtonEvent(
                 KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0)
@@ -249,5 +298,9 @@ class MediaController(private val context: Context) {
         }
     }
 
-    companion object { private const val TAG = "MediaController" }
+    companion object {
+        private const val TAG = "MediaController"
+        /** Relative skip distance for the Fast-forward / Rewind buttons. */
+        private const val SKIP_MS = 10_000L
+    }
 }

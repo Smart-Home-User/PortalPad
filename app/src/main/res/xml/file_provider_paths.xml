@@ -12,4 +12,10 @@
     <external-files-path
         name="screenshots"
         path="screenshots/" />
+    <!-- Update APKs downloaded by the in-app update checker; handed to the
+         system package installer via a content URI. Same app-private
+         external-files scheme — auto-cleared on uninstall. -->
+    <external-files-path
+        name="updates"
+        path="updates/" />
 </paths>

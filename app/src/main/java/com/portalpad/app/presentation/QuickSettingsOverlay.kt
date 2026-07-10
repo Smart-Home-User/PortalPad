@@ -77,6 +77,15 @@ import com.portalpad.app.ui.theme.PortalPadTheme
  * uses, read from prefs), and its text contrast flips with that color's
  * luminance so labels stay readable on any dock theme.
  */
+/**
+ * Density baseline for DPI-independent chrome sizing — the same 213 dpi ≈ 1.33
+ * XREAL-native reference DockBar uses (see DockBar.BASELINE_DENSITY). Kept in
+ * sync so the QuickSettings flyout and the dock scale identically. Dividing the
+ * live VD density out against this baseline makes the menu track ONLY the dock
+ * customization (icon/label size), never the external-display DPI slider.
+ */
+private const val QS_BASELINE_DENSITY = 1.33f
+
 class QuickSettingsOverlay(
     serviceContext: Context,
     val display: Display,
@@ -114,13 +123,16 @@ class QuickSettingsOverlay(
             setViewTreeSavedStateRegistryOwner(this@QuickSettingsOverlay)
             setViewTreeViewModelStoreOwner(this@QuickSettingsOverlay)
             setContent {
-                // Compose at the display's REAL density (matching DockOverlay) so the
-                // dock's published pixel rect converts to dp 1:1 and the panel lines
-                // up edge-to-edge with the dock.
-                val m = android.util.DisplayMetrics().also { display.getRealMetrics(it) }
+                // Compose at the PINNED baseline density (same as DockOverlay), NOT the
+                // display's live density. `wm density` (the DPI slider) changes the live
+                // one, and Compose converts every dp/sp with whatever density it's given
+                // — so a live density let the slider resize these tiles. Pinning freezes
+                // the panel at the 213-dpi look and makes dpiComp below resolve to 1.0.
+                // The dock's published pixel rect still round-trips correctly: it is
+                // converted px→dp with THIS density and rendered back at THIS density.
                 androidx.compose.runtime.CompositionLocalProvider(
                     androidx.compose.ui.platform.LocalDensity provides
-                        androidx.compose.ui.unit.Density(m.density, 1f),
+                        androidx.compose.ui.unit.Density(QS_BASELINE_DENSITY, 1f),
                 ) {
                     PortalPadTheme { PanelContent() }
                 }
@@ -237,7 +249,18 @@ class QuickSettingsOverlay(
         val bgDark = (lum(colorA) + lum(colorB)) / 2f < 0.5f
         val strong = if (bgDark) Color.White else Color(0xFF15131A)
         val muted = if (bgDark) strong.copy(alpha = 0.65f) else Color(0xFF15131A).copy(alpha = 0.55f)
-        val panelRadius = dockConfig.style.cornerRadiusDp.dp
+
+        // DPI-INDEPENDENT SIZING — mirror DockBar. This overlay Composes at the VD's
+        // live density (LocalDensity), which the external-display DPI slider changes
+        // via `wm density`. Dividing the live density out against the shared
+        // XREAL-native baseline keeps every dp size below sized to ONLY the dock
+        // customization, never the DPI slider (live or restored). Positioning further
+        // down still uses the live density, so the anchor against the dock's
+        // live-pixel rect is unaffected.
+        // Clamp wide enough to never bind across the full DPI slider (80–640 dpi) —
+        // matches DockBar, so the menu and dock stay DPI-independent together.
+        val dpiComp = (QS_BASELINE_DENSITY / LocalDensity.current.density).coerceIn(0.25f, 3.0f)
+        val panelRadius = (dockConfig.style.cornerRadiusDp * dpiComp).dp
 
         // Live connectivity state (same detection as the dock's status icons).
         var btOn by remember { mutableStateOf(false) }
@@ -332,8 +355,11 @@ class QuickSettingsOverlay(
         // dock's icon/label sizes × overall scale. The dock's published rect is
         // used ONLY to anchor (right edge + gap), not to size the panel.
         val scale = dockConfig.scalePct.coerceIn(50, 160) / 100f
-        val effIcon = dockConfig.iconSizeDp * scale
-        val baseLabel = (if (dockConfig.labelSizeSp > 0) dockConfig.labelSizeSp else 13) * scale
+        // dpiComp (computed above) divides out the live DPI so these track the dock
+        // customization only. Every tile dimension below derives from effIcon /
+        // baseLabel, so applying it here propagates to the whole panel.
+        val effIcon = dockConfig.iconSizeDp * scale * dpiComp
+        val baseLabel = (if (dockConfig.labelSizeSp > 0) dockConfig.labelSizeSp else 13) * scale * dpiComp
         val tileWidthDp = (effIcon * 1.7f).dp
         val tileIconDp = (effIcon * 0.5f).dp
         val tilePadH = (effIcon * 0.16f).dp

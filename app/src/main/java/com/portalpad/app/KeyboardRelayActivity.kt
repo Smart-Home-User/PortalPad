@@ -24,6 +24,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -141,6 +142,13 @@ class KeyboardRelayActivity : PinnedDensityActivity() {
     }
 
     override fun onPause() {
+        // Stamp BEFORE super/anything else: TrackpadActivity's onResume (which
+        // runs refocusExternalDisplay) fires while this activity is merely
+        // PAUSED — onDestroy comes ~250ms later, AFTER the refocus already ran.
+        // Stamping only in onDestroy left the skip-window unarmed at the exact
+        // moment it existed for (measured: refocus at +265ms after onPause,
+        // destroy at +513ms — dropdown relaunch-killed with the skip asleep).
+        (application as? PortalPadApp)?.relayClosedAt = System.currentTimeMillis()
         super.onPause()
         android.util.Log.w("DIAG-RELAY", "onPause")
         injector.setRelayImeMode(false)
@@ -151,6 +159,7 @@ class KeyboardRelayActivity : PinnedDensityActivity() {
         // Relay is closing (back button or the X). Re-enable the auto-open poller
         // so the next field tap can open it again.
         app.relayOpen = false
+        app.relayClosedAt = System.currentTimeMillis()
         super.onDestroy()
     }
 }
@@ -264,14 +273,136 @@ private fun RelayScreen(injector: InputInjector, initialText: String = "", onClo
         },
         containerColor = AbBackground,
     ) { padding ->
+      var showSuggestions by remember { mutableStateOf(false) }
+      var overlaySuggestions by remember {
+          mutableStateOf(listOf<com.portalpad.app.service.PortalPadAccessibilityService.MirrorSuggestion>())
+      }
+      // Scope for the pick fallback (SET_TEXT → brief settle → Enter).
+      val suggestionScope = rememberCoroutineScope()
+      // When the popup closes, restore field focus (the reassert watcher stood
+      // down while it was open). Guarded so it doesn't fire on first composition.
+      var popupWasOpen by remember { mutableStateOf(false) }
+      LaunchedEffect(showSuggestions) {
+          if (popupWasOpen && !showSuggestions) {
+              kotlinx.coroutines.delay(60)
+              runCatching { focusRequester.requestFocus() }
+          }
+          popupWasOpen = showSuggestions
+      }
+      Box(Modifier.fillMaxSize().padding(padding)) {
         Column(
             Modifier
-                .padding(padding)
                 .padding(16.dp)
                 .fillMaxSize(),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            // Same disconnect banner as the trackpad interface — the relay
+            // covers TrackpadActivity, so its banner fires unseen underneath.
+            // Keyed to the PHYSICAL id (instant at unplug); under the grace
+            // model the app being typed into stays ALIVE, so this is
+            // actionable ("replug and continue"), and the relay deliberately
+            // does NOT auto-finish: the draft text survives the grace window.
+            val physId by com.portalpad.app.PortalPadApp.instance
+                .physicalExternalDisplayId.collectAsState()
+            com.portalpad.app.ui.common.DisconnectBanner(externalDisplayId = physId)
             RelayDependencyChip(customKeyboard)
+
+            // ── Suggestion mirror (overlay dropdown) ───────────────────
+            // The on-display dropdown is UNSELECTABLE from the phone: any relay
+            // touch kills it (system IME arbitration), and DPAD selection is
+            // cleared by Chrome's fill-in/rebuild loop. So the accessibility
+            // service READS the suggestions off the display's node tree; here
+            // they surface as a compact trigger row that opens a floating,
+            // scrollable popup OVER the keyboard (nothing below reflows). A tap
+            // clicks the real suggestion via ACTION_CLICK on its node — no focus
+            // events, no key injection. Invisible when nothing is readable
+            // (fallback by design: Chrome's view ids can shift across versions).
+            var suggestions by remember {
+                mutableStateOf(listOf<com.portalpad.app.service.PortalPadAccessibilityService.MirrorSuggestion>())
+            }
+            LaunchedEffect(Unit) {
+                // STICKY + BURST reliability (field report 2026-07-09: chips
+                // appeared intermittently — a single empty read mid-dropdown-
+                // rebuild blanked the list even when the next poll would have
+                // refilled it, and the fixed 600ms cadence aliased against apps
+                // that populate their dropdown a few hundred ms AFTER each
+                // keystroke).
+                //  - STICKY: a non-empty chip set is held through empty reads
+                //    while the query is unchanged; it clears only after 4
+                //    consecutive empties (the dropdown is genuinely gone).
+                //    On a query change the old chips hold briefly too — the
+                //    burst below replaces them within ~250ms, which reads as
+                //    progressive refinement rather than flicker.
+                //  - BURST: the first 5 reads after each query change run at
+                //    250ms, then the loop settles back to 600ms.
+                var lastQuery = ""
+                var emptyStreak = 0
+                var sinceChange = 0
+                // Seed the shared query flow with THIS session's starting text:
+                // it's a process-wide StateFlow, so without seeding, a stale
+                // query from a previous relay session (another app entirely)
+                // leaks into the first scans until the first keystroke.
+                injector.setSearchQuery(fieldValue.text)
+                while (true) {
+                    // Query source follows the ACTIVE keyboard path. The old
+                    // "fieldValue, else custom buffer" precedence served the
+                    // PREFILL forever on the custom path whenever the tapped
+                    // field opened with leftover text (DIAG 2026-07-09: every
+                    // scan said q='goo' while the user typed 'boss bab' — the
+                    // relevance gate then rejected perfectly good rows).
+                    val typed = if (customKeyboard) {
+                        injector.searchQuery.value.trim()
+                    } else {
+                        fieldValue.text.trim()
+                    }
+                    if (typed != lastQuery) {
+                        lastQuery = typed
+                        sinceChange = 0
+                        emptyStreak = 0
+                    } else {
+                        sinceChange++
+                    }
+                    val raw = runCatching {
+                        com.portalpad.app.service.PortalPadAccessibilityService.instance
+                            ?.readSuggestions(injector.displayId, query = typed)
+                    }.getOrNull() ?: emptyList()
+                    // Filter Chrome's verbatim echo of the typed text (Send Enter
+                    // already covers "search exactly this") and trim the trailing
+                    // two-line separator dot that bleeds into line_1.
+                    val processed = raw
+                        .map { it.copy(title = it.title.trimEnd(' ', '\u00B7', '\u2013', '\u2014').trim()) }
+                        .filter { it.title.isNotBlank() && !it.title.equals(typed, ignoreCase = true) }
+                        .distinctBy { it.title }
+                    // BROWSERS keep their NATIVE order (and full list): the
+                    // engine's ranking encodes history/popularity/personal
+                    // signals that ABC would destroy, and its list is already
+                    // all-relevant by its own judgment so nothing is pruned.
+                    // Everything else (streaming tiles, Play Store, unknown
+                    // apps) gets word-prefix tiers + ABC within each tier, with
+                    // non-matches dropped once 3+ real matches exist.
+                    val srcPkg = com.portalpad.app.service.PortalPadAccessibilityService
+                        .instance?.lastSuggestionSourcePkg
+                    val isBrowser = com.portalpad.app.service.PortalPadAccessibilityService
+                        .isBrowserPkg(srcPkg)
+                    val ranked = if (isBrowser) processed
+                    else com.portalpad.app.ui.common.SearchRank.rank(processed, typed) { it.title }
+                    if (ranked.isNotEmpty()) {
+                        emptyStreak = 0
+                        suggestions = ranked
+                    } else {
+                        emptyStreak++
+                        if (emptyStreak >= 4) suggestions = emptyList()
+                    }
+                    kotlinx.coroutines.delay(if (sinceChange < 5) 250L else 600L)
+                }
+            }
+            // NOTE deliberately NO live `overlaySuggestions = suggestions` here.
+            // The popup shows a SNAPSHOT taken when the trigger is tapped: the
+            // trigger tap itself kills Chrome's real dropdown (IMMS arbitration —
+            // the proven dropdown3.txt floor), so the next poll reads EMPTY and a
+            // live-bound popup drains and vanishes within one tick ("list appears
+            // and cancels quickly"). The snapshot keeps the popup stable; the live
+            // list only controls the trigger row's visibility.
 
             Surface(
                 color = AbSurface,
@@ -322,6 +453,39 @@ private fun RelayScreen(injector: InputInjector, initialText: String = "", onClo
                     onClick = { injector.buzz(); customKeyboard = false },
                 )
             }
+
+            // Suggestion trigger — directly above the input area, below the
+            // keyboard-mode tabs. Opens the floating popup (declared later).
+            if (suggestions.isNotEmpty()) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable {
+                            // Snapshot NOW — this very tap dismisses Chrome's real
+                            // dropdown, so the poll goes empty right after. The
+                            // popup must not depend on the live list.
+                            overlaySuggestions = suggestions
+                            showSuggestions = true
+                        }
+                        .background(AbSurfaceElevated)
+                        .padding(horizontal = 14.dp, vertical = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("\u2605", color = AbPrimaryBright, fontSize = 13.sp)
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "${suggestions.size} suggestion${if (suggestions.size == 1) "" else "s"}",
+                        color = AbOnSurface, modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Text("\u25BE", color = AbOnSurfaceMuted, fontSize = 12.sp)
+                }
+            }
+            // No `else { showSuggestions = false }`: the live list going empty is
+            // EXPECTED the instant the popup opens (trigger tap → Chrome dropdown
+            // dies → poll drains). It hides the trigger row above, but the open
+            // popup keeps its snapshot; only the scrim tap or a pick closes it.
 
             if (customKeyboard) {
                 // Size the keyboard to the space left below the toggle so it fits
@@ -385,7 +549,11 @@ private fun RelayScreen(injector: InputInjector, initialText: String = "", onClo
                         // up, re-request it on the next frame so typing continues
                         // uninterrupted. Event-driven (not polling) so it only
                         // fires on actual focus loss.
-                        if (!state.isFocused) {
+                        // EXCEPTION: while the suggestion popup is open, the field
+                        // SHOULD lose focus to it — reasserting here would blur the
+                        // popup and dismiss it mid-tap (the "list flashes then
+                        // cancels" bug). Stand down until the popup closes.
+                        if (!state.isFocused && !showSuggestions) {
                             reassertFocus = true
                         }
                     },
@@ -424,6 +592,177 @@ private fun RelayScreen(injector: InputInjector, initialText: String = "", onClo
             }
             } // end Android-keyboard branch
         }
+
+        // ── Floating suggestion popup (over the keyboard) ──────────────────
+        if (showSuggestions && overlaySuggestions.isNotEmpty()) {
+            // Scrim: tap anywhere outside dismisses without choosing.
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.45f))
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                    ) { showSuggestions = false },
+            )
+            Column(
+                Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 96.dp, start = 16.dp, end = 16.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(AbSurface)
+                    .border(1.dp, AbPrimary, RoundedCornerShape(14.dp)),
+            ) {
+                Text(
+                    "Suggestions \u00B7 tap to open",
+                    color = AbOnSurfaceMuted,
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+                )
+                androidx.compose.foundation.layout.Box {
+                    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+                    val suggThumb = AbOnSurfaceMuted.copy(alpha = 0.6f)
+                    androidx.compose.foundation.lazy.LazyColumn(
+                        state = listState,
+                        modifier = Modifier
+                            // Content-sized up to this cap: 8 chips (some with
+                            // 2-line URL rows) fit without clipping; beyond it
+                            // the list scrolls, with the thumb below as the
+                            // affordance (a clipped row used to read as broken
+                            // — field report 2026-07-09).
+                            .heightIn(max = 420.dp)
+                            .fillMaxWidth()
+                            // Scrollbar thumb (the dock list's pattern): drawn
+                            // only while content overflows; sized to the
+                            // visible fraction, tracks scroll position.
+                            .drawWithContent {
+                                drawContent()
+                                val info = listState.layoutInfo
+                                val total = info.totalItemsCount
+                                if (total > 0 && info.visibleItemsInfo.isNotEmpty()) {
+                                    val visible = info.visibleItemsInfo.size.toFloat()
+                                    val frac = (visible / total).coerceIn(0.1f, 1f)
+                                    if (frac < 1f) {
+                                        val firstIdx = info.visibleItemsInfo.first().index.toFloat()
+                                        val progress = (firstIdx / (total - visible)).coerceIn(0f, 1f)
+                                        val thumbH = size.height * frac
+                                        val thumbY = (size.height - thumbH) * progress
+                                        val w = 4.dp.toPx()
+                                        drawRoundRect(
+                                            color = suggThumb,
+                                            topLeft = androidx.compose.ui.geometry.Offset(size.width - w - 3.dp.toPx(), thumbY),
+                                            size = androidx.compose.ui.geometry.Size(w, thumbH),
+                                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(w / 2),
+                                        )
+                                    }
+                                }
+                            },
+                    ) {
+                        itemsIndexed(overlaySuggestions) { i, s ->
+                            androidx.compose.foundation.layout.Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        showSuggestions = false
+                                        suggestionScope.launch {
+                                            val svc = com.portalpad.app.service
+                                                .PortalPadAccessibilityService.instance
+                                            // Tier 1: click the LIVE node — free win in
+                                            // the rare case Chrome's dropdown outlived
+                                            // the trigger tap. Preserves the row's exact
+                                            // semantics, whatever they were.
+                                            var ok = runCatching {
+                                                svc?.clickSuggestion(injector.displayId, s.title, i)
+                                            }.getOrNull() == true
+                                            // Tier 2 (expected path): the real dropdown
+                                            // died when the trigger was tapped, so the
+                                            // node is gone. SET_TEXT into the retained
+                                            // field node (same primitive the relay uses
+                                            // for deletes) and submit with a real Enter.
+                                            // URL rows submit their line_2 ADDRESS (the
+                                            // omnibox navigates); search rows submit the
+                                            // title (the omnibox searches) — same
+                                            // outcome the real row would have had.
+                                            if (!ok) {
+                                                val submitText = s.url ?: s.title
+                                                val set = runCatching { svc?.setFieldText(submitText) }
+                                                    .getOrNull() == true
+                                                if (set) {
+                                                    injector.setSearchQuery(submitText)
+                                                    // Let Chrome's editor ingest the
+                                                    // SET_TEXT before the submit key.
+                                                    kotlinx.coroutines.delay(120)
+                                                    injector.submitSearch()
+                                                    injector.pressKey(KeyEvent.KEYCODE_ENTER)
+                                                    ok = true
+                                                }
+                                            }
+                                            android.util.Log.d(
+                                                "PortalPadRelay",
+                                                "suggestion pick '${s.title}' idx=$i url=${s.url != null} ok=$ok",
+                                            )
+                                            if (ok) { injector.buzz(longPress = false); onClose() }
+                                        }
+                                    }
+                                    .padding(start = 14.dp, end = 20.dp, top = 11.dp, bottom = 11.dp),
+                            ) {
+                                Text(
+                                    s.title,
+                                    color = AbOnSurface,
+                                    maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                                // Dimmed address line — present only on rows whose
+                                // pick will NAVIGATE rather than search.
+                                if (s.url != null) {
+                                    Text(
+                                        s.url,
+                                        color = AbOnSurfaceMuted,
+                                        maxLines = 1,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                        style = MaterialTheme.typography.labelSmall,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    // Persistent proportional scrollbar — visible ONLY when the
+                    // list actually overflows (no false signal on short lists).
+                    val info = listState.layoutInfo
+                    val total = info.totalItemsCount
+                    val visible = info.visibleItemsInfo.size
+                    if (total > visible && total > 0) {
+                        val frac = visible.toFloat() / total
+                        val progress = if (total > visible)
+                            listState.firstVisibleItemIndex.toFloat() / (total - visible) else 0f
+                        Box(
+                            Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(top = 4.dp, bottom = 4.dp, end = 3.dp)
+                                .width(4.dp)
+                                .fillMaxHeight()
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(AbSurfaceElevated),
+                        ) {
+                            androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxHeight()) {
+                                val thumbH = maxHeight * frac
+                                val room = maxHeight - thumbH
+                                Box(
+                                    Modifier
+                                        .offset(y = room * progress)
+                                        .width(4.dp)
+                                        .height(thumbH)
+                                        .clip(RoundedCornerShape(2.dp))
+                                        .background(AbPrimary),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+      }
     }
 }
 
@@ -585,6 +924,14 @@ private fun RowScope.KbKey(
     onClick: () -> Unit,
 ) {
     val keyH = LocalKbKeyHeight.current
+    // holdRepeat captures its action inside a pointerInput(Unit) coroutine that
+    // OUTLIVES recomposition — so when ?123 swapped the rows, each positionally
+    // reused key kept typing its FIRST label's character ("1" typed "q", "@"
+    // typed "a", "?" typed "m": every symbol key sent the letter from the same
+    // grid slot). Route the call through rememberUpdatedState so the long-lived
+    // gesture always invokes the CURRENT key's action; letter mode never showed
+    // it because the slot's k never changes there.
+    val currentOnClick by rememberUpdatedState(onClick)
     // Press state, tracked on the Initial pass so it works for BOTH the clickable and
     // the hold-repeat paths (the character keys repeat) without consuming — so it can't
     // interfere with the actual click/repeat handling layered after it.
@@ -613,9 +960,9 @@ private fun RowScope.KbKey(
             .clip(RoundedCornerShape(7.dp))
             .background(if (pressed) androidx.compose.ui.graphics.lerp(bg, AbPrimary, 0.3f) else bg)
         val clickMod = if (repeatScope != null) {
-            surface.holdRepeat(repeatScope, true, onClick)
+            surface.holdRepeat(repeatScope, true) { currentOnClick() }
         } else {
-            surface.clickable { onClick() }
+            surface.clickable { currentOnClick() }
         }
         Box(clickMod, contentAlignment = Alignment.Center) {
             Text(label, color = fg, style = MaterialTheme.typography.titleMedium)
@@ -2020,26 +2367,45 @@ private fun ColumnScope.CustomKeyboardSection(
 }
 
 /**
- * Map a Char to a KeyEvent and inject. Covers letters, digits, and the most
- * common punctuation. Out-of-range characters are dropped.
+ * Map a Char to a KeyEvent and inject. Uses the system's VIRTUAL_KEYBOARD
+ * [android.view.KeyCharacterMap] to resolve ANY mappable character to its key +
+ * shift metaState, then presses it via [InputInjector.pressKeyWithMeta] (which
+ * carries META_SHIFT_ON on the key events, the part text widgets actually read).
+ *
+ * History: the old hand-rolled table silently DROPPED every symbol not in it
+ * (@ # $ _ & + ( ) * " : ! ? — the whole ?123 second/third rows), and typed
+ * capitals as lowercase because it "held" shift as a separate press-RELEASE
+ * that completed before the letter went down. Field report: "keys send the
+ * wrong keys" in both ?123 and ABC mode.
  */
+private val VIRTUAL_KEYMAP: android.view.KeyCharacterMap by lazy {
+    android.view.KeyCharacterMap.load(android.view.KeyCharacterMap.VIRTUAL_KEYBOARD)
+}
+
 private fun forwardCharacter(ch: Char, injector: InputInjector) {
-    val (keyCode, withShift) = when {
-        ch in 'a'..'z' -> (KeyEvent.KEYCODE_A + (ch - 'a')) to false
-        ch in 'A'..'Z' -> (KeyEvent.KEYCODE_A + (ch - 'A')) to true
-        ch in '0'..'9' -> (KeyEvent.KEYCODE_0 + (ch - '0')) to false
-        ch == ' ' -> KeyEvent.KEYCODE_SPACE to false
-        ch == '\n' -> KeyEvent.KEYCODE_ENTER to false
-        ch == '.' -> KeyEvent.KEYCODE_PERIOD to false
-        ch == ',' -> KeyEvent.KEYCODE_COMMA to false
-        ch == '-' -> KeyEvent.KEYCODE_MINUS to false
-        ch == '/' -> KeyEvent.KEYCODE_SLASH to false
-        ch == ';' -> KeyEvent.KEYCODE_SEMICOLON to false
-        ch == '\'' -> KeyEvent.KEYCODE_APOSTROPHE to false
-        else -> return    // unsupported character
+    // Fast common paths the keymap also covers, kept explicit for clarity.
+    when (ch) {
+        ' ' -> { injector.pressKeyWithMeta(KeyEvent.KEYCODE_SPACE, 0); return }
+        '\n' -> { injector.pressKeyWithMeta(KeyEvent.KEYCODE_ENTER, 0); return }
     }
-    if (withShift) injector.pressKey(KeyEvent.KEYCODE_SHIFT_LEFT)
-    injector.pressKey(keyCode)
+    val events = runCatching { VIRTUAL_KEYMAP.getEvents(charArrayOf(ch)) }.getOrNull()
+    if (events == null) {
+        android.util.Log.w(
+            "PortalPadRelay",
+            "forwardCharacter: no keymap events for '$ch' (U+${"%04X".format(ch.code)}) — dropped",
+        )
+        return
+    }
+    // The keymap returns a full physical sequence (SHIFT down, key down/up,
+    // SHIFT up). The principal key's DOWN carries the metaState; pressing it
+    // with that metaState is sufficient — text widgets resolve the character
+    // from (keyCode, metaState), a physically held shift key isn't required.
+    val principal = events.firstOrNull {
+        it.action == KeyEvent.ACTION_DOWN &&
+            it.keyCode != KeyEvent.KEYCODE_SHIFT_LEFT &&
+            it.keyCode != KeyEvent.KEYCODE_SHIFT_RIGHT
+    } ?: return
+    injector.pressKeyWithMeta(principal.keyCode, principal.metaState)
 }
 
 /**

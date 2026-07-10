@@ -5,6 +5,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
+import kotlinx.coroutines.flow.first
 
 /**
  * App-side orchestrator for the AR-glasses virtual-display session.
@@ -75,6 +76,152 @@ class AirGlassesSession(private val backendProvider: () -> BoundShellBackend?) {
      * Start (or resize) the VD session for the given glasses display.
      * If already active for the same glasses id and same dimensions, no-op.
      */
+    /**
+     * Adopt a NEW physical glasses id for an already-running session — the
+     * replug half of the disconnect grace period. The VD (and every task on
+     * it, with all in-app state) is untouched; only the tracked physical id
+     * changes, and the same-id path in [start] then performs an in-place
+     * resize if the new panel's resolution differs. Falls through to a fresh
+     * [start] when no session survived.
+     */
+    fun rebind(newGlassesId: Int, width: Int, height: Int, dpi: Int): Int {
+        if (virtualDisplayId < 0) return start(newGlassesId, width, height, dpi)
+        if (physicalGlassesId != newGlassesId) {
+            Log.d(
+                TAG,
+                "rebind: VD=$virtualDisplayId glasses $physicalGlassesId → $newGlassesId " +
+                    "(${width}x$height dpi=$dpi) — tasks preserved",
+            )
+            physicalGlassesId = newGlassesId
+        }
+        return start(newGlassesId, width, height, dpi)
+    }
+
+    /** EXPERIMENT (permfix3) — pin the physical display's CURRENT mode. That
+     *  log proved the external goes black whenever a runtime-permission dialog
+     *  appears ANYWHERE (phone or external): the dialog churns SurfaceFlinger's
+     *  frame-rate votes, the physical display flaps modes (60↔90Hz within 7ms),
+     *  and One UI's deferred display update fades EVERY window on it to
+     *  alpha 0 for the dialog's lifetime. Pinning one mode removes the flap
+     *  trigger entirely. Pin = whatever mode is active now, so a user-chosen
+     *  90Hz stays 90Hz. Cleared in [stop]. */
+    private fun pinPhysicalDisplayMode(glassesId: Int) {
+        runCatching {
+            val dm = com.portalpad.app.PortalPadApp.instance
+                .getSystemService(android.hardware.display.DisplayManager::class.java)
+            val d = dm?.getDisplay(glassesId)
+            if (d == null) {
+                Log.w(TAG, "MODE-PIN: display $glassesId not found; skipping")
+                return
+            }
+            val m = d.mode
+            val rate = Math.round(m.refreshRate)
+            val out = backend?.runCommand(
+                "cmd display set-user-preferred-display-mode -d $glassesId " +
+                    "${m.physicalWidth} ${m.physicalHeight} $rate",
+            ) ?: "no backend"
+            Log.w(
+                TAG,
+                "MODE-PIN: pinned disp=$glassesId to ${m.physicalWidth}x${m.physicalHeight}@$rate" +
+                    " → '${out.trim().take(120)}'",
+            )
+        }.onFailure { Log.w(TAG, "MODE-PIN: pin failed: ${it.message}") }
+    }
+
+    /** Clear the [pinPhysicalDisplayMode] pin on session teardown. */
+    private fun clearPhysicalDisplayModePin(glassesId: Int) {
+        if (glassesId < 0) return
+        runCatching {
+            val out = backend?.runCommand(
+                "cmd display clear-user-preferred-display-mode -d $glassesId",
+            ) ?: "no backend"
+            Log.w(TAG, "MODE-PIN: cleared pin on disp=$glassesId → '${out.trim().take(120)}'")
+        }.onFailure { Log.w(TAG, "MODE-PIN: clear failed: ${it.message}") }
+    }
+
+    /** EXPERIMENT (permfix) — try to grant the app an overlay-hide exemption
+     *  so the VD mirror survives HIDE_NON_SYSTEM_OVERLAY_WINDOWS (the security
+     *  hide that blanks the glasses whenever a USB/permission dialog appears).
+     *  Two candidate permissions, both signature-level; `pm grant` usually
+     *  refuses signature perms, so this logs the EXACT output of each attempt —
+     *  that output is the diagnostic that tells us whether this whole avenue is
+     *  viable on Shizuku-shell (vs. root-only). Runs once per session start. */
+    private fun grantOverlayExemptionPermissions() {
+        val pkg = com.portalpad.app.PortalPadApp.instance.packageName
+        for (perm in arrayOf(
+            "android.permission.SYSTEM_APPLICATION_OVERLAY",
+            "android.permission.INTERNAL_SYSTEM_WINDOW",
+        )) {
+            val out = runCatching { backend?.runCommand("pm grant $pkg $perm") ?: "no backend" }
+                .getOrElse { "threw: ${it.message}" }
+            Log.w(TAG, "OVERLAY-EXEMPT: pm grant $perm → '${out.trim().take(160)}'")
+        }
+        // Report what actually stuck, so we don't rely on the grant's own
+        // (often empty) stdout.
+        val dump = runCatching {
+            backend?.runCommand("dumpsys package $pkg | grep -iE 'SYSTEM_APPLICATION_OVERLAY|INTERNAL_SYSTEM_WINDOW'")
+                ?: ""
+        }.getOrDefault("")
+        Log.w(TAG, "OVERLAY-EXEMPT: post-grant state → ${dump.trim().replace("\n", " | ").take(300)}")
+    }
+
+    /**
+     * EXPERIMENT (permfix / AirBeam parity): drive the glasses via a
+     * SurfaceControl layerStack retarget instead of the overlay + GL-shader
+     * mirror. Retargets the panel to the VD's layerStack (overlay-free), then
+     * applies the user's LINEAR color tuning through the system display color
+     * transform. The non-linear gamma stage is dropped (a display color matrix
+     * can't express it). Returns true only if the retarget reported OK, so the
+     * caller can auto-fall-back to the overlay path when the ROM refuses it.
+     */
+    /** Live-apply a LINEAR color matrix to the system-mirror panel (used by the
+     *  Settings color sliders when the overlay/GL path isn't active). Gamma is
+     *  not expressible in a display matrix, so it's dropped. */
+    fun applySystemMirrorColor(glassesDisplayId: Int, matrix4x4: FloatArray): String {
+        val b = backend ?: return "FAIL: no backend"
+        return runCatching { b.setDisplayColorTransform(glassesDisplayId, matrix4x4) }
+            .getOrElse { "FAIL: ${it.message}" }
+    }
+
+    /** Best-effort delivered-fps for the mirror HUD (SurfaceFlinger stats). */
+    fun sampleDisplayFps(displayId: Int): Float =
+        runCatching { backend?.sampleDisplayFps(displayId) ?: -1f }.getOrDefault(-1f)
+
+    fun startSystemMirror(glassesDisplayId: Int, vdDisplayId: Int): Boolean {
+        val b = backend ?: run { Log.w(TAG, "SYSTEM-MIRROR: no backend"); return false }
+        val res = runCatching { b.startLayerStackMirror(glassesDisplayId, vdDisplayId) }
+            .getOrElse { "threw: ${it.message}" }
+        Log.w(TAG, "SYSTEM-MIRROR start → $res")
+        if (!res.startsWith("OK")) return false
+
+        // Apply the user's persisted LINEAR color tuning via the system display
+        // color transform. Gamma (the non-linear stage) is intentionally not
+        // applied here — it lived only in the GL shader.
+        runCatching {
+            val saved = kotlinx.coroutines.runBlocking {
+                com.portalpad.app.PortalPadApp.instance.prefs.colorTuning.first()
+            }
+            val v = com.portalpad.app.presentation.GlColorRenderer.parseValues(saved)
+            if (!com.portalpad.app.presentation.GlColorRenderer.isDefault(v)) {
+                val matrix = com.portalpad.app.presentation.GlColorRenderer.matrixFromValues(v)
+                val cres = b.setDisplayColorTransform(glassesDisplayId, matrix)
+                Log.w(TAG, "SYSTEM-MIRROR color → $cres")
+            } else {
+                Log.d(TAG, "SYSTEM-MIRROR: tuning is default — no color transform")
+            }
+        }.onFailure { Log.w(TAG, "SYSTEM-MIRROR color failed: ${it.message}") }
+        return true
+    }
+
+    /** Restore the panel's original layerStack (undo [startSystemMirror]). Safe
+     *  to call unconditionally on teardown/toggle-off. */
+    fun stopSystemMirror(glassesDisplayId: Int) {
+        val b = backend ?: return
+        val res = runCatching { b.stopLayerStackMirror(glassesDisplayId) }
+            .getOrElse { "threw: ${it.message}" }
+        Log.w(TAG, "SYSTEM-MIRROR stop → $res")
+    }
+
     fun start(glassesId: Int, width: Int, height: Int, dpi: Int): Int {
         if (backend?.isReady != true) {
             Log.w(TAG, "start: bound backend not ready")
@@ -104,6 +251,10 @@ class AirGlassesSession(private val backendProvider: () -> BoundShellBackend?) {
                 }
                 lastWidth = w; lastHeight = h; lastDpi = dpi
             }
+            // Re-pin on every (re)entry: a rebind arrives here with a NEW
+            // physical id whose mode isn't pinned yet (the old pin died with
+            // the old display).
+            pinPhysicalDisplayMode(glassesId)
             return virtualDisplayId
         }
 
@@ -206,6 +357,21 @@ class AirGlassesSession(private val backendProvider: () -> BoundShellBackend?) {
         mirrorBound = false
 
         Log.d(TAG, "AirGlassesSession started: vdId=$vdId glasses=$glassesId ${w}x$h flags=0x${flags.toString(16)}")
+        grantOverlayExemptionPermissions()
+        pinPhysicalDisplayMode(glassesId)
+        // Passive go/no-go for an AirBeam-style overlay-free system mirror.
+        // Touches nothing live — just reports whether the SC mirror primitives
+        // are reachable on this ROM. Verdict lands in logcat as MIRROR-PROBE.
+        runCatching {
+            val verdict = backend?.probeMirrorCapability(glassesId) ?: "no backend"
+            Log.w(TAG, "MIRROR-PROBE verdict → $verdict")
+        }.onFailure { Log.w(TAG, "MIRROR-PROBE call failed: ${it.message}") }
+        // Passive report of the XREAL's native color modes — informs whether
+        // the panel offers a gamma/EOTF alternative we lost with the shader.
+        runCatching {
+            val modes = backend?.getDisplayColorModes(glassesId) ?: "no backend"
+            Log.w(TAG, "COLOR-MODES disp=$glassesId → ${modes.trim().take(300)}")
+        }.onFailure { Log.w(TAG, "COLOR-MODES probe failed: ${it.message}") }
         return vdId
     }
 
@@ -250,6 +416,7 @@ class AirGlassesSession(private val backendProvider: () -> BoundShellBackend?) {
     fun stop() {
         val vdId = virtualDisplayId
         val glassesId = physicalGlassesId
+        clearPhysicalDisplayModePin(glassesId)
         if (vdId >= 0) {
             runCatching { backend?.stopSurfaceMirror(glassesId) }
             if (appVd != null) {

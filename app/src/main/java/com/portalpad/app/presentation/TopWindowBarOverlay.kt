@@ -927,14 +927,33 @@ class TopWindowBarOverlay(
         if (secs <= 0) return
         val s = scope ?: return
         autoHideJob = s.launch {
-            kotlinx.coroutines.delay(secs * 1000L)
-            // Only hide if we're idle (not mid Move/Resize) and still shown.
-            if (shown && mode == Mode.IDLE) {
+            while (true) {
+                kotlinx.coroutines.delay(secs * 1000L)
+                if (!shown) return@launch
+                // HOVER HOLD: a cursor parked anywhere over the bar (or a grab
+                // in progress) must not have the bar hide under it — re-arm a
+                // full window and check again, so the bar hides only a full
+                // duration after the cursor LEAVES.
+                if (mode != Mode.IDLE || cursorOverBar()) continue
                 suppressRevealUntilExit = true
                 setShown(false)
+                return@launch
             }
         }
     }
+
+    /** Whether the injected cursor currently sits over the visible bar's
+     *  on-screen rect (small grace margin so the very edge still counts). */
+    private fun cursorOverBar(): Boolean = runCatching {
+        val c = container ?: return@runCatching false
+        if (c.visibility != View.VISIBLE || c.width == 0) return@runCatching false
+        val loc = IntArray(2)
+        c.getLocationOnScreen(loc)
+        val (x, y) = injector.cursorPosition.value
+        val pad = 12f
+        x >= loc[0] - pad && x <= loc[0] + c.width + pad &&
+            y >= loc[1] - pad && y <= loc[1] + c.height + pad
+    }.getOrDefault(false)
 
     /** Update the proxy outline as the cursor moves. MOVE translates the whole
      *  rect so its top-left follows the cursor; RESIZE holds the top-left and

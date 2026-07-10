@@ -84,8 +84,16 @@ class AirMouseController(
     @Volatile
     var accelStrength: Float = 1.0f
 
-    private var smoothDx = 0f
-    private var smoothDy = 0f
+    // One-Euro filter state: raw deltas accumulate into a virtual position,
+    // the filter smooths THAT, and the emitted delta is the filtered diff.
+    // Adaptive: heavy smoothing when nearly still (kills jitter), backing off
+    // as speed rises (kills the lag/"trail" a fixed moving average causes).
+    private var vX = 0f
+    private var vY = 0f
+    private var lastFx = 0f
+    private var lastFy = 0f
+    private val filterX = OneEuroFilter()
+    private val filterY = OneEuroFilter()
 
     fun start() {
         val sensor = rotationSensor ?: run {
@@ -93,9 +101,12 @@ class AirMouseController(
             return
         }
         initialized = false
-        smoothDx = 0f
-        smoothDy = 0f
-        sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME)
+        vX = 0f; vY = 0f; lastFx = 0f; lastFy = 0f
+        filterX.reset(); filterY.reset()
+        // FASTEST (2-5ms typical) vs GAME (20ms): ~15ms less pointer latency
+        // for trivially more battery while the mode is active. The One-Euro
+        // filter is timestamp-driven, so it self-adapts to the rate.
+        sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_FASTEST)
         Log.d(TAG, "Air mouse started")
     }
 
@@ -157,15 +168,31 @@ class AirMouseController(
         val rawDx = xSign * dYaw * sensitivity * 100f
         val rawDy = ySign * dPitch * sensitivity * 100f
 
-        // Exponential smoothing to take the jitter out of raw sensor deltas.
-        // smoothDx = a*raw + (1-a)*prev, where a = 1 - smoothing.
-        val a = (1f - smoothing).coerceIn(0.05f, 1f)
-        smoothDx = a * rawDx + (1f - a) * smoothDx
-        smoothDy = a * rawDy + (1f - a) * smoothDy
-
+        // One-Euro smoothing (replaces the old fixed EMA, whose smoothing/lag
+        // tradeoff was inherent: "higher = smoother but laggier"). The pref
+        // keeps its meaning — 0 = off; higher = stronger stillness smoothing —
+        // mapped to the filter's minimum cutoff frequency. beta controls how
+        // aggressively smoothing releases with speed.
+        var outX: Float
+        var outY: Float
+        if (smoothing <= 0f) {
+            outX = rawDx
+            outY = rawDy
+        } else {
+            val minCutoff = ((1f - smoothing) * 3f).coerceAtLeast(0.3f)
+            vX += rawDx
+            vY += rawDy
+            val t = event.timestamp
+            val fx = filterX.filter(vX, t, minCutoff, ONE_EURO_BETA)
+            val fy = filterY.filter(vY, t, minCutoff, ONE_EURO_BETA)
+            outX = fx - lastFx
+            outY = fy - lastFy
+            lastFx = fx
+            lastFy = fy
+        }
         // Snap tiny residual to zero so the cursor fully settles.
-        val outX = if (abs(smoothDx) < 0.01f) 0f else smoothDx
-        val outY = if (abs(smoothDy) < 0.01f) 0f else smoothDy
+        if (abs(outX) < 0.01f) outX = 0f
+        if (abs(outY) < 0.01f) outY = 0f
 
         if (outX != 0f || outY != 0f) {
             // Pointer acceleration — its own scale, since the air-mouse output
@@ -189,5 +216,46 @@ class AirMouseController(
         // changes don't require action.
     }
 
-    companion object { private const val TAG = "AirMouseController" }
+    companion object {
+        private const val TAG = "AirMouseController"
+
+        /** One-Euro speed-release aggressiveness: how quickly smoothing backs
+         *  off as the hand speeds up. Higher = trail disappears sooner at
+         *  speed but more jitter bleeds through during medium motion. */
+        private const val ONE_EURO_BETA = 0.02f
+    }
+
+    /**
+     * One-Euro filter (Casiez et al.) — adaptive low-pass: cutoff frequency
+     * rises with the signal's speed, so it smooths hard near stillness and
+     * gets out of the way during fast motion. Timestamp-driven, so sensor
+     * rate changes don't alter the feel.
+     */
+    private class OneEuroFilter(private val dCutoff: Float = 1f) {
+        private var xPrev = 0f
+        private var dxPrev = 0f
+        private var tPrevNs = 0L
+        private var init = false
+
+        fun reset() { init = false }
+
+        fun filter(x: Float, tNs: Long, minCutoff: Float, beta: Float): Float {
+            if (!init) {
+                init = true
+                xPrev = x; dxPrev = 0f; tPrevNs = tNs
+                return x
+            }
+            val dt = ((tNs - tPrevNs).coerceAtLeast(1L)) / 1_000_000_000f
+            tPrevNs = tNs
+            fun alpha(cutoff: Float): Float {
+                val r = 2f * Math.PI.toFloat() * cutoff * dt
+                return r / (r + 1f)
+            }
+            val dx = (x - xPrev) / dt
+            dxPrev += alpha(dCutoff) * (dx - dxPrev)
+            val a = alpha(minCutoff + beta * abs(dxPrev))
+            xPrev += a * (x - xPrev)
+            return xPrev
+        }
+    }
 }

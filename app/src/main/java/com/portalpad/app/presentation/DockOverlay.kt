@@ -59,6 +59,15 @@ import kotlinx.coroutines.runBlocking
  * even with the permission. If the dock doesn't show, the user can switch to
  * Presentation mode in Settings → Dock.
  */
+/**
+ * 213 dpi ÷ 160 = 1.33 — the dock's fixed layout density. Must stay in sync with
+ * DockBar.BASELINE_DENSITY (private there): DockBar computes
+ * `dpiComp = BASELINE_DENSITY / LocalDensity.current.density`, so providing this
+ * exact value makes dpiComp resolve to 1.0 and leaves every dp/sp — derived AND
+ * raw — at a fixed on-screen size regardless of the external-display DPI slider.
+ */
+private const val DOCK_BASELINE_DENSITY = 1.33f
+
 class DockOverlay(
     serviceContext: Context,
     val display: Display,
@@ -81,6 +90,9 @@ class DockOverlay(
     override val viewModelStore: ViewModelStore get() = _viewModelStore
 
     private var view: View? = null
+    /** Invoked once, when the dock window has genuinely attached — the hook
+     *  the service uses to re-add the cursor overlay ABOVE the dock. */
+    var onWindowAttached: (() -> Unit)? = null
     /** Live window params for the dock window, so we can expand it to
      *  full-screen while a long-press menu / folder popup is open (those modals
      *  use fillMaxSize and need room) and restore the bar size afterward. */
@@ -118,27 +130,39 @@ class DockOverlay(
         savedStateRegistryController.performRestore(null)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
 
-        // Read the display's REAL density first so the dock content is laid out
-        // at the same pixel scale the window is sized in. The window span is
-        // computed in real display pixels (metrics.widthPixels * pct) and centered
-        // by gravity; if the Compose content used a DIFFERENT density (it used to
-        // be pinned to 360dpi = 2.25), the content would lay out narrower than the
-        // window and sit in the top-left — making the whole bar look shifted left
-        // on displays whose real density isn't 2.25. Matching the real density
-        // makes the content fill (and thus center within) the window.
+        // PIN the dock's layout density to the 213-dpi baseline (1.33) — the same
+        // constant DockBar.BASELINE_DENSITY uses, and the value this display already
+        // reports at "Auto" (its physical 100 dpi falls outside the 120..480 accept
+        // window, so Auto falls back to 213). Pinning here is what actually makes the
+        // dock DPI-proof: the DPI slider drives `wm density` on the VD, and Compose
+        // converts EVERY dp/sp with the density it's given. Compensating individual
+        // values (dpiComp) only fixed the values it touched — the dock's many raw
+        // constants (band thickness +21f, status glyph .size(28.dp), padding 10.dp,
+        // the icon-width budget 84f/40f, chevron, badge, tooltip) still tripled at
+        // 640 dpi, blowing up the layout. With the density pinned, dpiComp in DockBar
+        // self-computes to 1.0 and raw + derived values alike render at a fixed size.
+        //
+        // NOTE the historical regression this must not reintroduce: content pinned to
+        // a density that DISAGREES with the window's pixel scale laid out narrower
+        // than the window and sat top-left. That pin was 2.25 (360dpi) against a real
+        // 1.33 display. This pins to 1.33 — equal to the real density at Auto — so at
+        // Auto the layout is pixel-identical to today, and off-Auto it simply holds
+        // that same Auto layout instead of scaling. The window span itself is raw
+        // pixels (widthPixels * pct), which the DPI slider never changes.
         val realMetrics = DisplayMetrics().also { display.getRealMetrics(it) }
+        @Suppress("UNUSED_VARIABLE")
         val displayDensity = realMetrics.density.coerceAtLeast(0.5f)
+        val pinnedDensity = DOCK_BASELINE_DENSITY
         val composeView = ComposeView(displayContext).apply {
             setViewTreeLifecycleOwner(this@DockOverlay)
             setViewTreeSavedStateRegistryOwner(this@DockOverlay)
             setViewTreeViewModelStoreOwner(this@DockOverlay)
             setContent {
-                // Lay out at the display's REAL density (not a fixed 2.25) so the
-                // content matches the real-pixel window span and centers correctly.
-                // fontScale pinned to 1f for consistent text sizing.
+                // Lay out at the PINNED baseline density (not the live VD density) so
+                // the DPI slider can never resize the dock. fontScale pinned to 1f.
                 androidx.compose.runtime.CompositionLocalProvider(
                     androidx.compose.ui.platform.LocalDensity provides
-                        androidx.compose.ui.unit.Density(displayDensity, 1f),
+                        androidx.compose.ui.unit.Density(pinnedDensity, 1f),
                 ) {
                     PortalPadTheme { OverlayContent() }
                 }
@@ -206,9 +230,55 @@ class DockOverlay(
             // display-wide IME re-layout that would dismiss Chrome's
             // dropdown. (See CursorOverlay for the full explanation.)
             softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
+            // Refresh-rate hint — matters on the RAW-FALLBACK path, where apps
+            // render straight to the physical display and nothing else in the
+            // app votes for a mode (VirtualDisplayMirror does on the VD path).
+            // Some panels ship a >60Hz mode the system never selects by
+            // default (seen in the wild: XBX A01+ with a 90Hz mode sitting
+            // unused at 60). Request the highest mode at the CURRENT
+            // resolution. Self-gating: an app-created VD reports exactly one
+            // mode, so this is a no-op there; a request, not a command — the
+            // OEM's mode policy has the final say.
+            runCatching {
+                val cur = display.mode
+                val best = display.supportedModes
+                    .filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+                    .maxByOrNull { it.refreshRate }
+                if (best != null && best.refreshRate > cur.refreshRate + 0.5f) {
+                    preferredDisplayModeId = best.modeId
+                    Log.d(
+                        TAG,
+                        "Refresh: dock hint ${"%.1f".format(best.refreshRate)}Hz " +
+                            "modeId=${best.modeId} on display ${display.displayId} " +
+                            "(was ${"%.1f".format(cur.refreshRate)}Hz)",
+                    )
+                }
+            }
         }
 
+        // One-shot notification when this view is ACTUALLY attached to its
+        // window. addView schedules the attach on a later traversal, so
+        // "addView returned" ≠ "window exists" — the cursor z-order reassert
+        // must key on the real attach (registered BEFORE addView so a
+        // synchronous attach can't slip past; isAttachedToWindow re-checked
+        // after as a belt).
+        var attachFired = false
+        fun fireAttached() {
+            if (attachFired) return
+            attachFired = true
+            onWindowAttached?.invoke()
+        }
+        composeView.addOnAttachStateChangeListener(
+            object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {
+                    v.removeOnAttachStateChangeListener(this)
+                    fireAttached()
+                }
+                override fun onViewDetachedFromWindow(v: View) {}
+            },
+        )
         windowManager.addView(composeView, params)
+        if (composeView.isAttachedToWindow) fireAttached()
         liveParams = params
         barSpanW = spanW
         barSpanH = spanH
@@ -790,6 +860,13 @@ class DockOverlay(
         } else {
             Log.d(TAG, "launchFromDock: desktop=$desktop asWindow=false → startActivityOnDisplay $component on disp ${display.displayId}")
             app.access.startActivityOnDisplay(component, display.displayId)
+            // Fullscreen/extend launches don't go through launchFreeform, so the
+            // permission-dialog watch was never armed here — a first-run app (e.g.
+            // Kindle) could spawn a transparent GrantPermissionsActivity on the
+            // external display and black it out, undetected. Arm the shell watch
+            // for this launch too, in fullscreen mode so any consent relaunch
+            // comes back fullscreen (not as a freeform window).
+            runCatching { app.freeform.armDialogShellWatch(component, display.displayId, freeform = false) }
         }
     }
 

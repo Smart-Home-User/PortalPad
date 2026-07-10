@@ -159,8 +159,21 @@ class InputInjector(
     val cursorOnCaption: StateFlow<Boolean> = _onCaption.asStateFlow()
     // Throttled snapshot of freeform windows — listTasks() hits the task system,
     // so we never call it per-move; geometry runs against this cache.
-    private var cachedResizeTasks: List<RunningTask> = emptyList()
-    private var lastResizeTaskCacheAt = 0L
+    @Volatile private var cachedResizeTasks: List<RunningTask> = emptyList()
+    @Volatile private var lastResizeTaskCacheAt = 0L
+    @Volatile private var resizeScanInFlight = false
+
+    /** Dedicated thread for the resize-hover window scan. `listTasks` is a
+     *  full shell round-trip (`am stack list` through the privileged backend,
+     *  20-100ms) — it previously ran SYNCHRONOUSLY inside [pointerMove] every
+     *  time the 250ms cache expired, i.e. on the thread delivering touch
+     *  events, hitching the cursor 4x/sec in desktop mode. Not the inject
+     *  executor: parking a shell call there would delay queued hover/click
+     *  injections behind it. */
+    private val resizeScanExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "portalpad-resize-scan").apply { isDaemon = true }
+        }
 
     /** On cursor move, if it's hovering a resizable freeform window's edge/corner,
      *  switch the cursor to the matching resize glyph. Gated so it's never a dead
@@ -173,12 +186,27 @@ class InputInjector(
             if (_onCaption.value) _onCaption.value = false
             return
         }
-        val now = System.currentTimeMillis()
-        if (now - lastResizeTaskCacheAt > RESIZE_CACHE_TTL_MS) {
-            cachedResizeTasks = runCatching {
-                PortalPadApp.instance.freeform.listTasks(displayId)
-            }.getOrDefault(emptyList())
-            lastResizeTaskCacheAt = now
+        // Refresh the window-bounds cache ASYNCHRONOUSLY (single-flight): keep
+        // hit-testing against the stale bounds until fresh ones land — 250ms
+        // staleness was already the accepted design, so an extra ~50ms of
+        // shell latency is invisible, whereas paying it on this thread was
+        // not. Monotonic clock: wall time jumps (NTP/user) broke the TTL.
+        val now = SystemClock.uptimeMillis()
+        if (now - lastResizeTaskCacheAt > RESIZE_CACHE_TTL_MS && !resizeScanInFlight) {
+            resizeScanInFlight = true
+            val scanDisplayId = displayId
+            runCatching {
+                resizeScanExecutor.execute {
+                    try {
+                        cachedResizeTasks = runCatching {
+                            PortalPadApp.instance.freeform.listTasks(scanDisplayId)
+                        }.getOrDefault(emptyList())
+                        lastResizeTaskCacheAt = SystemClock.uptimeMillis()
+                    } finally {
+                        resizeScanInFlight = false
+                    }
+                }
+            }.onFailure { resizeScanInFlight = false }
         }
         // Topmost window under the cursor — only a thin strip hugging each edge
         // counts (a little outside, a little inside), so the arrow sits on the
@@ -751,6 +779,24 @@ class InputInjector(
     /** Publish the latest cursor position and ensure a drain is scheduled.
      *  Returns immediately — no IPC on the caller (gesture) thread. */
     private fun scheduleHoverInject(x: Float, y: Float) {
+        // While the a11y input path is active (untrusted display), backend
+        // hover events are at best useless (Shizuku events don't land in
+        // foreign windows there) and at worst they RACE the a11y gestures and
+        // get them cancelled — the Sony trackpad bug. Suppress the stream and
+        // park any pointer left over from before the a11y state applied.
+        // Throttled log so user-submitted captures show this mode is active.
+        if (useA11y()) {
+            pendingHover.set(null)
+            val now = SystemClock.uptimeMillis()
+            if (now - lastHoverLogAt > 1000) {
+                Log.d(TAG, "hover SUPPRESSED (a11y input path active) disp=$displayId")
+                lastHoverLogAt = now
+            }
+            if (hoverActive) {
+                runCatching { injectExecutor.execute { sendHoverExitViaBackend(x, y) } }
+            }
+            return
+        }
         pendingHover.set(floatArrayOf(x, y))
         if (hoverDrainScheduled.compareAndSet(false, true)) {
             runCatching {
@@ -896,9 +942,18 @@ class InputInjector(
         // normal backend if the a11y service isn't connected / can't dispatch.
         if (displayId != 0 && (!usingVd || !activeBackendReady())) {
             val svc = PortalPadAccessibilityService.instance
-            if (svc != null && svc.dispatchTap(displayId, x.toFloat(), y.toFloat())) {
-                debugToast("Left click → a11y gesture display=$displayId ($x,$y)")
-                return@safe
+            if (svc != null) {
+                // Park any injected mouse hover FIRST (mirrors the Shizuku
+                // branch below): a live backend hover pointer racing the a11y
+                // gesture gets the gesture cancelled by the dispatcher — the
+                // Sony "trackpad taps don't register / air mouse fine" bug
+                // (trackpad = finger moving ms before the tap = hover in
+                // flight; air mouse = still when clicking = clean pipeline).
+                sendHoverExitViaBackend(x.toFloat(), y.toFloat())
+                if (svc.dispatchTap(displayId, x.toFloat(), y.toFloat())) {
+                    debugToast("Left click → a11y gesture display=$displayId ($x,$y)")
+                    return@safe
+                }
             }
         }
         val backend = PortalPadApp.instance.clickBackend
@@ -986,9 +1041,20 @@ class InputInjector(
         // the long-press through the a11y framework so it lands in foreign apps.
         if (displayId != 0 && (!usingVd || !activeBackendReady())) {
             val svc = PortalPadAccessibilityService.instance
-            if (svc != null && svc.dispatchLongPress(displayId, x.toFloat(), y.toFloat(), 1200L)) {
-                debugToast("Right click → a11y long-press display=$displayId ($x,$y)")
-                return@safe
+            if (svc != null) {
+                // Park any injected hover first — see leftClick.
+                sendHoverExitViaBackend(x.toFloat(), y.toFloat())
+                // 600ms, was 1200ms: still comfortably a long-press to apps
+                // (ViewConfiguration's default is ~400ms), but half the window
+                // during which the single-gesture a11y pipe is OCCUPIED — the
+                // Sony log showed 19 of 22 of these cancelled by the user's
+                // next input fighting through, each one a 1.2s dead zone that
+                // read as "input not ready". Also halves the overshoot when a
+                // resting finger triggers touch-hold select unintentionally.
+                if (svc.dispatchLongPress(displayId, x.toFloat(), y.toFloat(), 600L)) {
+                    debugToast("Right click → a11y long-press display=$displayId ($x,$y)")
+                    return@safe
+                }
             }
         }
         val backend = PortalPadApp.instance.clickBackend
@@ -1036,6 +1102,20 @@ class InputInjector(
             PortalPadApp.instance.lastGlassesTapAt = android.os.SystemClock.elapsedRealtime()
         }
         emitClickEvent(x.toFloat(), y.toFloat())
+        // Accessibility fallback (see leftClick) — previously MISSING here:
+        // singles routed a11y and landed while doubles went Shizuku-touch into
+        // the untrusted display and vanished, i.e. "double tap reads as single
+        // tap" on Sony-type devices. One atomic two-stroke gesture.
+        if (displayId != 0 && (!usingVd || !activeBackendReady())) {
+            val svc = PortalPadAccessibilityService.instance
+            if (svc != null) {
+                sendHoverExitViaBackend(x.toFloat(), y.toFloat())
+                if (svc.dispatchDoubleTap(displayId, x.toFloat(), y.toFloat())) {
+                    debugToast("Double click → a11y double-tap display=$displayId ($x,$y)")
+                    return@safe
+                }
+            }
+        }
         val backend = PortalPadApp.instance.clickBackend
 
         when (backend) {
@@ -1086,11 +1166,15 @@ class InputInjector(
         val endX = (cx - scrollAccumX * 2).toInt().coerceIn(0, displayWidth - 1)
         val endY = (cy - scrollAccumY * 2).toInt().coerceIn(0, displayHeight - 1)
         // GUARD: a swipe whose start and end are nearly the same point is
-        // interpreted by Android as a TAP/CLICK, not a scroll. Below the real-
-        // swipe threshold we no longer DROP the motion — we keep accumulating it
-        // until it crosses the threshold, so slow scrolls aren't lost.
+        // interpreted by Android as a TAP/CLICK, not a scroll — and a SHORT
+        // swipe dispatched via the a11y path is short enough that some apps
+        // (e.g. Chrome) still register it as a tap on whatever's under the
+        // cursor. So we require a larger minimum travel before injecting: below
+        // it we keep accumulating (slow scrolls aren't lost), and once we cross
+        // it the injected gesture is unambiguously a swipe. This is what stops a
+        // near-stationary edge-strip hold from landing as a click.
         val travel = kotlin.math.hypot((endX - cx).toDouble(), (endY - cy).toDouble())
-        if (travel < 8.0) {
+        if (travel < 24.0) {
             return@safe
         }
         // The accumulated motion is being delivered as this swipe — clear it.
@@ -1346,6 +1430,36 @@ class InputInjector(
     }
 
     /**
+     * A complete key PRESS (down → 12ms → up) carrying [metaState], for typing
+     * shifted characters from the relay keyboard: capitals and symbols like
+     * @ # $ & * ( ) " : ! ? need META_SHIFT_ON on the key events themselves.
+     * The 12ms gap matches the server-side injectKeyPressInternal spacing —
+     * without a real gap the dispatcher silently drops occasional presses.
+     * Runs on keyExecutor (12ms there costs nothing user-visible). Shell
+     * fallback is degraded (input keyevent can't carry meta) and only fires
+     * for meta-less presses so it can never type the WRONG character.
+     */
+    fun pressKeyWithMeta(keycode: Int, metaState: Int) = safe {
+        val targetDisplay = displayId
+        keyExecutor.execute {
+            try {
+                when (val backend = PortalPadApp.instance.clickBackend) {
+                    is ClickBackend.ShizukuUserService -> if (backend.backend.isReady) {
+                        backend.backend.injectKey(keycode, KeyEvent.ACTION_DOWN, metaState, targetDisplay)
+                        try { Thread.sleep(12) } catch (_: InterruptedException) {}
+                        backend.backend.injectKey(keycode, KeyEvent.ACTION_UP, metaState, targetDisplay)
+                    }
+                    is ClickBackend.Shell -> if (metaState == 0 && access.isReady) {
+                        access.execShell("input ${displayFlag()}keyevent $keycode")
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "pressKeyWithMeta failed keycode=$keycode meta=$metaState", t)
+            }
+        }
+    }
+
+    /**
      * Inject a raw hardware-keyboard key edge on the external display for the
      * physical-keyboard relay (the combo device captured by the mouse pipeline).
      * Forwards the literal DOWN/UP and [metaState] (Shift/Ctrl/Alt) so capitals,
@@ -1535,6 +1649,16 @@ class InputInjector(
      *  keyboard. (A non-default policy left on a VD that's then destroyed wedges
      *  IME placement on some OEMs until reboot.) */
     private val touchedImeDisplays = java.util.Collections.synchronizedSet(mutableSetOf<Int>())
+
+    /** Last IME policy successfully APPLIED per display. Every write goes
+     *  through a dedupe against this: setting a display's IME policy — even
+     *  to the SAME value — forces a display-wide IME re-layout, and Chrome
+     *  dismisses its omnibox suggestion dropdown on that relayout (measured:
+     *  suggestions died at relay open AND close, both redundant writes for
+     *  the auto-relay config). Skipping no-op writes keeps the dropdown
+     *  alive through the relay's whole lifecycle. Entries clear on
+     *  resetImePolicy so a fresh session re-applies for real. */
+    private val imePolicyApplied = java.util.concurrent.ConcurrentHashMap<Int, Int>()
     fun repinImePolicy(aggressive: Boolean = true) {
         if (aggressive) {
             val aggressiveOn = aggressiveImeRepin
@@ -1562,8 +1686,13 @@ class InputInjector(
         // Constants: 0=LOCAL, 1=FALLBACK_DISPLAY, 2=HIDE.
         val imeOnExternal = imeOnExternalEnabled
         val policy = if (imeOnExternal) 0 else if (autoOpenRelayEnabled) 2 else 1
+        if (imePolicyApplied[targetDisplay] == policy) {
+            Log.d(TAG, "repin NO-OP disp=$targetDisplay policy=$policy already applied (dropdown-safe)")
+            return
+        }
         val ok = runCatching { shizuku.setImePolicy(targetDisplay, policy) }.getOrDefault(false)
         Log.d(TAG, "repin disp=$targetDisplay policy=$policy (imeOnExternal=$imeOnExternal autoOpenRelay=$autoOpenRelayEnabled) aggressive=$aggressive ok=$ok")
+        if (ok) imePolicyApplied[targetDisplay] = policy
         lastImePolicyDisplay = targetDisplay
         touchedImeDisplays.add(targetDisplay)
     }
@@ -1608,13 +1737,23 @@ class InputInjector(
             // that cascade so the phone keyboard stays up. (Was previously set
             // to 1=FALLBACK_DISPLAY, which does NOT stop the request — the
             // relay keyboard kept vanishing after one keystroke.)
+            if (imePolicyApplied[targetDisplay] == 2) {
+                Log.d(TAG, "relay IME mode ON: disp=$targetDisplay already HIDE — NO-OP (dropdown survives)")
+                return
+            }
             val ok = runCatching { shizuku.setImePolicy(targetDisplay, 2) }.getOrDefault(false)
+            if (ok) imePolicyApplied[targetDisplay] = 2
             touchedImeDisplays.add(targetDisplay)
             Log.d(TAG, "relay IME mode ON: disp=$targetDisplay policy=2(HIDE) ok=$ok")
         } else {
-            // Restore normal policy (HIDE → LOCAL via repin).
-            repinImePolicy(aggressive = false)
-            Log.d(TAG, "relay IME mode OFF: restored normal policy on disp=$targetDisplay")
+            // LAZY restore — deliberately NO policy write here. The eager
+            // repin at relay close forced the IME relayout that dismissed
+            // Chrome's suggestion dropdown the instant the user tapped X,
+            // making suggestions unclickable. The per-key repin machinery
+            // (deduped above) restores the pref-correct policy the next time
+            // a path actually needs it, and resetImePolicy still cleans up at
+            // disconnect. Until then the dropdown stays up for the trackpad.
+            Log.d(TAG, "relay IME mode OFF: policy left as-is (lazy restore; dropdown survives)")
         }
     }
 
@@ -1683,7 +1822,10 @@ class InputInjector(
         for (d in displays) {
             val ok = runCatching { shizuku.setImePolicy(d, 0) }.getOrDefault(false)
             Log.d(TAG, "resetImePolicy disp=$d -> 0(LOCAL) ok=$ok")
-            if (ok) touchedImeDisplays.remove(d)
+            if (ok) {
+                touchedImeDisplays.remove(d)
+                imePolicyApplied.remove(d)
+            }
         }
         if (touchedImeDisplays.isEmpty()) lastImePolicyDisplay = -1
     }
