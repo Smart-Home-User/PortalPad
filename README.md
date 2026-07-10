@@ -2,7 +2,7 @@
 
 > **Update (07/09/2026):** DRM-protected streaming now works with PortalPad's latest v1.3-beta release on several major services.
 >
-> **Tested working:** Amazon Prime Video, Disney+, Hulu (via the Disney+ app), Peacock, Paramount+\
+> **Tested working:** Amazon Prime Video, Disney+, Hulu (via the Disney+ app), Netflix, Peacock, Paramount+\
 > **Not working:** Hulu (standalone app)
 >
 > **Getting DRM apps to play:** turn on **System mirror** in Display settings — from the Start page, or from the display settings inside the Trackpad / Air Mouse / Remote interface.
@@ -169,7 +169,7 @@ Most of these are optional and only asked for when you use the related feature.
 
 ## Known limitations
 
-- **DRM-protected streaming needs System mirror** — with **System mirror** enabled (Display settings, from the Start page or the Trackpad / Air Mouse / Remote interface), many services play on the external display. Tested working: Amazon Prime Video, Disney+, Hulu via the Disney+ app, Peacock, and Paramount+. The standalone Hulu app still refuses, and untested services may vary. Without System mirror, DRM playback generally won't start — the overlay display path looks like screen capture to these apps.
+- **DRM-protected streaming needs System mirror** — with **System mirror** enabled (Display settings, from the Start page or the Trackpad / Air Mouse / Remote interface), many services play on the external display. Tested working: Amazon Prime Video, Disney+, Hulu via the Disney+ app, Netflix, Peacock, and Paramount+. The standalone Hulu app still refuses, and untested services may vary. Without System mirror, DRM playback generally won't start — the overlay display path looks like screen capture to these apps.
 - **Several streaming apps open at once can pause each other** — in desktop-windows mode every visible window stays active, and a streaming app's home screen autoplaying preview trailers grabs audio focus from the one actually playing, which then politely pauses. This is standard Android audio-focus behavior meeting multi-window; PortalPad isn't involved. Fix: turn off autoplay previews in each streaming app's settings, or park idle streaming windows on a screen that doesn't autoplay.
 
 ## License
