@@ -66,9 +66,18 @@ class VirtualDisplayMirror(
      * IS exempt from that hide — the same fix already proven for the cursor, dock,
      * and floating bubble. Resolved per-attempt (not cached in a field) so a retry
      * after the a11y service binds can upgrade 2038 → 2032. Falls back to 2038 when
-     * a11y isn't bound, which is exactly today's behaviour — never worse.
+     * a11y isn't bound, which is exactly today's behaviour — never worse. The attach
+     * ladder in [show] also flips [forceOverlay2038] on after 2032 token-nulls twice
+     * on a reconnected physical display, escalating the remaining retries to 2038.
      */
-    private fun resolveHost(): OverlayHost = OverlayHost.forDisplay(display, serviceContext)
+    private fun resolveHost(): OverlayHost =
+        OverlayHost.forDisplay(display, serviceContext, force2038 = forceOverlay2038)
+
+    // Set true by [show]'s catch after the 2032 attach token-nulls repeatedly on a
+    // fresh physical display (BadTokenException at addView). Escalates the remaining
+    // retries to 2038, whose token is valid the moment the display exists. Per-
+    // instance: a new mirror (fresh connect) starts back at the preferred 2032.
+    @Volatile private var forceOverlay2038: Boolean = false
 
     // Fallback context/WM for the 2038 path and for callers that need a display
     // context outside show(). The host resolved in show() is authoritative for the
@@ -131,7 +140,19 @@ class VirtualDisplayMirror(
 
     val isGlActive: Boolean get() = glRenderer != null
 
+    /** True once a real VD frame has flowed through the GL renderer (mirror is
+     *  pumping). False on a bound-but-stuck mirror sitting on its black init
+     *  frame — the service polls this after attach to auto-kick a composition. */
+    val hasPresentedContentFrame: Boolean get() = glRenderer?.hasPresentedContentFrame ?: false
+
     val isAttached: Boolean get() = attached
+
+    /** True when the mirror is attached on the degraded 2038 fallback (the 2032
+     *  a11y overlay token wasn't ready at attach — e.g. accessibility not yet bound
+     *  on a fresh install). 2038 renders but is force-hidden by the system, so the
+     *  panel looks black. The service re-attaches (upgrading to a visible 2032) once
+     *  accessibility connects. */
+    val isOnFallbackOverlay: Boolean get() = attached && forceOverlay2038
     val displayId: Int get() = display.displayId
 
     private val surfaceCallback = object : SurfaceHolder.Callback {
@@ -161,6 +182,20 @@ class VirtualDisplayMirror(
         val metrics = android.util.DisplayMetrics().also { display.getRealMetrics(it) }
         val w = metrics.widthPixels.coerceAtLeast(1)
         val h = metrics.heightPixels.coerceAtLeast(1)
+
+        // DIAG (Xiaomi blur + input): compare the physical panel's native pixels
+        // and density against the SurfaceView we're rendering the VD into. If the
+        // surface is smaller than the panel the VD image is upscaled (blur), and
+        // if the VD was created at a different size than this surface the injected
+        // tap coordinate space won't line up (taps miss inside apps). Pair this
+        // with the "Starting AirGlassesSession WxH dpi" line (captured across a
+        // reconnect) to see the full VD → surface → panel scaling chain.
+        val sf = holder.surfaceFrame
+        Log.d(
+            TAG,
+            "DIAG-VDSIZE panel=${w}x$h densityDpi=${metrics.densityDpi} disp=${display.displayId} " +
+                "surfaceFrame=${sf.width()}x${sf.height()}",
+        )
 
         // Refresh-rate vote: request the panel's max rate. Self-guards to a no-op when
         // no higher mode exists; inert on the own-group VD but harmless and correct.
@@ -380,16 +415,40 @@ class VirtualDisplayMirror(
             // retry after a real attach is a no-op.
             if (attachRetries < MAX_ATTACH_RETRIES) {
                 val n = ++attachRetries
+                // Attach ladder: 2032 ×2 (attempts 1–2), then 2038 ×3 (attempts
+                // 3–5). The log shows 2032 token-nulling five times straight on a
+                // reconnected physical display (fresh id, a11y window token not
+                // registered yet), never self-healing → Android left the panel
+                // mirroring the phone. Two 2032 tries distinguish "just the
+                // synchronous onDisplayAdded attempt was too early" (retry #2,
+                // deferred ~250ms, would then succeed) from "2032 is unattachable
+                // on this id" — and if the deferred one still fails, escalate to
+                // 2038, whose token is valid the instant the display exists.
+                // Attach ladder: 2032 ×3 (attempts 1–3), then 2038 (attempts 4+).
+                // The log shows 2032 token-nulling on a fresh physical display /
+                // fresh install (a11y window token not registered yet), never self-
+                // healing → Android left the panel mirroring the phone. A few 2032
+                // tries give the accessibility service a moment to bind (its token
+                // becoming valid is what makes 2032 succeed); if it still fails,
+                // escalate to 2038 so SOMETHING shows — and the service re-attempts
+                // 2032 once a11y connects (see onAccessibilityConnected).
+                if (n >= 3 && !forceOverlay2038) {
+                    forceOverlay2038 = true
+                    Log.w(TAG, "DIAG-OVL escalating mirror overlay 2032 → 2038 on display " +
+                        "${display.displayId} (2032 token-null after $n attempts)")
+                }
                 val delayMs = 250L * n
-                Log.w(TAG, "Retrying VD mirror overlay attach in ${delayMs}ms (attempt $n/$MAX_ATTACH_RETRIES)")
+                val nextType = if (forceOverlay2038) 2038 else 2032
+                Log.w(TAG, "Retrying VD mirror overlay attach in ${delayMs}ms " +
+                    "(attempt $n/$MAX_ATTACH_RETRIES, next type=$nextType)")
                 runCatching { oh.windowManager.removeView(host) }
                 retryHandler.postDelayed({ if (!attached) show() }, delayMs)
             } else {
                 Log.e(
                     TAG,
                     "VD mirror overlay attach FAILED after $MAX_ATTACH_RETRIES attempts on display " +
-                        "${display.displayId} — the external display will stay black. Check the " +
-                        "'Display over other apps' permission (this window is TYPE_APPLICATION_OVERLAY).",
+                        "${display.displayId} (tried 2032 then 2038) — the external display will stay " +
+                        "black. Check the 'Display over other apps' permission.",
                 )
             }
         }
@@ -459,6 +518,13 @@ class VirtualDisplayMirror(
         return runCatching { r.setScreenTransform(scale, offsetX, offsetY); true }.getOrDefault(false)
     }
 
+    /** Suppress/restore the parented performance HUD while the widget overlay
+     *  is shown (the overlay renders above it). Passes through to the HUD; no-op
+     *  when the HUD isn't attached (mirror mode uses the standalone HUD instead). */
+    fun setHudWidgetHidden(hidden: Boolean) {
+        hud?.setWidgetHidden(hidden)
+    }
+
     fun dismiss() {
         // Cancel any pending attach retry FIRST — this must run before the
         // `hostLayout ?: return` below, because a failed attach leaves hostLayout
@@ -517,7 +583,7 @@ class VirtualDisplayMirror(
     companion object {
         private const val TAG = "VDMirror"
         /** Attach attempts before we declare the panel unrecoverable and say why. */
-        private const val MAX_ATTACH_RETRIES = 4
+        private const val MAX_ATTACH_RETRIES = 6
         /** ~5 vsyncs at 60Hz. Long enough for SurfaceFlinger to composite and scan out
          *  the black frame queued by eglSwapBuffers before we destroy the layer. */
         private const val BLACK_SETTLE_MS = 80L

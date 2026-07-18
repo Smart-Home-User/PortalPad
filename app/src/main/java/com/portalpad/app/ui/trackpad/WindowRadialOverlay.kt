@@ -72,7 +72,7 @@ fun WindowRadialOverlay(onDismiss: () -> Unit) {
             !it.packageName.contains("nexuslauncher", ignoreCase = true) &&
             it.packageName != "com.portalpad.app"
     }
-    val hasMaximized = snap.maximizedId != null
+    val hasMaximized = snap.hasMaximized
     val hasSession = session?.windows?.isNotEmpty() == true
 
     fun isLive(id: String): Boolean = when (id) {
@@ -275,15 +275,19 @@ private val RING = listOf(
     Triple("restoreSession", "\u21BB", -36.0),
 )
 
-// Lower "window size" arch below center: minimize, restore-freeform, maximize.
+// Lower "window size" arch below center: minimize, restore-freeform, maximize,
+// window-top-bar. Angles MIRROR the upper RING (144/108/72/36 vs -144/-108/-72/-36)
+// at the same radius, so each arch button sits directly under a ring button —
+// aligned columns, evenly spaced, no overlap.
 private val ARCH = listOf(
-    Triple("minimize", "\u2212", 128.0),
-    Triple("restoreFreeform", "\u2750", 90.0),
-    Triple("maximize", "\u26F6", 52.0),
+    Triple("minimize", "\u2212", 144.0),
+    Triple("restoreFreeform", "\u2750", 108.0),
+    Triple("maximize", "\u26F6", 72.0),
+    Triple("windowTopBar", "\u25AD", 36.0),
 )
 
 private const val RING_RADIUS = 104.0
-private const val ARCH_RADIUS = 96.0
+private const val ARCH_RADIUS = 104.0
 
 private val META = mapOf(
     "arrangeEvenly" to Pair("\u2637", "Arrange evenly"),
@@ -292,6 +296,7 @@ private val META = mapOf(
     "restoreSession" to Pair("\u21BB", "Restore session"),
     "closeAll" to Pair("\u2715", "Close all"),
     "minimize" to Pair("\u2212", "Minimize"),
-    "restoreFreeform" to Pair("\u2750", "Restore freeform"),
+    "restoreFreeform" to Pair("\u2750", "Unmaximize"),
     "maximize" to Pair("\u26F6", "Maximize"),
+    "windowTopBar" to Pair("\u25AD", "Window top bar"),
 )

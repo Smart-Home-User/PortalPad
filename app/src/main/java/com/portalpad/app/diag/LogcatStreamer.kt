@@ -44,6 +44,12 @@ class LogcatStreamer {
     private val _state = MutableStateFlow(State.IDLE)
     val state: StateFlow<State> = _state.asStateFlow()
 
+    /** TRUE between [pause] and [resume] (or the next [start]). App-singleton
+     *  state, so leaving and re-entering the viewer can't silently restart a
+     *  capture the user paused — the viewer's open-time auto-start checks it. */
+    private val _userPaused = MutableStateFlow(false)
+    val userPaused: StateFlow<Boolean> = _userPaused.asStateFlow()
+
     enum class State { IDLE, RUNNING, NO_BACKEND, ERROR }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -51,11 +57,19 @@ class LogcatStreamer {
     /** The `su -c logcat` process when streaming via the root-shell fallback. */
     @Volatile private var rootProcess: Process? = null
 
+    /** Hard gate on the pump loop. Job.cancel() can't interrupt a BLOCKING
+     *  readLine(), so if the backend-side subprocess kill ever fails the old
+     *  pump kept appending lines after "Stop" — this makes stop authoritative:
+     *  once false, delivered lines are dropped and the loop exits. */
+    @Volatile private var acceptLines = true
+
     /** Max lines retained. Older lines drop off the front. */
     private val maxLines = 2000
 
     fun start(filter: String? = null) {
         if (_state.value == State.RUNNING) return
+        acceptLines = true
+        _userPaused.value = false
         val app = PortalPadApp.instance
         val backend = app.clickBackend
         when {
@@ -111,7 +125,9 @@ class LogcatStreamer {
             var process: Process? = null
             try {
                 // -v brief keeps lines compact; the filter spec selects tags.
-                process = ProcessBuilder("su", "-c", "logcat -v brief $spec")
+                // -T 1: from now, not the retained ring (see ShellUserService's
+                // streamLogcat for the field story).
+                process = ProcessBuilder("su", "-c", "logcat -v brief -T 1 $spec")
                     .redirectErrorStream(true)
                     .start()
                 rootProcess = process
@@ -130,9 +146,12 @@ class LogcatStreamer {
     }
 
     private suspend fun pumpLines(br: BufferedReader) {
-        // Stream line-by-line; append to the ring buffer.
-        while (true) {
+        // Stream line-by-line; append to the ring buffer. acceptLines is
+        // re-checked AFTER each blocking read so a stop() while blocked drops
+        // the in-flight line instead of appending it.
+        while (acceptLines) {
             val line = br.readLine() ?: break
+            if (!acceptLines) break
             _lines.update { current ->
                 if (current.size >= maxLines) {
                     current.drop(current.size - maxLines + 1) + line
@@ -142,6 +161,7 @@ class LogcatStreamer {
     }
 
     fun stop() {
+        acceptLines = false
         readerJob?.cancel()
         readerJob = null
         // Kill the root-shell logcat subprocess if we spawned one.
@@ -153,6 +173,18 @@ class LogcatStreamer {
         runCatching { backend?.backend?.stopLogcatStream() }
         _state.value = State.IDLE
     }
+
+    /** User pause: ACTUALLY stops capture (buffer kept). The old pause froze
+     *  the VIEW while the stream kept filling the buffer, so returning to the
+     *  screen revealed everything captured "while paused" — paused now means
+     *  no new lines, period. */
+    fun pause() {
+        _userPaused.value = true
+        stop()
+    }
+
+    /** Resume a user pause: restarts capture (clears the paused flag). */
+    fun resume() { start() }
 
     /** Clear the in-memory buffer (does NOT clear actual logcat). */
     fun clearBuffer() { _lines.value = emptyList() }

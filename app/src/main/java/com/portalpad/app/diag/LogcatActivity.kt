@@ -87,25 +87,25 @@ private fun LogcatScreen(onClose: () -> Unit) {
     val lines by streamer.lines.collectAsState()
     val state by streamer.state.collectAsState()
     val scope = rememberCoroutineScope()
-    var paused by remember { mutableStateOf(false) }
-    // When paused, freeze the view to a snapshot taken at the moment of pausing
-    // so newly-streamed lines don't scroll the content out from under the user.
-    // (The stream keeps filling the buffer in the background; we just stop
-    // showing the new lines until Resume.) Without this, "Pause" only stopped
-    // auto-scroll while lines kept appending — so it didn't feel paused.
-    var frozenLines by remember { mutableStateOf<List<String>>(emptyList()) }
-    val displayedLines = if (paused) frozenLines else lines
+    // Pause lives on the STREAMER (app singleton), and it actually stops
+    // capture — the old view-freeze model kept filling the buffer, and its
+    // remember{}-scoped flag reset on re-entry, so returning to the screen
+    // revealed everything captured "while paused" AND silently resumed.
+    val paused by streamer.userPaused.collectAsState()
+    val displayedLines = lines
     var showConsent by remember { mutableStateOf<Boolean?>(null) }
     var showStopConfirm by remember { mutableStateOf(false) }
     var statusMsg by remember { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
 
-    // Show consent once on first open (per install).
+    // Show consent once on first open (per install). A user pause survives
+    // leaving the screen — don't auto-restart over it.
     LaunchedEffect(Unit) {
         val consented = app.prefs.bool(
             PreferencesRepository.Keys.LOGCAT_CONSENT_SHOWN, default = false,
         ).first()
-        if (!consented) showConsent = true else streamer.start()
+        if (!consented) showConsent = true
+        else if (!streamer.userPaused.value) streamer.start()
     }
 
     // Auto-scroll to bottom when new lines arrive and not paused.
@@ -176,7 +176,8 @@ private fun LogcatScreen(onClose: () -> Unit) {
             // State chip
             val (stateLabel, stateColor) = when (state) {
                 LogcatStreamer.State.RUNNING -> "Streaming" to Color(0xFF4ADE80)
-                LogcatStreamer.State.IDLE -> "Idle" to AbOnSurfaceMuted
+                LogcatStreamer.State.IDLE ->
+                    (if (paused) "Paused" else "Idle") to AbOnSurfaceMuted
                 LogcatStreamer.State.NO_BACKEND ->
                     "Needs Shizuku or Root" to AbAccent
                 LogcatStreamer.State.ERROR -> "Error" to AbAccent
@@ -200,15 +201,7 @@ private fun LogcatScreen(onClose: () -> Unit) {
             // Action row
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
-                    onClick = {
-                        if (!paused) {
-                            // Pausing: snapshot the current lines so the view freezes.
-                            frozenLines = lines
-                            paused = true
-                        } else {
-                            paused = false
-                        }
-                    },
+                    onClick = { if (!paused) streamer.pause() else streamer.resume() },
                     colors = ButtonDefaults.buttonColors(containerColor = AbSurfaceElevated, contentColor = AbOnSurface),
                 ) { Text(if (paused) "Resume" else "Pause") }
                 Button(
@@ -221,10 +214,14 @@ private fun LogcatScreen(onClose: () -> Unit) {
                 ) { Text("Stop") }
                 Button(
                     onClick = {
+                        // Pause BEFORE snapshotting: the saved file is exactly
+                        // what's on screen, and capture doesn't keep running
+                        // behind the share sheet. Resume continues if wanted.
+                        streamer.pause()
                         scope.launch {
                             val file = saveLogToFile(ctx, streamer.snapshotText())
                             if (file != null) {
-                                statusMsg = "Saved ${file.name}"
+                                statusMsg = "Saved ${file.name} — capture paused"
                                 shareFile(ctx, file)
                             } else {
                                 statusMsg = "Save failed"
@@ -251,8 +248,6 @@ private fun LogcatScreen(onClose: () -> Unit) {
                     confirmButton = {
                         TextButton(onClick = {
                             showStopConfirm = false
-                            paused = false
-                            frozenLines = emptyList()
                             streamer.clearBuffer()
                             streamer.stop()
                             // Reset the consent flag so the next time the

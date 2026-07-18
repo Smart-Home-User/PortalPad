@@ -203,9 +203,85 @@ class MediaController(private val context: Context) {
     }
 
     private fun sendMediaKey(keyCode: Int) {
-        if (sendViaMediaSession(keyCode)) return
-        if (sendViaBroadcast(keyCode)) return
-        Log.w(TAG, "No path worked for media key $keyCode")
+        logSessions("key ${keyName(keyCode)}")
+        if (sendViaMediaSession(keyCode)) {
+            Log.i(TAG, "DIAG-MEDIA key ${keyName(keyCode)} -> session path returned OK")
+            return
+        }
+        if (sendViaBroadcast(keyCode)) {
+            Log.i(TAG, "DIAG-MEDIA key ${keyName(keyCode)} -> broadcast path returned OK")
+            return
+        }
+        Log.w(TAG, "DIAG-MEDIA key ${keyName(keyCode)} -> NO path worked")
+    }
+
+    // ─────────────────────────── DIAG-MEDIA instrumentation ───────────────────────
+    // Logcat-only. Dumps the active-session world on each user-initiated media key
+    // / seek so we can see whether the target app (e.g. Paramount+) publishes a
+    // MediaSession at all, its playback state, which transport actions it
+    // advertises, and which session we picked. "session path returned OK" means
+    // the dispatch call did not throw — NOT that the app acted on it: an app that
+    // ignores media-button events (as Netflix does for FF/REW) still returns OK.
+    private fun logSessions(reason: String) {
+        if (!hasNotificationAccess) {
+            Log.i(TAG, "DIAG-MEDIA [$reason] no notification access")
+            return
+        }
+        val sessions = runCatching {
+            mediaSessionManager.getActiveSessions(listenerComponent)
+        }.getOrNull()
+        if (sessions == null) {
+            Log.i(TAG, "DIAG-MEDIA [$reason] getActiveSessions returned null")
+            return
+        }
+        val own = context.packageName
+        val picked = pickAppSession()?.packageName
+        Log.i(TAG, "DIAG-MEDIA [$reason] ${sessions.size} session(s), picked=$picked")
+        sessions.forEach { s ->
+            val st = s.playbackState
+            val ownTag = if (s.packageName == own) " (OWN-decoy)" else ""
+            Log.i(
+                TAG,
+                "DIAG-MEDIA   pkg=${s.packageName}$ownTag state=${stateName(st?.state)}" +
+                    " pos=${st?.position} actions=[${actionNames(st?.actions ?: 0L)}]",
+            )
+        }
+    }
+
+    private fun keyName(keyCode: Int): String = when (keyCode) {
+        KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> "PLAY_PAUSE"
+        KeyEvent.KEYCODE_MEDIA_NEXT -> "NEXT"
+        KeyEvent.KEYCODE_MEDIA_PREVIOUS -> "PREV"
+        KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> "FF"
+        KeyEvent.KEYCODE_MEDIA_REWIND -> "REW"
+        KeyEvent.KEYCODE_MEDIA_STOP -> "STOP"
+        else -> "key$keyCode"
+    }
+
+    private fun stateName(state: Int?): String = when (state) {
+        null -> "null"
+        android.media.session.PlaybackState.STATE_NONE -> "NONE"
+        android.media.session.PlaybackState.STATE_STOPPED -> "STOPPED"
+        android.media.session.PlaybackState.STATE_PAUSED -> "PAUSED"
+        android.media.session.PlaybackState.STATE_PLAYING -> "PLAYING"
+        android.media.session.PlaybackState.STATE_BUFFERING -> "BUFFERING"
+        android.media.session.PlaybackState.STATE_ERROR -> "ERROR"
+        else -> "state$state"
+    }
+
+    private fun actionNames(actions: Long): String {
+        val names = mutableListOf<String>()
+        fun has(flag: Long) = actions and flag != 0L
+        if (has(android.media.session.PlaybackState.ACTION_PLAY_PAUSE)) names += "PLAY_PAUSE"
+        if (has(android.media.session.PlaybackState.ACTION_PLAY)) names += "PLAY"
+        if (has(android.media.session.PlaybackState.ACTION_PAUSE)) names += "PAUSE"
+        if (has(android.media.session.PlaybackState.ACTION_SKIP_TO_NEXT)) names += "NEXT"
+        if (has(android.media.session.PlaybackState.ACTION_SKIP_TO_PREVIOUS)) names += "PREV"
+        if (has(android.media.session.PlaybackState.ACTION_FAST_FORWARD)) names += "FF"
+        if (has(android.media.session.PlaybackState.ACTION_REWIND)) names += "REW"
+        if (has(android.media.session.PlaybackState.ACTION_SEEK_TO)) names += "SEEK_TO"
+        if (has(android.media.session.PlaybackState.ACTION_STOP)) names += "STOP"
+        return names.joinToString(",")
     }
 
     /**
@@ -245,6 +321,7 @@ class MediaController(private val context: Context) {
      * respond to those.
      */
     private fun seekRelativeOrKey(deltaMs: Long, fallbackKey: Int) {
+        logSessions("seek ${deltaMs}ms")
         val session = pickAppSession()
         val state = session?.playbackState
         val canSeek = state != null && state.position >= 0 &&
@@ -256,9 +333,11 @@ class MediaController(private val context: Context) {
             var target = state!!.position + deltaMs
             if (target < 0L) target = 0L
             if (dur > 0L && target > dur) target = dur
+            Log.i(TAG, "DIAG-MEDIA seek ${deltaMs}ms -> ${session.packageName} seekTo=$target")
             runCatching { session.transportControls.seekTo(target) }
             return
         }
+        Log.i(TAG, "DIAG-MEDIA seek ${deltaMs}ms -> canSeek=$canSeek, falling back to ${keyName(fallbackKey)} key")
         sendMediaKey(fallbackKey)
     }
 
@@ -266,6 +345,7 @@ class MediaController(private val context: Context) {
         if (!hasNotificationAccess) return false
         return try {
             val active = pickAppSession() ?: return false
+            Log.i(TAG, "DIAG-MEDIA dispatch ${keyName(keyCode)} -> ${active.packageName}")
             val now = SystemClock.uptimeMillis()
             active.dispatchMediaButtonEvent(
                 KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0)

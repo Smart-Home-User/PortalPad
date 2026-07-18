@@ -1,6 +1,7 @@
 package com.portalpad.app.ui.trackpad
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -11,6 +12,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -23,6 +26,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Layers
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Widgets
 import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -41,6 +47,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.portalpad.app.data.AppEntry
 import com.portalpad.app.data.QUICK_WHEEL_SLOTS
 import com.portalpad.app.ui.dock.AppIcon
@@ -78,7 +85,17 @@ import androidx.compose.ui.graphics.drawscope.Stroke
  * The whole cluster is bottom-anchored so the label strip lands in the gap just
  * above the bottom bar (see [WheelBottomLift]).
  */
-private val WheelBottomLift = 84.dp   // lift above the safe-area bottom; tunable
+// Bottom lift now equals the cluster's own 16dp internal gap: the space from
+// the nav bar to the chips matches the chips→card gap (user-specified symmetry).
+private val WheelBottomLift = 16.dp
+
+/** One missing grant the wheel's actions depend on: shown in the permissions
+ *  chip's popup with a per-row Fix. */
+data class PermissionIssue(
+    val label: String,
+    val why: String,
+    val fix: () -> Unit,
+)
 
 @Composable
 fun QuickWheelOverlay(
@@ -86,6 +103,18 @@ fun QuickWheelOverlay(
     onLaunchSlot: (AppEntry) -> Unit,
     onAssignSlot: (Int) -> Unit,
     onOpenDrawer: () -> Unit,
+    onWidgetOverlay: () -> Unit,
+    onWidgetOverlayEdit: () -> Unit,
+    onNotifications: () -> Unit,
+    onQrScan: () -> Unit,
+    permissionIssues: List<PermissionIssue> = emptyList(),
+    qrFeed: (@Composable () -> Unit)? = null,
+    // Nav-bar bottom inset measured in the ACTIVITY's window (which always
+    // receives insets), used as a floor below: this wheel lives in a Dialog
+    // whose window sometimes doesn't dispatch insets, so navigationBarsPadding
+    // read 0 and the bottom chips clipped under the nav bar (field + the
+    // DIAG-INSET note below). max(dialog inset, this) is deterministic.
+    fallbackBottomInset: androidx.compose.ui.unit.Dp = 0.dp,
     onDismiss: () -> Unit,
 ) {
     var preview by remember { mutableStateOf<Int?>(null) }
@@ -93,7 +122,10 @@ fun QuickWheelOverlay(
     val ringRadius = 116f
     val slotSize = 58.dp
     val centerSize = 112.dp
-    val wheelSize = 300.dp
+    // Clamped for compact phones: a fixed 300dp wheel (and the side buttons'
+    // screen-relative offsets) misbehaved below ~330dp-wide screens.
+    val screenWDp = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp
+    val wheelSize = if (screenWDp - 40.dp < 300.dp) screenWDp - 40.dp else 300.dp
 
     // Soft violet-tinted radial depth for the backdrop, and a livelier violet
     // gradient for the center button.
@@ -114,11 +146,26 @@ fun QuickWheelOverlay(
             dismissOnClickOutside = false,
         ),
     ) {
+        // DIAG-INSET: the wheel is hosted in a Dialog (its own window); the
+        // bottom buttons clip because navigationBarsPadding() is reading short
+        // here. Log the resolved nav-bar bottom inset — if it's 0 while the nav
+        // bar is clearly present, the Dialog window isn't dispatching insets and
+        // the fix is a real fallback pad rather than relying on the inset.
+        val diagDensity = androidx.compose.ui.platform.LocalDensity.current
+        val navBottomPx = WindowInsets.navigationBars.getBottom(diagDensity)
+        androidx.compose.runtime.LaunchedEffect(navBottomPx) {
+            android.util.Log.d("QuickWheel", "DIAG-INSET navBottomPx=$navBottomPx (Dialog window) fallback=$fallbackBottomInset")
+        }
+        // The larger of the Dialog-resolved inset and the activity-measured
+        // fallback: when the Dialog dispatches correctly nothing changes; when
+        // it reads 0 (the clipping case) the fallback fills in.
+        val dialogNavDp = with(diagDensity) { navBottomPx.toDp() }
+        val bottomInset = if (dialogNavDp > fallbackBottomInset) dialogNavDp else fallbackBottomInset
         Box(
             Modifier
                 .fillMaxSize()
-                .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.45f))
-                .navigationBarsPadding()
+                .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.7f))
+                .padding(bottom = bottomInset)
                 .pointerInput(Unit) { detectTapGestures { onDismiss() } },
             contentAlignment = Alignment.BottomCenter,
         ) {
@@ -130,6 +177,87 @@ fun QuickWheelOverlay(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
+            // Permissions heads-up: ONE quiet chip, only when something the
+            // wheel exposes is missing its grant (invisible otherwise). Tap →
+            // scrollable list, per-row Fix. Request-on-tap remains the primary
+            // flow; this is the "why doesn't this button work" answer.
+            var permPopupOpen by remember { mutableStateOf(false) }
+            if (permissionIssues.isNotEmpty()) {
+                Box(
+                    Modifier
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Color(0xFF221A38))
+                        .border(1.dp, Color(0xCCE0A75A), RoundedCornerShape(16.dp))
+                        .pointerInput(permissionIssues.size) {
+                            detectTapGestures { permPopupOpen = !permPopupOpen }
+                        }
+                        .padding(horizontal = 14.dp, vertical = 7.dp),
+                ) {
+                    Text(
+                        "${permissionIssues.size} permission" +
+                            (if (permissionIssues.size > 1) "s" else "") + " needed",
+                        color = Color(0xFFE0A75A),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+                if (permPopupOpen) {
+                    val permListState = androidx.compose.foundation.lazy.rememberLazyListState()
+                    Row(
+                        Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color(0xF2181226))
+                            .border(1.dp, Color(0x73E5D8FF), RoundedCornerShape(14.dp))
+                            .padding(10.dp)
+                            .heightIn(max = 190.dp)
+                            .widthIn(max = 300.dp),
+                    ) {
+                        androidx.compose.foundation.lazy.LazyColumn(
+                            state = permListState,
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            items(permissionIssues.size) { i ->
+                                val issue = permissionIssues[i]
+                                Row(
+                                    Modifier.padding(vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(issue.label, color = AbOnSurface,
+                                            fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                                        Text(issue.why, color = AbOnSurfaceMuted,
+                                            fontSize = 11.sp)
+                                    }
+                                    Spacer(Modifier.width(8.dp))
+                                    Box(
+                                        Modifier
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(AbPrimary.copy(alpha = 0.25f))
+                                            .pointerInput(i) {
+                                                detectTapGestures { issue.fix() }
+                                            }
+                                            .padding(horizontal = 12.dp, vertical = 5.dp),
+                                    ) {
+                                        Text("Fix", color = AbOnSurface, fontSize = 12.sp,
+                                            fontWeight = FontWeight.Medium)
+                                    }
+                                }
+                            }
+                        }
+                        if (permissionIssues.size > 4) {
+                            Spacer(Modifier.width(6.dp))
+                            com.portalpad.app.ui.common.VerticalScrollbar(
+                                listState = permListState,
+                                modifier = Modifier.width(4.dp).heightIn(max = 190.dp),
+                            )
+                        }
+                    }
+                }
+            }
+            // Integrated QR feed: renders INSIDE the wheel overlay, above the
+            // ring — no separate popup, wheel + cluster stay put. No idle
+            // placeholder by design: the squircle is the discoverability.
+            qrFeed?.invoke()
             Box(
                 Modifier
                     .size(wheelSize)
@@ -138,6 +266,73 @@ fun QuickWheelOverlay(
                     .pointerInput(Unit) { detectTapGestures { } },
                 contentAlignment = Alignment.Center,
             ) {
+                // QR squircle: icon-only, beside the ring, its center on the
+                // wheel's vertical center and HORIZONTALLY CENTERED in the gap
+                // between the ring's right edge and the screen edge (the pill
+                // version overflowed the chip row into a crushed sliver).
+                run {
+                    // Equal-diagonal-gap point from the user's mock: below
+                    // Disney+, outside the SE slot, above the card — solved so
+                    // the gaps to the SE slot edge, the card's top edge, and
+                    // the screen's right edge all land ~10-15dp. Right-edge
+                    // anchored so the edge gap holds on any phone width.
+                    val screenW = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp
+                    val sideX = (screenW / 2 - 164.dp).coerceAtLeast(8.dp)
+                    Box(
+                        Modifier
+                            .align(Alignment.CenterEnd)
+                            .offset(x = sideX, y = 128.dp)
+                            .size(56.dp)
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(Color(0xFF221A38))
+                            .border(1.dp, Color(0x73E5D8FF), RoundedCornerShape(16.dp))
+                            .pointerInput(Unit) {
+                                detectTapGestures {
+                                    com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = false)
+                                    onQrScan()
+                                }
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Default.QrCodeScanner,
+                            contentDescription = "QR scan",
+                            tint = AbPrimary,
+                            modifier = Modifier.size(40.dp),
+                        )
+                    }
+                }
+                // Exit squircle: the QR button's mirror twin (same equal-gap
+                // solve, flipped) — dark fill so it can't vanish like the old
+                // translucent chrome, red glyph + red-tinted border as the
+                // destructive cue. Icon-only to match its sibling.
+                run {
+                    val screenW2 = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp
+                    val sideX2 = (screenW2 / 2 - 164.dp).coerceAtLeast(8.dp)
+                    // Bare red ✕ (user-picked over the squircle): the scrim
+                    // is constant behind it so no chrome is needed; the 56dp
+                    // box stays as an invisible generous tap target.
+                    Box(
+                        Modifier
+                            .align(Alignment.CenterStart)
+                            .offset(x = -sideX2, y = 128.dp)
+                            .size(56.dp)
+                            .pointerInput(Unit) {
+                                detectTapGestures {
+                                    com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = false)
+                                    onDismiss()
+                                }
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            "✕",
+                            color = Color(0xFFE05A5A),
+                            fontSize = 30.sp,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                }
                 // Ring backdrop — soft violet-tinted radial depth.
                 Box(
                     Modifier
@@ -236,7 +431,34 @@ fun QuickWheelOverlay(
                 }
             }
 
-            LabelStrip(preview?.let { slots.getOrNull(it) })
+            val armed = preview?.let { slots.getOrNull(it) }
+            LabelStrip(
+                slot = armed,
+                onLaunch = armed?.let { s ->
+                    {
+                        com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = true)
+                        onLaunchSlot(s)
+                    }
+                },
+            )
+
+            // Two utility chips BELOW the tap-again card (user-picked position;
+            // cluster spacedBy(16) supplies the gap). Slot-chrome styling so
+            // they read as wheel furniture. Widget Overlay toggles the widget
+            // layer; Expand Notifications toggles the external display's
+            // notification panel — both via the existing PFS toggles.
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                WheelChip(
+                    icon = Icons.Default.Widgets,
+                    label = "Widget Overlay",
+                    onLongPress = { onWidgetOverlayEdit() },
+                ) { onWidgetOverlay() }
+                WheelChip(
+                    icon = Icons.Default.Notifications,
+                    label = "Expand Notifications",
+                ) { onNotifications() }
+
+            }
             }
         }
     }
@@ -353,6 +575,52 @@ private fun SlotView(
     }
 }
 
+/** One utility chip under the tap-again card — slot chrome in pill form. */
+@Composable
+private fun WheelChip(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onLongPress: (() -> Unit)? = null,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(21.dp))
+            .background(Color(0xFF221A38))
+            .border(1.dp, Color(0x73E5D8FF), RoundedCornerShape(21.dp))
+            .pointerInput(onLongPress != null) {
+                detectTapGestures(
+                    onTap = {
+                        com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = false)
+                        onClick()
+                    },
+                    onLongPress = if (onLongPress != null) {
+                        {
+                            com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = true)
+                            onLongPress()
+                        }
+                    } else null,
+                )
+            }
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            icon,
+            contentDescription = null,
+            tint = AbPrimary,
+            modifier = Modifier.size(18.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            label,
+            color = AbOnSurface,
+            fontWeight = FontWeight.Medium,
+            style = MaterialTheme.typography.labelLarge,
+        )
+    }
+}
+
 /** A slot's launch destination, encoded by ring color. */
 private fun accentFor(entry: AppEntry): Color = when {
     entry.isShortcut -> AbWarning   // launches on the phone
@@ -361,7 +629,7 @@ private fun accentFor(entry: AppEntry): Color = when {
 }
 
 @Composable
-private fun LabelStrip(slot: AppEntry?) {
+private fun LabelStrip(slot: AppEntry?, onLaunch: (() -> Unit)? = null) {
     val accent = slot?.let { accentFor(it) } ?: AbPrimary
     Box(
         Modifier
@@ -371,6 +639,14 @@ private fun LabelStrip(slot: AppEntry?) {
             // slot is latched.
             .heightIn(min = 58.dp)
             .clip(RoundedCornerShape(14.dp))
+            // The armed card LOOKED tappable (border, elevation) but wasn't —
+            // "tap again" secretly meant the slot. Now tapping the card
+            // launches too (same action + haptic as the confirming slot tap);
+            // idle state stays inert.
+            .then(
+                if (slot != null && onLaunch != null) Modifier.clickable { onLaunch() }
+                else Modifier,
+            )
             .background(AbSurfaceElevated)
             .border(
                 0.5.dp,
@@ -404,14 +680,15 @@ private fun LabelStrip(slot: AppEntry?) {
                             )
                             Spacer(Modifier.width(4.dp))
                             Text(
-                                "opens on phone · tap again to launch",
+                                "opens on phone · tap to launch",
                                 color = AbWarning,
                                 style = MaterialTheme.typography.labelSmall,
                             )
                         }
                     } else {
                         Text(
-                            if (slot.isActivity) "activity · tap again to launch" else "tap again to launch",
+                            if (slot.isActivity) "activity · tap here or slot to launch"
+                            else "tap here or the slot again to launch",
                             color = AbOnSurfaceMuted,
                             style = MaterialTheme.typography.labelSmall,
                         )

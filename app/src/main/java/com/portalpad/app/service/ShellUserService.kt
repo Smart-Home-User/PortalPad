@@ -449,7 +449,12 @@ class ShellUserService : IShellService.Stub {
     }
 
     private fun setDisplayId(event: InputEvent, displayId: Int) {
-        if (displayId == 0) return
+        // displayId 0 must be set EXPLICITLY: an unset event defaults to
+        // INVALID_DISPLAY (-1) = "the focused display", which is exactly wrong
+        // when the caller is trying to pull focus BACK to the phone (full log
+        // 2026-07-17 21:06:47.099: our display-0 key landed as d=-1 on the
+        // focused external display). Only negative means "leave default".
+        if (displayId < 0) return
         try {
             when (event) {
                 is MotionEvent -> setMotionDisplayId?.invoke(event, displayId)
@@ -1610,29 +1615,65 @@ class ShellUserService : IShellService.Stub {
         val id = Binder.clearCallingIdentity()
         return try {
             val list = runCommand("dumpsys SurfaceFlinger --list")
-            val layer = list.lines()
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .firstOrNull {
-                    (it.startsWith("SurfaceView") || it.contains("com.")) &&
-                        !it.contains("PortalPad", ignoreCase = true) &&
-                        !it.contains("Wallpaper", ignoreCase = true) &&
-                        !it.contains("Toast") && !it.contains("StatusBar") &&
-                        it.contains("#")
-                } ?: return -1f
-            val out = runCommand("dumpsys SurfaceFlinger --latency \"$layer\"")
-            val lines = out.lines().map { it.trim() }.filter { it.isNotEmpty() }
-            if (lines.size < 3) return -1f
-            val present = lines.drop(1).mapNotNull { row ->
-                val cols = row.split(Regex("\\s+"))
-                if (cols.size >= 2) cols[1].toLongOrNull() else null
-            }.filter { it > 0L }.distinct().sorted()
-            if (present.size < 2) return -1f
-            val spanNs = (present.last() - present.first()).toDouble()
-            if (spanNs <= 0.0) return -1f
-            val fps = (present.size - 1) * 1e9 / spanNs
-            if (fps.isFinite() && fps in 1.0..240.0) fps.toFloat() else -1f
+            val lines0 = list.lines().map { it.trim() }.filter { it.isNotEmpty() }
+            // --list on newer Android returns verbose RequestedLayerState{...
+            // name="X"#id ...} descriptors, NOT plain names — passing the whole
+            // line to --latency matched nothing (field: every candidate
+            // latencyLines=0 under mirror). Extract the real name (and #id).
+            // Lines with no name="" are CONTAINERS (ActivityRecord / WindowToken /
+            // Display) that hold no buffer — skip them.
+            val named = lines0.mapNotNull { line ->
+                val nm = Regex("name=\"([^\"]*)\"").find(line)?.groupValues?.get(1)
+                    ?: return@mapNotNull null
+                if (nm.contains("Wallpaper", true) || nm.contains("Toast", true) ||
+                    nm.contains("StatusBar", true) || nm.startsWith("Dim ")
+                ) return@mapNotNull null
+                val lid = Regex("name=\"[^\"]*\"#(\\d+)").find(line)?.groupValues?.get(1)
+                nm to lid
+            }
+            // Priority: an animating app surface (package/activity, "pkg/..."),
+            // then our VD layer, then any named surface. Under mirror a static
+            // scene has no frames → -1 is the truthful "— fps".
+            val ordered = buildList {
+                named.firstOrNull { it.first.contains("/") && !it.first.contains("PortalPad", true) }?.let { add(it) }
+                named.firstOrNull { it.first.contains("PortalPad Session") }?.let { add(it) }
+                named.firstOrNull { it.first.contains("/") }?.let { add(it) }
+                named.firstOrNull()?.let { add(it) }
+            }.distinct()
+            if (ordered.isEmpty()) return -1f
+            for ((nm, lid) in ordered) {
+                // --latency arg format varies by version; try name#id then bare name.
+                val args = listOfNotNull(lid?.let { "$nm#$it" }, nm).distinct()
+                for (arg in args) {
+                    val out = runCommand("dumpsys SurfaceFlinger --latency \"$arg\"")
+                    val lines = out.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                    if (lines.size < 3) {
+                        android.util.Log.d("PortalPadHud",
+                            "DIAG-HUDFPS arg='$arg' latencyLines=${lines.size} → skip (no data)")
+                        continue
+                    }
+                    val present = lines.drop(1).mapNotNull { row ->
+                        val cols = row.split(Regex("\\s+"))
+                        if (cols.size >= 2) cols[1].toLongOrNull() else null
+                    }.filter { it > 0L }.distinct().sorted()
+                    if (present.size < 2) {
+                        android.util.Log.d("PortalPadHud",
+                            "DIAG-HUDFPS arg='$arg' presentStamps=${present.size} → skip (stale)")
+                        continue
+                    }
+                    val spanNs = (present.last() - present.first()).toDouble()
+                    if (spanNs <= 0.0) continue
+                    val fps = (present.size - 1) * 1e9 / spanNs
+                    val result = if (fps.isFinite() && fps in 1.0..240.0) fps.toFloat() else -1f
+                    android.util.Log.d("PortalPadHud",
+                        "DIAG-HUDFPS arg='$arg' stamps=${present.size} → ${"%.1f".format(result)}")
+                    if (result > 0f) return result
+                }
+            }
+            android.util.Log.d("PortalPadHud", "DIAG-HUDFPS no candidate had frame data → -1")
+            -1f
         } catch (t: Throwable) {
+            android.util.Log.w("PortalPadHud", "DIAG-HUDFPS threw", t)
             -1f
         } finally {
             Binder.restoreCallingIdentity(id)
@@ -1741,6 +1782,138 @@ class ShellUserService : IShellService.Stub {
 
     // ─── Task management ────────────────────────────────────────────────
 
+    // Cached ActivityTaskManager.resizeTask handle — resolved once; a miss is
+    // remembered so we don't re-reflect per drag step.
+    @Volatile private var resizeTaskMethod: java.lang.reflect.Method? = null
+    @Volatile private var resizeTaskResolved = false
+    // 1 = RESIZE_MODE_USER (unanimated); demoted to 0 = SYSTEM if rejected.
+    @Volatile private var resizeModeValue = 1
+    @Volatile private var resizeFastLogged = false
+
+    override fun resizeTaskFast(taskId: Int, left: Int, top: Int, right: Int, bottom: Int): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val atm = Class.forName("android.app.ActivityTaskManager")
+                .getMethod("getService").invoke(null) ?: return false
+            if (!resizeTaskResolved) {
+                resizeTaskResolved = true
+                // Same version-tolerant pattern as moveTaskToDisplay: the
+                // signature has been (int, Rect, int resizeMode) throughout
+                // recent releases; keep the lookup list-shaped for safety.
+                resizeTaskMethod = runCatching {
+                    atm.javaClass.getMethod(
+                        "resizeTask",
+                        Int::class.javaPrimitiveType,
+                        android.graphics.Rect::class.java,
+                        Int::class.javaPrimitiveType,
+                    )
+                }.getOrNull()
+                Log.i(TAG, "resizeTaskFast: reflection ${if (resizeTaskMethod != null) "RESOLVED" else "MISSED"}")
+            }
+            val m = resizeTaskMethod ?: return false
+            // Prefer 1 = RESIZE_MODE_USER (interactive resize, typically
+            // UNANIMATED): with SYSTEM mode, every 30ms drag step restarted a
+            // small bounds animation and the pile-up read as springy/"bouncy"
+            // window motion (field). If USER is rejected on this ROM, fall
+            // back permanently to 0 = RESIZE_MODE_SYSTEM (what `am task
+            // resize` passes) — worst case is exactly the old feel.
+            val rect = android.graphics.Rect(left, top, right, bottom)
+            try {
+                m.invoke(atm, taskId, rect, resizeModeValue)
+            } catch (t: Throwable) {
+                if (resizeModeValue == 1) {
+                    Log.w(TAG, "resizeTaskFast: RESIZE_MODE_USER rejected — falling back to SYSTEM", t)
+                    resizeModeValue = 0
+                    m.invoke(atm, taskId, rect, 0)
+                } else {
+                    throw t
+                }
+            }
+            if (!resizeFastLogged) {
+                resizeFastLogged = true
+                Log.i(TAG, "resizeTaskFast: first call ok (task=$taskId)")
+            }
+            true
+        } catch (t: Throwable) {
+            if (!resizeFastLogged) {
+                resizeFastLogged = true
+                Log.w(TAG, "resizeTaskFast failed — callers will use the shell path", t)
+            }
+            false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    /** Direct window-focus grab for a KNOWN task — no enumeration.
+     *  refocusTopTaskOnDisplay's task discovery fails SILENTLY on this ROM
+     *  (zero log lines across an entire failing session, 2026-07-17), so
+     *  this variant takes the taskId from the caller (an Activity knows its
+     *  own) and logs EVERY method attempt including the exception class —
+     *  the next capture is decisive about which spelling this ROM honors.
+     *  focusTopTask first: proven working here by the ROM's own launcher
+     *  (19:41:01.792, IActivityTaskManager$Stub.onTransact → focusTopTask). */
+    override fun focusTask(taskId: Int): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val atm = Class.forName("android.app.ActivityTaskManager")
+                .getMethod("getService").invoke(null)
+            if (atm == null) {
+                Log.w(TAG, "focusTask($taskId): ATM service null")
+                return false
+            }
+            for (methodName in listOf("focusTopTask", "setFocusedTask", "setFocusedRootTask")) {
+                try {
+                    val m = atm.javaClass.getMethod(methodName, Int::class.javaPrimitiveType)
+                    m.invoke(atm, taskId)
+                    Log.i(TAG, "focusTask($taskId): $methodName OK")
+                    return true
+                } catch (t: Throwable) {
+                    val cause = t.cause ?: t
+                    Log.w(TAG, "focusTask($taskId): $methodName failed: ${cause.javaClass.simpleName}: ${cause.message}")
+                }
+            }
+            false
+        } catch (t: Throwable) {
+            Log.e(TAG, "focusTask($taskId) failed", t)
+            false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
+    // Cached IActivityTaskManager.removeTask handle — same resolve-once
+    // pattern as resizeTaskFast. removeTask finishes the task AND deletes its
+    // Recents record (the binder behind swiping a card away in Recents, and
+    // what DeX's caption X effectively achieves). MANAGE_ACTIVITY_TASKS is
+    // held by shell, so this works from the Shizuku/root process.
+    @Volatile private var removeTaskMethod: java.lang.reflect.Method? = null
+    @Volatile private var removeTaskResolved = false
+
+    override fun removeTask(taskId: Int): Boolean {
+        val id = Binder.clearCallingIdentity()
+        return try {
+            val atm = Class.forName("android.app.ActivityTaskManager")
+                .getMethod("getService").invoke(null) ?: return false
+            if (!removeTaskResolved) {
+                removeTaskResolved = true
+                removeTaskMethod = runCatching {
+                    atm.javaClass.getMethod("removeTask", Int::class.javaPrimitiveType)
+                }.getOrNull()
+                Log.i(TAG, "removeTask: reflection ${if (removeTaskMethod != null) "RESOLVED" else "MISSED"}")
+            }
+            val m = removeTaskMethod ?: return false
+            val ok = m.invoke(atm, taskId) as? Boolean ?: false
+            Log.i(TAG, "removeTask($taskId) → $ok")
+            ok
+        } catch (t: Throwable) {
+            Log.w(TAG, "removeTask($taskId) failed — caller will use the shell path", t)
+            false
+        } finally {
+            Binder.restoreCallingIdentity(id)
+        }
+    }
+
     override fun moveTaskToDisplay(taskId: Int, displayId: Int): Boolean {
         val id = Binder.clearCallingIdentity()
         return try {
@@ -1841,7 +2014,16 @@ class ShellUserService : IShellService.Stub {
                 ?: readIntField(match, "stackId")
                 ?: return false
 
-            for (methodName in listOf("moveRootTaskToFront", "moveTaskToFront", "moveStackToFront")) {
+            // focusTopTask FIRST: proven present AND working on this ROM by
+            // the ROM's own launcher (full log 2026-07-17 19:41:01.792:
+            // ActivityTaskManagerService.focusTopTask ← IActivityTaskManager
+            // $Stub.onTransact successfully changed window focus). The
+            // move-to-front spellings are known-absent on this ROM (long-
+            // standing constraint) — kept only for other builds.
+            for (methodName in listOf(
+                "focusTopTask", "setFocusedTask", "setFocusedRootTask",
+                "moveRootTaskToFront", "moveTaskToFront", "moveStackToFront",
+            )) {
                 runCatching {
                     val m = atm.javaClass.getMethod(methodName, Int::class.javaPrimitiveType)
                     m.invoke(atm, taskId)
@@ -2061,7 +2243,14 @@ class ShellUserService : IShellService.Stub {
 
         // Build argv. Splitting on spaces is fine because the filter
         // tokens never contain spaces individually.
-        val argv = mutableListOf("logcat", "-v", "threadtime")
+        // -T 1: start from NOW (well, the single most recent line), never the
+        // device's retained ring buffer — a bare logcat re-dumps the ENTIRE
+        // ring at spawn, so every stream (re)start re-imported thousands of
+        // historical lines (field: "Stop & clear didn't clear", "paused log
+        // grew" — it was the next start's history dump, not background
+        // capture). The device ring itself is left untouched so adb captures
+        // keep working.
+        val argv = mutableListOf("logcat", "-v", "threadtime", "-T", "1")
         argv += safe.split(' ').filter { it.isNotBlank() }
 
         val proc = try {

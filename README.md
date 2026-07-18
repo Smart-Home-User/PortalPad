@@ -19,7 +19,7 @@ It's built with Jetpack Compose, and uses Android's Virtual Display plus Shizuku
 
 ## Requirements
 
-- **A compatible Android device with USB-C DisplayPort Alt Mode** (Android 11 / API 30 or newer). This is what lets the phone drive an external display. Most AR glasses appear to the phone as a normal USB-C DisplayPort screen. Performance varies by device.
+- **A compatible Android device with USB-C DisplayPort Alt Mode** (Android 11 / API 30 or newer). This is what lets the phone drive an external display. Most AR glasses appear to the phone as a normal USB-C DisplayPort screen. Performance varies by device. Developed and tested primarily on Samsung One UI — other ROMs work but behavior can vary (some fall back to an accessibility-based input path that feels less smooth).
 - **Shizuku** (recommended) **or root** — required. PortalPad needs elevated access to inject input into the external display and manage it; Shizuku grants this without rooting. The recommended build is [thedjchi's Shizuku fork](https://github.com/thedjchi/Shizuku). It adds three things stock Shizuku lacks:
   * **Start-on-boot** — waits for Wi-Fi after a reboot, then starts the service automatically.
   * **TCP mode** (`adb tcpip`) — once started over Wi-Fi after a reboot, you can stop/restart it without a Wi-Fi connection.

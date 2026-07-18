@@ -85,7 +85,16 @@ class MainActivity : PinnedDensityActivity() {
         // Install the system splash (androidx core-splashscreen) before super so
         // the branded animated-icon splash shows on launch, then hands off to the
         // app theme. Must precede super.onCreate().
-        installSplashScreen()
+        // Timed hold: WITHOUT a keep-condition the system dismisses the splash
+        // at the app's first frame, cutting the icon animation short whenever
+        // the activity wins the race (field report). Hold ≈ the AVD's ~880ms
+        // run + a 1s rest so the animation always completes, then release.
+        // Trade-off: every cold launch shows the splash this long.
+        val splash = installSplashScreen()
+        var keepSplash = true
+        splash.setKeepOnScreenCondition { keepSplash }
+        android.os.Handler(android.os.Looper.getMainLooper())
+            .postDelayed({ keepSplash = false }, 1900L)
         super.onCreate(savedInstanceState)
         lockOrientationDefault()
         // Throttled update auto-check (v1.3+): at most once per 24h, only when
@@ -266,6 +275,12 @@ class MainActivity : PinnedDensityActivity() {
     override fun onResume() {
         super.onResume()
         applyForcedOrientation()
+        // Re-run the (throttled) update check when the main screen comes back to
+        // the foreground, so someone who keeps resuming the app still gets fresh
+        // checks + the spinning Sync icon. Fire-and-forget and throttled, so it
+        // dedupes with the onCreate call and never checks on the display-connect
+        // auto-launch path (that starts the service, not this activity).
+        com.portalpad.app.service.UpdateChecker.autoCheckOnLaunch(applicationContext)
         // Refresh access state — user may have just enabled Shizuku in another
         // app, or granted root externally. Without this the UI stays stale.
         val app = application as PortalPadApp

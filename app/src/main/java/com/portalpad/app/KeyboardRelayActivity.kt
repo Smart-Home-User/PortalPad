@@ -38,6 +38,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.drawWithContent
@@ -58,6 +60,12 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.TextRange
@@ -115,7 +123,15 @@ class KeyboardRelayActivity : PinnedDensityActivity() {
         // field's current text off the node). Empty when opened via the Shizuku
         // poller, which has no node to read from.
         val prefill = intent?.getStringExtra(EXTRA_PREFILL).orEmpty()
-        setContent { PortalPadTheme { RelayScreen(injector, prefill) { finish() } } }
+        // Caret/selection seed read off the field at open time by the detector
+        // (-1 = absent/unusable → RelayScreen falls back to end-of-text).
+        val selS = intent?.getIntExtra(EXTRA_CARET_START, -1) ?: -1
+        val selE = intent?.getIntExtra(EXTRA_CARET_END, -1) ?: -1
+        setContent {
+            PortalPadTheme {
+                RelayScreen(injector, prefill, selS, selE) { finish() }
+            }
+        }
         finishWhenExternalDisplayGone()
     }
 
@@ -123,6 +139,12 @@ class KeyboardRelayActivity : PinnedDensityActivity() {
         /** Optional launch extra: the tapped field's existing text, to prefill the
          *  relay box. Set only by the accessibility detector (never the poller). */
         const val EXTRA_PREFILL = "prefill_text"
+
+        /** Optional launch extras: the tapped field's selection at open time,
+         *  so the relay opens with its caret where the user actually clicked
+         *  instead of end-of-text. -1 = unknown (fall back to end). */
+        const val EXTRA_CARET_START = "caret_start"
+        const val EXTRA_CARET_END = "caret_end"
     }
 
     override fun onResume() {
@@ -148,7 +170,7 @@ class KeyboardRelayActivity : PinnedDensityActivity() {
         // Stamping only in onDestroy left the skip-window unarmed at the exact
         // moment it existed for (measured: refocus at +265ms after onPause,
         // destroy at +513ms — dropdown relaunch-killed with the skip asleep).
-        (application as? PortalPadApp)?.relayClosedAt = System.currentTimeMillis()
+        (application as? PortalPadApp)?.relayClosedAt = android.os.SystemClock.elapsedRealtime()
         super.onPause()
         android.util.Log.w("DIAG-RELAY", "onPause")
         injector.setRelayImeMode(false)
@@ -159,21 +181,33 @@ class KeyboardRelayActivity : PinnedDensityActivity() {
         // Relay is closing (back button or the X). Re-enable the auto-open poller
         // so the next field tap can open it again.
         app.relayOpen = false
-        app.relayClosedAt = System.currentTimeMillis()
+        app.relayClosedAt = android.os.SystemClock.elapsedRealtime()
         super.onDestroy()
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun RelayScreen(injector: InputInjector, initialText: String = "", onClose: () -> Unit) {
+private fun RelayScreen(
+    injector: InputInjector,
+    initialText: String = "",
+    initialSelStart: Int = -1,
+    initialSelEnd: Int = -1,
+    onClose: () -> Unit,
+) {
     // Seed with the tapped field's existing text (prefill). Cursor at end → append
     // mode. Because onValueChange forwards only the DIFF vs. this baseline, the
     // prefilled text is NOT re-injected into the field — only new keystrokes are.
     // Showing the real text is what makes the keyboard's backspace work: there's
     // something in the box to delete. Empty fields open blank.
     var fieldValue by remember {
-        mutableStateOf(TextFieldValue(initialText, selection = TextRange(initialText.length)))
+        // Seed the caret/selection from the open-time read when valid; a full
+        // select-all carries through (first keystroke replaces, platform
+        // convention). Anything unusable → end-of-text, the old behavior.
+        val sel = if (initialSelStart in 0..initialText.length &&
+            initialSelEnd in initialSelStart..initialText.length
+        ) TextRange(initialSelStart, initialSelEnd) else TextRange(initialText.length)
+        mutableStateOf(TextFieldValue(initialText, selection = sel))
     }
     val focusRequester = remember { FocusRequester() }
     var reassertFocus by remember { mutableStateOf(false) }
@@ -181,6 +215,58 @@ private fun RelayScreen(injector: InputInjector, initialText: String = "", onClo
     var keystrokeNonce by remember { mutableIntStateOf(0) }
     @OptIn(ExperimentalComposeUiApi::class)
     val keyboardController = LocalSoftwareKeyboardController.current
+    // Live IME-visibility probe target for the recovery reclaims: reclaim only
+    // when the keyboard is genuinely DOWN. reclaimIme's clearFocus toggle
+    // itself hides+reshows the keyboard (kb tests: our own client
+    // HIDE_SOFT_INPUT_BY_INSETS_API blinks), so running it while the keyboard
+    // is up trades nothing for a visible flicker.
+    val hostView = androidx.compose.ui.platform.LocalView.current
+    // The relay's own taskId — fed to the focusTask binder so the shell side
+    // needs NO task enumeration (the silent failure point of
+    // refocusTopTaskOnDisplay on this ROM).
+    val relayTaskId = remember {
+        runCatching { (hostView.context as? android.app.Activity)?.taskId ?: -1 }.getOrDefault(-1)
+    }
+    // Screen point near the relay field's right end — target for the
+    // tap-fallback focus grab (focus-follows-touch: the same bedrock
+    // mechanism that steals focus TO the external display works in reverse).
+    var fieldTapPoint by remember { mutableStateOf<Pair<Float, Float>?>(null) }
+    val focusManager = LocalFocusManager.current
+    val relayScope = rememberCoroutineScope()
+    // Stamped whenever the Android path writes the TARGET field via
+    // accessibility (SET_TEXT / SET_SELECTION). Those writes migrate the IME
+    // target to the external field, whose display policy is HIDE — so the
+    // system drops the PHONE keyboard ~1s later (androidkeyboard.txt:
+    // hideSoftInput reason=HIDE_DISPLAY_IME_POLICY_HIDE right after a
+    // backspace-into-prefill). The re-claim below wins it back.
+    var lastA11yPushAt by remember { mutableLongStateOf(0L) }
+    // Re-claim the IME for the RELAY: a plain show() is IGNORED while the
+    // system still counts the external field as the input target, and a plain
+    // requestFocus() is a NO-OP because the Compose field never lost focus.
+    // The clear→refocus TOGGLE restarts the input session, which re-registers
+    // this window as the IME target; then show() lands.
+    // IME re-claim — GUARDED against self-triggering. The focus toggle + show
+    // themselves fire inset/visibility changes, so ANY approach that re-claims
+    // in RESPONSE to a visibility change oscillates (field: SHOW_SOFT_INPUT_BY_
+    // INSETS_API firing dozens of times/sec, keyboard flickering, random keys
+    // dropping it — an oscillator I built with the old storm-watcher). This
+    // version is one-shot per call and marks a self-window so its OWN insets
+    // storms can't feed anything back.
+    var reclaimingUntil by remember { mutableLongStateOf(0L) }
+    val reclaimIme: () -> Unit = {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now >= reclaimingUntil) {
+            reclaimingUntil = now + 1200
+            relayScope.launch {
+                android.util.Log.i("PortalPadRelay", "reclaimIme: focus toggle + show")
+                runCatching { focusManager.clearFocus(force = true) }
+                kotlinx.coroutines.delay(60)
+                runCatching { focusRequester.requestFocus() }
+                kotlinx.coroutines.delay(30)
+                runCatching { keyboardController?.show() }
+            }
+        }
+    }
 
     // Input mode. Custom = our own on-screen keyboard (drives the field via
     // accessibility SET_TEXT/SET_SELECTION — reliable backspace + caret, no system
@@ -200,8 +286,11 @@ private fun RelayScreen(injector: InputInjector, initialText: String = "", onClo
     LaunchedEffect(interactionSource) {
         interactionSource.interactions.collect { interaction ->
             if (interaction is androidx.compose.foundation.interaction.PressInteraction.Release) {
-                runCatching { focusRequester.requestFocus() }
-                runCatching { keyboardController?.show() }
+                // Full re-claim, not a plain focus+show: after an a11y write
+                // stole the IME target, focus was never lost here, so the old
+                // requestFocus was a no-op and show() was ignored (field:
+                // "tapping the text field does not bring the keyboard back").
+                reclaimIme()
             }
         }
     }
@@ -304,7 +393,12 @@ private fun RelayScreen(injector: InputInjector, initialText: String = "", onClo
             // does NOT auto-finish: the draft text survives the grace window.
             val physId by com.portalpad.app.PortalPadApp.instance
                 .physicalExternalDisplayId.collectAsState()
-            com.portalpad.app.ui.common.DisconnectBanner(externalDisplayId = physId)
+            val bannerActivity = androidx.compose.ui.platform.LocalContext.current
+                as? android.app.Activity
+            com.portalpad.app.ui.common.DisconnectBanner(
+                externalDisplayId = physId,
+                onReturnNow = { bannerActivity?.finish() },
+            )
             RelayDependencyChip(customKeyboard)
 
             // ── Suggestion mirror (overlay dropdown) ───────────────────
@@ -420,9 +514,11 @@ private fun RelayScreen(injector: InputInjector, initialText: String = "", onClo
                             append("Note: ")
                             pop()
                             append(
-                                "Custom keyboard is the more reliable option for editing " +
-                                    "existing text (backspace, cursor, selection). Switch to " +
-                                    "Android for other features like autocorrect, swipe, and voice.",
+                                "Custom keyboard types live to the external display and " +
+                                    "handles editing (backspace, cursor, selection) better. " +
+                                    "Android keyboard syncs after you stop typing. Switch to " +
+                                    "it for autocorrect, swipe typing, and other features the " +
+                                    "custom keyboard doesn't have.",
                             )
                         },
                         color = AbDanger,
@@ -498,50 +594,469 @@ private fun RelayScreen(injector: InputInjector, initialText: String = "", onClo
                     val keyH = ((avail - mirrorH - 166.dp) / 5).coerceIn(32.dp, 50.dp)
                     CompositionLocalProvider(LocalKbKeyHeight provides keyH) {
                         Column(Modifier.fillMaxSize()) {
-                            CustomKeyboardSection(injector, initialText, mirrorH)
+                            // fieldValue is the SINGLE cross-tab truth: the
+                            // custom section seeds from it on entry and reports
+                            // every buffer/caret change back into it, so
+                            // switching tabs carries text AND caret both ways.
+                            // (Before this, the section's remember{} state was
+                            // DISPOSED on switch — custom edits vanished and
+                            // returning reset to the original prefill.)
+                            CustomKeyboardSection(
+                                injector,
+                                fieldValue.text,
+                                fieldValue.selection.end.coerceIn(0, fieldValue.text.length),
+                                // Carried selection (open-time select-all, or one
+                                // made on the Android tab) seeds the anchor so the
+                                // custom keyboard shows the same selection.
+                                initialAnchor = if (fieldValue.selection.min != fieldValue.selection.max) {
+                                    fieldValue.selection.min.coerceIn(0, fieldValue.text.length)
+                                } else -1,
+                                mirrorHeight = mirrorH,
+                            ) { t, c ->
+                                fieldValue = TextFieldValue(t, selection = TextRange(c))
+                            }
                         }
                     }
                 }
             } else {
 
+            // ── Debounced external sync (Android path) ─────────────────────
+            // Local edits are instant; the a11y write to the TARGET field is
+            // debounced (one push ~450ms after the burst ends). Every write
+            // migrates the IME target to the external field, whose display
+            // policy is HIDE — per-keystroke writes made the phone keyboard
+            // dip on EVERY backspace (field). One push per burst = at most one
+            // dip per burst, and the proactive re-claim below often beats the
+            // delayed hide entirely. lastSyncedText is what the external field
+            // actually holds, so the keystroke fallback (no a11y node) can
+            // diff against reality.
+            var pendingSyncText by remember { mutableStateOf<String?>(null) }
+            var pendingSyncCaret by remember { mutableIntStateOf(0) }
+            var syncJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+            // Post-flush reclaim chain, tracked SEPARATELY from syncJob so the
+            // next keystroke's syncJob?.cancel() can't kill a pending reclaim
+            // (kb test: the 17:31:24.365 policy-hide was never followed by any
+            // reclaim or onShown — the chain died with a cancelled syncJob and
+            // the keyboard stayed down for the rest of the capture). Only a
+            // NEWER flush replaces it.
+            var recoveryJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+            // Uptime of the last flush attempt (diagnostic stamp).
+            var lastFlushAt by remember { mutableLongStateOf(0L) }
+            // Uptime of the last TEXT edit — distinguishes typing-residue
+            // caret moves (suppressed: no write, no migration) from deliberate
+            // caret repositioning (synced).
+            var lastTextEditAt by remember { mutableLongStateOf(0L) }
+            // Fallback-tap echo guard: while armed, a selection-only change in
+            // onValueChange is the recovery tap's OWN caret jump — restore the
+            // saved caret and schedule nothing. Breaks the tap→caret-jump→
+            // fresh-flush→fresh-war→tap oscillation (23:11 capture: caret
+            // bouncing 4↔17 every ~1.3s for 8+ seconds).
+            var suppressTapEchoUntil by remember { mutableLongStateOf(0L) }
+            var tapSavedSelection by remember {
+                mutableStateOf<androidx.compose.ui.text.TextRange?>(null)
+            }
+            // Pause threshold before the external write fires (Settings →
+            // keyboard section). Shorter = snappier external sync; longer =
+            // fewer mid-thought flushes = fewer chances to drop a keystroke.
+            val pauseFlushMs by com.portalpad.app.PortalPadApp.instance.prefs
+                .int(com.portalpad.app.data.PreferencesRepository.Keys.RELAY_PAUSE_FLUSH_MS, default = 600)
+                .collectAsState(initial = 600)
+            var lastSyncedText by remember { mutableStateOf(fieldValue.text) }
+            // Where the EXTERNAL field's caret is, as far as we know: seeded
+            // from the open/tab-entry state, updated by our pushes, keystroke
+            // appends/deletes, and the caret back-sync. Lets caret-anchored
+            // deletions go out as DEL keystrokes (no a11y write, no IME hide).
+            var lastSyncedCaret by remember {
+                mutableIntStateOf(fieldValue.selection.end.coerceIn(0, fieldValue.text.length))
+            }
+            // Under the FALLBACK IME policy the failure mode CHANGED (full log
+            // 2026-07-17 19:03:11.132): each a11y write migrates display focus
+            // 0→VD and the keyboard — which now STAYS VISIBLE — silently
+            // re-binds to Chrome's field as a legitimate FALLBACK client.
+            // requestFocus() is then a no-op (Compose focus never left) and
+            // show() is a no-op (already shown), so nothing ever rebinds the
+            // relay: typing dies after 1-2 keys with zero hides. The reliable
+            // LOCAL tell is the relay window losing WINDOW focus; the reliable
+            // fix is pulling display-0 focus back via the privileged
+            // refocusTopTaskOnDisplay binder (the relay is d0's top task).
+            val regrabWindowFocusIfLost: () -> Boolean = regrab@{
+                val lost = runCatching { !hostView.hasWindowFocus() }.getOrDefault(false)
+                if (!lost) return@regrab false
+                // Direct grab by OUR OWN taskId — no shell-side task
+                // enumeration (that path failed silently every time), and no
+                // shift-key trick (it landed on d=-1 = the focused external
+                // display; see ShellUserService.setDisplayId). focusTask logs
+                // every method attempt server-side, so the capture will name
+                // the spelling this ROM honors.
+                val ok = runCatching {
+                    PortalPadApp.instance.activeBoundBackend?.focusTask(relayTaskId) == true
+                }.getOrDefault(false)
+                android.util.Log.i(
+                    "PortalPadRelay",
+                    "postWrite: window focus LOST → focusTask($relayTaskId) ok=$ok",
+                )
+                true
+            }
+            // One recovery for BOTH write paths (text and selection-only —
+            // each migrates focus identically). Fast focus+show for the cheap
+            // cases, then the window-focus check once the migration has
+            // actually landed.
+            val postWriteRecover: () -> Unit = {
+                relayScope.launch {
+                    // First regrab at +40ms — the migration lands ~25ms after
+                    // the write; every ms shaved here is a ms less of the
+                    // window where a resuming keystroke would die.
+                    kotlinx.coroutines.delay(40)
+                    regrabWindowFocusIfLost()
+                    runCatching { focusRequester.requestFocus() }
+                    runCatching { keyboardController?.show() }
+                    // ESCALATE STRAIGHT TO THE TAP: repeated focusTask rounds
+                    // never succeed where the first failed (23:11 capture:
+                    // ok=true three times per episode, focus still lost until
+                    // the tap every time) — the old second round was ~340ms of
+                    // pure dead time in the vulnerable window.
+                    // Focus-follows-touch is bedrock: a pointer down on the
+                    // external display is exactly what steals focus away, so a
+                    // pointer down here pulls it home.
+                    kotlinx.coroutines.delay(180)
+                    val stillLost = runCatching { !hostView.hasWindowFocus() }.getOrDefault(false)
+                    val tapAt = fieldTapPoint
+                    if (stillLost && tapAt != null) {
+                        // CARET-SAFE: the tap lands a caret at the field's
+                        // right end; save the real caret, arm the echo guard so
+                        // the jump can't schedule a flush, tap, then restore.
+                        tapSavedSelection = fieldValue.selection
+                        suppressTapEchoUntil =
+                            android.os.SystemClock.uptimeMillis() + 900L
+                        runCatching {
+                            PortalPadApp.instance.activeBoundBackend
+                                ?.tap(0, tapAt.first, tapAt.second)
+                        }
+                        android.util.Log.i(
+                            "PortalPadRelay",
+                            "postWrite: STILL lost → caret-safe tap fallback (${tapAt.first.toInt()},${tapAt.second.toInt()})",
+                        )
+                        kotlinx.coroutines.delay(150)
+                        tapSavedSelection?.let { saved ->
+                            fieldValue = fieldValue.copy(selection = saved)
+                        }
+                    }
+                    runCatching { focusRequester.requestFocus() }
+                    runCatching { keyboardController?.show() }
+                }
+            }
+            val flushSync: () -> Unit = flush@{
+                syncJob?.cancel()
+                lastFlushAt = android.os.SystemClock.uptimeMillis()
+                val t = pendingSyncText ?: return@flush
+                pendingSyncText = null
+                val caret = pendingSyncCaret
+                val svc = PortalPadAccessibilityService.instance
+                if (t == lastSyncedText) {
+                    // TYPING-RESIDUE caret-only change: SKIP the write
+                    // entirely. A SET_SELECTION migrates the IME target
+                    // exactly like SET_TEXT — a whole focus war for a caret
+                    // nudge the next text write will carry anyway. Only
+                    // deliberate caret moves (no text edit in the last 1.5s)
+                    // are worth a migration.
+                    if (android.os.SystemClock.uptimeMillis() - lastTextEditAt < 1500) {
+                        lastSyncedCaret = caret
+                        return@flush
+                    }
+                    // Deliberate selection-only move: sync it. The
+                    // SET_SELECTION still migrates focus/IME target (the
+                    // 17:31:16.056 migration was a bare
+                    // performAccessibilityAction), so it needs the same fast
+                    // focus+show recovery.
+                    runCatching { svc?.setFieldSelection(caret, caret) }
+                    lastSyncedCaret = caret
+                    lastA11yPushAt = android.os.SystemClock.uptimeMillis()
+                    postWriteRecover()
+                    return@flush
+                }
+                val ok = runCatching { svc?.setFieldText(t) == true }.getOrDefault(false)
+                if (ok) {
+                    runCatching { svc?.setFieldSelection(caret, caret) }
+                    lastSyncedCaret = caret
+                    lastA11yPushAt = android.os.SystemClock.uptimeMillis()
+                    // ACTION_SET_TEXT on the EXTERNAL field makes the system
+                    // briefly treat CHROME's node as the active editor, so the
+                    // relay window is left "focused without an editor" and the
+                    // IME hides it (android1.txt: HIDE_SAME_WINDOW_FOCUSED_
+                    // WITHOUT_EDITOR, relay hasFocusedEditor=false while
+                    // Chrome's node held the editor role). Re-request focus on
+                    // OUR field so the editor role returns to the relay — the
+                    // real cause of the "type one letter then stuck" hide,
+                    // which no keyboard re-SHOW could fix because the system
+                    // correctly saw no editor.
+                    // ALSO (kb test 2026-07-17 17:31:16.056→.082): the a11y
+                    // write migrates window focus to Chrome on the external
+                    // display (policy HIDE), landing a HIDE_DISPLAY_IME_
+                    // POLICY_HIDE ~25ms out. Re-SHOW here, fast, instead of
+                    // waiting for the +1300ms reclaim (which left the keyboard
+                    // down for seconds). Time-based, bounded, no visibility
+                    // feedback — cannot oscillate.
+                    postWriteRecover()
+                } else {
+                    // No a11y target (poller-opened relay): legacy keystrokes,
+                    // diffed against what the external field ACTUALLY holds.
+                    val base = lastSyncedText
+                    val common = base.commonPrefixWith(t).length
+                    repeat(base.length - common) { injector.pressKey(KeyEvent.KEYCODE_DEL) }
+                    t.substring(common).forEach { forwardCharacter(it, injector) }
+                }
+                lastSyncedText = t
+            }
+            // Leaving the tab (switch or relay close) flushes any pending push
+            // so the external field can't be left stale.
+            DisposableEffect(Unit) { onDispose { runCatching { flushSync() } } }
+            // EXTERNAL→RELAY caret sync: while on the Android path, the target
+            // field's selection changes (published by the a11y back-sync) move
+            // this field's caret to match — clicking in the glasses field now
+            // updates the typing indicator here, like the custom keyboard's
+            // model. Clamped to the current text; no-ops when already equal, so
+            // it can't loop with the outbound push above.
+            LaunchedEffect(Unit) {
+                com.portalpad.app.service.PortalPadAccessibilityService
+                    .relayFieldSelection.collect { sel ->
+                        val len = fieldValue.text.length
+                        val a = sel.first.coerceIn(0, len)
+                        val b = sel.second.coerceIn(0, len)
+                        android.util.Log.i("PortalPadRelay",
+                            "DIAG-CARETSYNC apply(android) sel=${sel.first}..${sel.second} → $a..$b (was ${fieldValue.selection.min}..${fieldValue.selection.max}, len=$len)")
+                        lastSyncedCaret = b
+                        if (fieldValue.selection.min != a || fieldValue.selection.max != b) {
+                            fieldValue = fieldValue.copy(
+                                selection = androidx.compose.ui.text.TextRange(a, b),
+                            )
+                        }
+                    }
+            }
             OutlinedTextField(
-                value = fieldValue,
-                onValueChange = { newValue ->
-                    // LIVE typing on the ANDROID-keyboard path: forward the diff
-                    // between old and new text as key events to the external display.
-                    // This path is the simple, known-good keystroke forwarder — it
-                    // types reliably but can only reliably backspace at the END of a
-                    // field (the keystroke DEL desyncs the IME on a prefilled field
-                    // after one delete). For reliable mid-text editing and backspace,
-                    // use the custom keyboard (toggle above), which drives the field
-                    // via accessibility SET_TEXT instead and has no IME to desync.
-                    val newText = newValue.text
-                    val oldText = fieldValue.text
-                    when {
-                        newText.length == oldText.length + 1 && newText.startsWith(oldText) ->
-                            forwardCharacter(newText.last(), injector)
-                        newText.length == oldText.length - 1 && oldText.startsWith(newText) ->
-                            injector.pressKey(KeyEvent.KEYCODE_DEL)
-                        newText.length > oldText.length -> {
-                            val commonPrefixLen = oldText.commonPrefixWith(newText).length
-                            newText.substring(commonPrefixLen).forEach {
-                                forwardCharacter(it, injector)
+                // DISPLAY-layer sentinel: an empty field renders one zero-width
+                // space, so an IME backspace on "empty" DELETES something and
+                // becomes observable — the only reliable way to give the same
+                // "nothing to delete" double-buzz the custom keyboard has
+                // (IMEs emit no event for a no-op delete). fieldValue itself
+                // stays CLEAN; the sentinel exists only in the view.
+                value = if (fieldValue.text.isEmpty()) {
+                    TextFieldValue("\u200B", selection = TextRange(1))
+                } else fieldValue,
+                onValueChange = { rawValue ->
+                    // Normalize the display-layer sentinel out of BOTH text and
+                    // selection up front, so the rest of the handler only ever
+                    // sees clean state. The old code filtered sentinel from the
+                    // TEXT but left the SELECTION pointing past it — so typing a
+                    // char from the empty-sentinel state placed the caret one
+                    // position late and corrupted every following keystroke
+                    // (field: "google.com" → "gvgggghhh..."). Rebase any
+                    // selection index that sits past a sentinel char.
+                    val sentinelIdx = rawValue.text.indexOf('\u200B')
+                    val newValue = if (sentinelIdx < 0) rawValue else {
+                        val cleaned = rawValue.text.replace("\u200B", "")
+                        fun rebase(i: Int): Int {
+                            // count sentinels at or before position i
+                            var shift = 0
+                            var p = rawValue.text.indexOf('\u200B')
+                            while (p in 0 until i) {
+                                shift++
+                                p = rawValue.text.indexOf('\u200B', p + 1)
+                            }
+                            return (i - shift).coerceIn(0, cleaned.length)
+                        }
+                        TextFieldValue(
+                            cleaned,
+                            selection = TextRange(
+                                rebase(rawValue.selection.start),
+                                rebase(rawValue.selection.end),
+                            ),
+                        )
+                    }
+                    // Empty-backspace on the sentinel: buzz, change nothing
+                    // (recomposition re-supplies the sentinel).
+                    if (fieldValue.text.isEmpty() && newValue.text.isEmpty()) {
+                        if (rawValue.text.isEmpty()) {
+                            injector.buzz()
+                            relayScope.launch {
+                                kotlinx.coroutines.delay(110)
+                                injector.buzz()
                             }
                         }
-                        newText.length < oldText.length -> {
-                            repeat(oldText.length - newText.length) {
-                                injector.pressKey(KeyEvent.KEYCODE_DEL)
+                        return@OutlinedTextField
+                    }
+                    // LIVE typing on the ANDROID-keyboard path. Pure ASCII
+                    // APPENDS forward as key events (live, cheap, works even
+                    // without an a11y target). Everything else — any deletion,
+                    // an autocorrect REWRITE (the old code forwarded the new
+                    // suffix without deleting the divergent tail: teh→the
+                    // desynced the target), emoji / non-ASCII (unmappable to
+                    // key codes) — goes through the SAME accessibility
+                    // SET_TEXT mechanism the custom keyboard uses, which is
+                    // deterministic. If no a11y target exists (relay opened by
+                    // the Shizuku poller, which has no node), fall back to the
+                    // legacy best-effort keystrokes.
+                    val newText = newValue.text
+                    val oldText = fieldValue.text
+                    // FALLBACK-TAP ECHO: inside the guard window, a
+                    // selection-only change is the recovery tap's own caret
+                    // jump — keep the user's caret, schedule NOTHING (see
+                    // suppressTapEchoUntil's declaration for the oscillation
+                    // this prevents).
+                    if (newText == oldText &&
+                        android.os.SystemClock.uptimeMillis() < suppressTapEchoUntil
+                    ) {
+                        fieldValue = newValue.copy(
+                            selection = tapSavedSelection ?: newValue.selection,
+                        )
+                        return@OutlinedTextField
+                    }
+                    // "Field just cleared" cue: the last observable moment on
+                    // the Android path (an IME backspace on an ALREADY-empty
+                    // field produces no event we can see — the key listener
+                    // below catches it only on IMEs that send key events).
+                    if (oldText.isNotEmpty() && newText.isEmpty()) {
+                        injector.buzz()
+                        relayScope.launch {
+                            kotlinx.coroutines.delay(110)
+                            injector.buzz()
+                        }
+                    }
+                    val pureAppend = newText.length > oldText.length && newText.startsWith(oldText)
+                    val appended = if (pureAppend) newText.substring(oldText.length) else ""
+                    // Appends stream live as keystrokes ONLY while no debounced
+                    // push is pending — keystroking over a not-yet-synced
+                    // deletion would type onto STALE text.
+                    // GATED OFF — see FORWARD_LIVE_KEYSTROKES (bottom of file):
+                    // injected keys on the external display kill this window's
+                    // InputConnection via display-focus migration.
+                    val asciiAppend = FORWARD_LIVE_KEYSTROKES &&
+                        pureAppend && pendingSyncText == null &&
+                        appended.all { it.code in 0x20..0x7E || it == '\n' }
+                    // PURE END-TRUNCATION (the hold-backspace case): a prefix
+                    // of the synced text with a collapsed caret at its end goes
+                    // out as plain DEL keystrokes — keystrokes never touch the
+                    // external field's input focus, so there is NO IME-target
+                    // migration and NO policy-hide, ever (field: an 11-wave
+                    // hide storm in 700ms outlasted every recovery scheme —
+                    // prevention is the only fix that meets "the keyboard
+                    // should never go away"). Requires the external field to be
+                    // known-synced (lastSyncedText == oldText, nothing
+                    // pending); anything murkier takes the debounced SET_TEXT
+                    // path, which also self-heals any drift on its next write.
+                    // Deletion of exactly the chars BEFORE the caret (end OR
+                    // mid-text — the back-sync means we KNOW the external
+                    // caret): DEL keystrokes, no a11y write, no IME hide
+                    // (field: a single mid-text backspace after an external
+                    // caret click still stormed). ASCII-only deleted span so a
+                    // DEL-per-char matches; anything else self-heals via the
+                    // SET_TEXT path.
+                    val delCount = oldText.length - newText.length
+                    val caretPos = newValue.selection.end.coerceIn(0, newText.length)
+                    // GATED OFF — same reason as asciiAppend above.
+                    val pureTruncation = FORWARD_LIVE_KEYSTROKES &&
+                        pendingSyncText == null &&
+                        lastSyncedText == oldText && delCount > 0 &&
+                        newValue.selection.min == newValue.selection.max &&
+                        caretPos + delCount <= oldText.length &&
+                        lastSyncedCaret == caretPos + delCount &&
+                        oldText.removeRange(caretPos, caretPos + delCount) == newText &&
+                        oldText.substring(caretPos, caretPos + delCount)
+                            .all { it.code in 0x20..0x7E }
+                    when {
+                        newText == oldText && newValue.selection == fieldValue.selection -> Unit
+                        asciiAppend -> {
+                            appended.forEach { forwardCharacter(it, injector) }
+                            lastSyncedText = newText
+                            lastSyncedCaret = newText.length
+                        }
+                        pureTruncation -> {
+                            repeat(delCount) { injector.pressKey(KeyEvent.KEYCODE_DEL) }
+                            lastSyncedText = newText
+                            lastSyncedCaret = caretPos
+                        }
+                        else -> {
+                            // Deletions, rewrites, emoji, selection moves — and
+                            // appends over a pending push — all coalesce into
+                            // ONE debounced external write.
+                            pendingSyncText = newText
+                            pendingSyncCaret = newValue.selection.end.coerceIn(0, newText.length)
+                            syncJob?.cancel()
+                            // PAUSE-GATED: each keystroke pushes the flush
+                            // out; it fires only after pauseFlushMs of true
+                            // stillness, so NOTHING touches the external node
+                            // while keys are flowing (see the pause-gate doc
+                            // at the bottom of this file for the evidence).
+                            if (newText != oldText) {
+                                lastTextEditAt = android.os.SystemClock.uptimeMillis()
+                            }
+                            val flushWait = pauseFlushMs.toLong().coerceIn(300L, 1500L)
+                            syncJob = relayScope.launch {
+                                kotlinx.coroutines.delay(flushWait)
+                                flushSync()
+                                // TWO guarded re-claims, both TIME-based (never
+                                // visibility-triggered — that oscillated). The
+                                // first lands past the initial policy-hide; the
+                                // second past the multi-wave storm tail
+                                // (keyboard.txt: a 3-wave hide burst at burst
+                                // end outlasted a single re-claim — the "hides
+                                // near the end when done backspacing fast").
+                                // The guard in reclaimIme collapses overlap.
+                                // In recoveryJob (NOT here) so the next
+                                // keystroke's syncJob?.cancel() can't kill a
+                                // pending reclaim — see recoveryJob's decl.
+                                recoveryJob?.cancel()
+                                recoveryJob = relayScope.launch {
+                                    kotlinx.coroutines.delay(1300)
+                                    if (regrabWindowFocusIfLost()) kotlinx.coroutines.delay(120)
+                                    if (!imeCurrentlyVisible(hostView)) reclaimIme()
+                                    kotlinx.coroutines.delay(1600)
+                                    if (regrabWindowFocusIfLost()) kotlinx.coroutines.delay(120)
+                                    if (!imeCurrentlyVisible(hostView)) reclaimIme()
+                                }
                             }
                         }
                     }
-                    fieldValue = newValue
-                    injector.setSearchQuery(newValue.text)
+                    fieldValue = TextFieldValue(
+                        newText,
+                        selection = TextRange(
+                            newValue.selection.start.coerceIn(0, newText.length),
+                            newValue.selection.end.coerceIn(0, newText.length),
+                        ),
+                    )
+                    injector.setSearchQuery(newText)
                     keystrokeNonce++
                 },
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(min = 200.dp)
+                    .onGloballyPositioned { c ->
+                        runCatching {
+                            val b = c.boundsInWindow()
+                            val loc = IntArray(2).also { hostView.getLocationOnScreen(it) }
+                            fieldTapPoint = Pair(
+                                loc[0] + b.right - 24f,
+                                loc[1] + (b.top + b.bottom) / 2f,
+                            )
+                        }
+                    }
                     .focusRequester(focusRequester)
+                    // OPPORTUNISTIC empty-backspace cue: fires only on IMEs
+                    // that deliver delete as key events (some do, many don't —
+                    // stated limitation; the guaranteed cue is the clear-
+                    // transition buzz in onValueChange). Never consumes.
+                    .onPreviewKeyEvent { ev ->
+                        if (ev.type == KeyEventType.KeyDown &&
+                            ev.key == Key.Backspace &&
+                            fieldValue.text.isEmpty()
+                        ) {
+                            injector.buzz()
+                            relayScope.launch {
+                                kotlinx.coroutines.delay(110)
+                                injector.buzz()
+                            }
+                        }
+                        false
+                    }
                     .onFocusChanged { state ->
                         // The VD/external app can steal IME focus after a couple
                         // keystrokes, which silently stops typing until the user
@@ -573,10 +1088,9 @@ private fun RelayScreen(injector: InputInjector, initialText: String = "", onClo
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(16.dp))
                     .clickable {
-                        // Text was already forwarded live as you typed, so Send
-                        // just notifies the on-display search overlay (launch top
-                        // result) and injects a real ENTER for the focused field
-                        // (posts the message / submits the address bar).
+                        // Flush any pending debounced write FIRST, or ENTER
+                        // would submit the external field's stale text.
+                        runCatching { flushSync() }
                         injector.submitSearch()
                         injector.pressKey(KeyEvent.KEYCODE_ENTER)
                     }
@@ -1064,10 +1578,13 @@ private fun SelectionHandle(
 private fun ColumnScope.CustomKeyboardSection(
     injector: InputInjector,
     initialText: String,
+    initialCaret: Int,
+    initialAnchor: Int = -1,
     mirrorHeight: Dp = MIRROR_HEIGHT,
+    onState: (String, Int) -> Unit = { _, _ -> },
 ) {
     var buffer by remember { mutableStateOf(initialText) }
-    var caret by remember { mutableIntStateOf(initialText.length) }
+    var caret by remember { mutableIntStateOf(initialCaret.coerceIn(0, initialText.length)) }
     var shift by remember { mutableStateOf(false) }
     var symbols by remember { mutableStateOf(false) }
     // Accent swap layer: 0 = normal letters; 1..ACCENT_TIERS.size apply an accent map.
@@ -1151,7 +1668,30 @@ private fun ColumnScope.CustomKeyboardSection(
     }
     // Selection: an anchor (null = no selection). The selected span runs between the
     // anchor and the caret. Only "Select all" creates one; any edit/move/tap clears it.
-    var selAnchor by remember { mutableStateOf<Int?>(null) }
+    var selAnchor by remember {
+        mutableStateOf<Int?>(
+            initialAnchor.takeIf { it in 0..initialText.length && it != initialCaret },
+        )
+    }
+    // EXTERNAL→CUSTOM caret sync: a tap in the external field (published by the
+    // a11y back-sync) moves this keyboard's caret to match. drop(1) skips the
+    // StateFlow's replay of the LAST selection on entry — without it, merely
+    // switching to this tab would yank the caret to a stale external position,
+    // stomping the tab-switch handoff. Applied locally only (no pushCaret):
+    // the external field is ALREADY at this position — pushing it back would
+    // just round-trip through the echo window.
+    LaunchedEffect(Unit) {
+        PortalPadAccessibilityService.relayFieldSelection.collect { sel ->
+            val c = sel.first.coerceIn(0, buffer.length)
+            android.util.Log.i("PortalPadRelay",
+                "DIAG-CARETSYNC apply(custom) sel=${sel.first}..${sel.second} → caret=$c (was $caret, len=${buffer.length})")
+            if (c != caret) {
+                caret = c
+                selAnchor = null
+                onState(buffer, caret)
+            }
+        }
+    }
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
 
@@ -1167,6 +1707,7 @@ private fun ColumnScope.CustomKeyboardSection(
         val ok = runCatching { svc?.setFieldText(buffer) == true }.getOrDefault(false)
         if (ok) runCatching { svc?.setFieldSelection(caret, caret) }
         injector.setSearchQuery(buffer)
+        onState(buffer, caret)
         android.util.Log.i(
             "PortalPadRelay",
             "customKb text: buffer='${buffer.take(40)}'(len=${buffer.length}) caret=$caret setText=$ok",
@@ -1176,6 +1717,7 @@ private fun ColumnScope.CustomKeyboardSection(
     }
     fun pushCaret() {
         runCatching { PortalPadAccessibilityService.instance?.setFieldSelection(caret, caret) }
+        onState(buffer, caret)
         android.util.Log.i("PortalPadRelay", "customKb caret=$caret")
     }
     fun insert(s: String) {
@@ -1212,6 +1754,15 @@ private fun ColumnScope.CustomKeyboardSection(
                 buffer = buffer.substring(0, start) + buffer.substring(c)
                 caret = start
                 pushText()
+            } else {
+                // NOTHING to delete — say so with a distinct DOUBLE buzz
+                // (field: silent empty-backspace felt like dead keys). One
+                // per press, so held repeat gives a clear "you're done" pulse.
+                injector.buzz()
+                scope.launch {
+                    kotlinx.coroutines.delay(110)
+                    injector.buzz()
+                }
             }
         }
     }
@@ -2378,6 +2929,48 @@ private fun ColumnScope.CustomKeyboardSection(
  * that completed before the letter went down. Field report: "keys send the
  * wrong keys" in both ?123 and ABC mode.
  */
+// LIVE KEY FORWARDING — DISABLED (root cause of "Android tab types ONE letter
+// then dies", full log 2026-07-17 15:43:09.988): forwarding a typed character
+// (or a DEL) as an injected key event onto the EXTERNAL display trips this
+// ROM's key-on-unfocused-display policy — PhoneWindowManager
+// .interceptKeyBeforeQueueing → moveDisplayToTopInternal → InputDispatcher
+// "Focused display: 0 -> 40" — the relay window loses WINDOW focus and the
+// system keyboard's InputConnection goes permanently INACTIVE
+// ("setComposingText on inactive InputConnection" on every later key). The
+// injector was OUR ShellUserService (uid 2000/shell, the PortalPadHud
+// process), NOT HoneyBoard. The old rationale ("keystrokes never touch the
+// external field's input focus → no IME-target migration") was true at the
+// IMMS layer but missed this display-focus layer beneath it — and it also
+// explains the historical "can only delete one letter" on this tab. All
+// Android-tab edits now coalesce into the debounced a11y SET_TEXT write,
+// which never enters InputDispatcher; its IME-target migration is handled by
+// the post-write editor-focus re-request. Tradeoff: the external field
+// updates ~450ms after a typing pause instead of live per key. Flip this
+// back only with fresh log evidence.
+private const val FORWARD_LIVE_KEYSTROKES = false
+
+// FLUSHES ARE PAUSE-GATED — the rolling ceiling is deliberately GONE.
+// Evidence (full log 2026-07-17 22:11): once a write migrates the IME target
+// to the external field, every HoneyBoard KEYPRESS re-steals display focus
+// (handleTapOutsideFocusInsideSelf — the keyboard's own keys become
+// external-display territory until the re-target completes), so recovery can
+// never outrun actively-moving fingers. The rolling ceiling guaranteed a
+// write mid-burst every ~700ms = guaranteed casualties ("types 7-10 chars
+// then stops"). The ONLY stable regime while keys are flowing is ZERO writes;
+// one write per genuine pause, with the recovery chain settling inside the
+// pause. The pause threshold is the RELAY_PAUSE_FLUSH_MS pref (tunable in
+// Settings; default 600ms). Do NOT reintroduce mid-typing writes without new
+// evidence that the ROM stopped treating IME taps this way.
+
+// True when the soft keyboard is currently visible for this window. Platform
+// insets API (minSdk 30 covers WindowInsets.Type.ime()). On any failure,
+// returns false so the caller's reclaim still runs — the safe fallback is the
+// old always-reclaim behavior.
+private fun imeCurrentlyVisible(view: android.view.View): Boolean =
+    runCatching {
+        view.rootWindowInsets?.isVisible(android.view.WindowInsets.Type.ime()) == true
+    }.getOrDefault(false)
+
 private val VIRTUAL_KEYMAP: android.view.KeyCharacterMap by lazy {
     android.view.KeyCharacterMap.load(android.view.KeyCharacterMap.VIRTUAL_KEYBOARD)
 }

@@ -55,6 +55,10 @@ class PerformanceHud(
     private var scope: CoroutineScope? = null
 
     @Volatile private var enabled = false
+    // Suppressed while the widget overlay is shown (it renders ABOVE the HUD, so
+    // the HUD would poke through / sit behind it). Independent of [enabled]: when
+    // the overlay closes, visibility returns to whatever the saved toggle says.
+    @Volatile private var widgetHidden = false
     @Volatile private var corner = CORNER_TOP_RIGHT
     @Volatile private var showFps = true
     @Volatile private var showFrameTime = true
@@ -64,6 +68,7 @@ class PerformanceHud(
     // fps derivation: delta of frameCount over wall-clock between ticks.
     private var lastCount = 0L
     private var lastTickNs = 0L
+    private var lastLoggedHz = -1f
 
     // Standalone mode (system mirror): the HUD owns its overlay window instead
     // of parenting into the VD mirror's host. Set by [standalone]; removed in
@@ -78,6 +83,11 @@ class PerformanceHud(
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, textPx)
             typeface = Typeface.MONOSPACE
             includeFontPadding = false
+            // Never wrap mid-row: measure to the widest line (mirror-mode's
+            // standalone window was wrapping "60 Hz" and "· — behind" onto
+            // continuation lines; each status must own exactly one line, same
+            // as overlay mode).
+            setHorizontallyScrolling(true)
             setLineSpacing(textPx * 0.18f, 1f)
             val padX = (textPx * 0.7f).toInt()
             val padY = (textPx * 0.45f).toInt()
@@ -92,6 +102,13 @@ class PerformanceHud(
         }
         parent.addView(tv, cornerLayoutParams(corner))
         view = tv
+        // Seed the overlay-suppression state: a VD rebind / mirror flip / DPI
+        // change recreates this HUD while the widget overlay may still be open,
+        // and the service's overlay-open collector only fires on state CHANGES —
+        // so a HUD born mid-overlay must read the current value itself.
+        widgetHidden = runCatching {
+            com.portalpad.app.PortalPadApp.instance.widgetOverlayOpen.value
+        }.getOrDefault(false)
 
         val s = CoroutineScope(Dispatchers.Main)
         scope = s
@@ -119,9 +136,18 @@ class PerformanceHud(
         ownWindowManager = null
     }
 
+    /** Show/hide the HUD while the widget overlay is up. Main-thread only
+     *  (touches the view) — the service collector that drives this runs on
+     *  Dispatchers.Main. No-op if the new state matches the current one. */
+    fun setWidgetHidden(hidden: Boolean) {
+        if (widgetHidden == hidden) return
+        widgetHidden = hidden
+        applyVisibility()
+    }
+
     private fun applyVisibility() {
-        view?.visibility = if (enabled) View.VISIBLE else View.GONE
-        if (enabled) {
+        view?.visibility = if (enabled && !widgetHidden) View.VISIBLE else View.GONE
+        if (enabled && !widgetHidden) {
             // Seed the fps delta so the first sample isn't a huge spike.
             lastCount = GlColorRenderer.frameCount
             lastTickNs = System.nanoTime()
@@ -147,6 +173,22 @@ class PerformanceHud(
         val drawMs = GlColorRenderer.lastDrawNanos / 1e6
         val mode = display.mode
         val hz = mode.refreshRate
+        // DIAG-HUDHZ: the HUD always reads 60 Hz even where the panel supports 90.
+        // Log which display it reads, its active refresh, and the supported rates —
+        // tells us if 90 is available-but-unselected (mode-selection bug) or 60 is
+        // the honest delivered rate (e.g. the VirtualDisplay caps at 60). Logged
+        // only when the value changes, so it's low-volume.
+        if (hz != lastLoggedHz) {
+            lastLoggedHz = hz
+            val supported = runCatching {
+                display.supportedModes.joinToString(",") { "%.0f".format(it.refreshRate) }
+            }.getOrDefault("?")
+            android.util.Log.d(
+                "PortalPadHud",
+                "DIAG-HUDHZ disp=${display.displayId} activeHz=${"%.0f".format(hz)} " +
+                    "mode=${mode.physicalWidth}x${mode.physicalHeight} supported=[$supported]",
+            )
+        }
         val dropped = (hz - fps).coerceAtLeast(0.0).let { Math.round(it) }
 
         val sb = StringBuilder()
@@ -170,10 +212,19 @@ class PerformanceHud(
             val sfFps = fpsSampler?.invoke() ?: -1f
             if (sfFps > 0f) {
                 if (showFps) sb.append("${"%.0f".format(sfFps)} fps\n")
+                // draw row intentionally ABSENT under system mirror (GL-only
+                // metric, nothing to measure) — the Settings toggle is greyed
+                // with an explanation instead of the HUD showing a dash.
                 if (showDropped) {
                     val sfDropped = (hz - sfFps).coerceAtLeast(0f).let { Math.round(it) }
                     sb.append("vsync ${"%.0f".format(hz)} · ~$sfDropped behind\n")
                 }
+            } else {
+                // fps is NOT measurable under system mirror (confirmed —
+                // --latency returns only the header line for every layer). Show
+                // nothing rather than a dashed placeholder that reads as broken;
+                // the Settings rows grey out to signal "not available in mirror".
+                // Only the resolution·Hz row above shows under mirror.
             }
         }
         v.text = sb.toString().trimEnd('\n')

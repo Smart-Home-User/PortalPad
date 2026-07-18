@@ -55,10 +55,22 @@ object UpdateChecker {
     private const val KEY_APK_HASH = "installed_apk_sha256"
     private const val KEY_APK_HASH_KEY = "installed_apk_sha256_key"
 
-    private const val AUTO_CHECK_MIN_INTERVAL_MS = 24L * 60 * 60 * 1000
+    private const val AUTO_CHECK_MIN_INTERVAL_MS = 15L * 60 * 1000
 
     /** Amber "« New" hint next to the top-bar update icon. */
     val badgeVisible = mutableStateOf(false)
+
+    /** True while a live network check is running — drives the spinning Sync icon
+     *  on the main screen. Only ever true during an actual GitHub fetch (never for
+     *  the instant cached-badge refresh), so the spin is honest. */
+    val checking = mutableStateOf(false)
+
+    /** Amber "« Released" word next to the version: same version tag as the latest
+     *  release, but the released build isn't the one installed (different bytes, or
+     *  published after this build). Distinct from a genuine ahead/dev build, which
+     *  tints the version amber but shows NO word. Mutually exclusive with the "« New"
+     *  badge (you can't be both behind and same-tag). */
+    val releasedWordVisible = mutableStateOf(false)
 
     /**
      * Amber tint on the top-bar version number: true when this binary is NOT
@@ -78,14 +90,18 @@ object UpdateChecker {
         val latest = result?.latest
         if (latest == null) {
             versionTintAmber.value = false
+            releasedWordVisible.value = false
             return
         }
         val installed = parseVersionNumbers(BuildConfig.VERSION_NAME)
         val ahead = isNewer(installed, parseVersionNumbers(latest.tag))
         val same = assessSameTag(ctx, result)
-        versionTintAmber.value = ahead ||
-            same == SameTagStatus.MISMATCH ||
-            same == SameTagStatus.PUBLISHED_AFTER_BUILD
+        val sameTagReleasedElsewhere =
+            same == SameTagStatus.MISMATCH || same == SameTagStatus.PUBLISHED_AFTER_BUILD
+        versionTintAmber.value = ahead || sameTagReleasedElsewhere
+        // Word only for the same-tag "official build isn't yours" case — NOT for a
+        // genuine ahead/dev build (that just tints the version, no word).
+        releasedWordVisible.value = sameTagReleasedElsewhere
     }
 
     data class ReleaseInfo(
@@ -173,10 +189,15 @@ object UpdateChecker {
                 applyBadgeFrom(app, cached)
                 refreshVersionTint(app, cached)
                 if (due) {
-                    val result = performCheck(app)
-                    prefs(app).edit().putLong(KEY_LAST_AUTO_MS, System.currentTimeMillis()).apply()
-                    refreshVersionTint(app, result)
-                    Log.i(TAG, "launch auto-check done; badge=${badgeVisible.value} tint=${versionTintAmber.value}")
+                    checking.value = true
+                    try {
+                        val result = performCheck(app)
+                        prefs(app).edit().putLong(KEY_LAST_AUTO_MS, System.currentTimeMillis()).apply()
+                        refreshVersionTint(app, result)
+                        Log.i(TAG, "launch auto-check done; badge=${badgeVisible.value} tint=${versionTintAmber.value}")
+                    } finally {
+                        checking.value = false
+                    }
                 }
             } catch (t: Throwable) {
                 Log.w(TAG, "launch auto-check failed: ${t.message}")

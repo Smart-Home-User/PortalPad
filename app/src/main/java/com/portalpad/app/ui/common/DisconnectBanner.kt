@@ -1,6 +1,7 @@
 package com.portalpad.app.ui.common
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -45,7 +46,12 @@ import kotlinx.coroutines.delay
  * empties. This composable is purely the visual; it doesn't call finish().
  */
 @Composable
-internal fun DisconnectBanner(externalDisplayId: Int?) {
+internal fun DisconnectBanner(
+    externalDisplayId: Int?,
+    /** Immediate return action (same destination as the auto-finish watcher —
+     *  the button just skips the grace wait). Hidden on the reconnect flash. */
+    onReturnNow: (() -> Unit)? = null,
+) {
     // Grace window — keep in sync with the auto-finish watcher's goneGraceMs.
     val graceMs = 10000
     // Only engage after we've actually seen a display, so the initial null at
@@ -98,6 +104,10 @@ internal fun DisconnectBanner(externalDisplayId: Int?) {
             .background(androidx.compose.ui.graphics.Color(0xFF080510).copy(alpha = 0.62f)),
         contentAlignment = Alignment.Center,
     ) {
+        androidx.compose.foundation.layout.Column(
+            Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
         androidx.compose.foundation.layout.Column(
             Modifier
                 .fillMaxWidth(0.78f)
@@ -157,6 +167,29 @@ internal fun DisconnectBanner(externalDisplayId: Int?) {
                         .background(accent),
                 )
             }
+        }
+        if (!showReconnected && onReturnNow != null) {
+            Spacer(Modifier.height(14.dp))
+            androidx.compose.foundation.layout.Row(
+                Modifier
+                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(14.dp))
+                    .background(com.portalpad.app.ui.theme.AbSurfaceElevated)
+                    .border(
+                        1.dp,
+                        accent.copy(alpha = 0.45f),
+                        androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+                    )
+                    .clickable { onReturnNow() }
+                    .padding(horizontal = 18.dp, vertical = 10.dp),
+            ) {
+                androidx.compose.material3.Text(
+                    "Return to main",
+                    color = com.portalpad.app.ui.theme.AbOnSurface,
+                    fontWeight = FontWeight.SemiBold,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+        }
         }
     }
 }

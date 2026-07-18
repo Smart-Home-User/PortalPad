@@ -32,6 +32,11 @@ import com.portalpad.app.PortalPadApp
  * Enabling/disabling this service in Android Settings → Accessibility is itself
  * the on/off switch; there's no separate in-app toggle.
  */
+/** A caption_handle node on an external display. [clickable] distinguishes the two states
+ *  reliably (width-independent, so resize/resolution don't matter): the COLLAPSED mini pill
+ *  is a clickable ImageButton; the EXPANDED caption drag strip is a non-clickable View. */
+data class CaptionHandle(val rect: android.graphics.Rect, val clickable: Boolean)
+
 class PortalPadAccessibilityService : AccessibilityService() {
 
     @Volatile private var lastLaunchAt = 0L
@@ -104,11 +109,17 @@ class PortalPadAccessibilityService : AccessibilityService() {
     // post a short burst of checks that query the focused node directly.
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val probeToken = Any()
+    private val readerFindToken = Any()
     // Live reference to the last tapped editable field on the glasses. The relay
     // uses it to DELETE via ACTION_SET_TEXT (no DEL key → no focus bounce → no IME
     // cursor desync, which is why keystroke-DEL could only delete once on a field
     // that already had text). Set when the relay opens; refreshed on each use.
     @Volatile private var targetNode: android.view.accessibility.AccessibilityNodeInfo? = null
+    // When we last WROTE to the target field (SET_TEXT / SET_SELECTION). The
+    // caret back-sync ignores selection events inside FIELD_PUSH_ECHO_MS of a
+    // push — they're our own writes echoing, not the user moving the caret.
+    @Volatile private var lastFieldPushAt = 0L
+    @Volatile private var lastCaretSyncDiag = 0L
 
     private fun tn(t: Int) = when (t) {
         AccessibilityEvent.TYPE_VIEW_CLICKED -> "CLICK"
@@ -178,6 +189,23 @@ class PortalPadAccessibilityService : AccessibilityService() {
                 lastClickPkg = cp
                 lastClickAt = SystemClock.elapsedRealtime()
             }
+            // Event-driven caption "expand to fullscreen": tapping the desktop caption
+            // bar's maximize/expand control puts the window into true fullscreen MODE,
+            // which this ROM can't undo in place — the foreground service converts it to
+            // our near-full freeform maximize. Driving that off THIS click, rather than
+            // the ~2s window-monitor poll, removes most of the felt lag. Scoped to
+            // systemui caption-region view-ids so ordinary system-UI taps don't trigger
+            // the check; the poll remains a backstop if the id doesn't match.
+            if (cp == "com.android.systemui") {
+                // The caption-expand ("extend to fullscreen") click carries NO source /
+                // view-id on this ROM (logged as "null source"), so we can't match by id.
+                // Fire the convert check on any systemui click — it's cheap and gated by
+                // the fills-display geometry test + per-package recentlyConverted cooldown,
+                // so it no-ops unless a window actually went fullscreen.
+                val cvid = runCatching { event.source?.viewIdResourceName }.getOrNull()
+                Log.i(TAG, "DIAG systemui click vid=$cvid → fullscreen-convert check")
+                runCatching { PortalPadForegroundService.instance?.requestFullscreenConvertCheck() }
+            }
         }
         // Open on a real field CLICK or FOCUS. CLICKED alone missed fields that only
         // FOCUS on the first tap — WebView inputs (e.g. google.com's search box) and
@@ -192,6 +220,66 @@ class PortalPadAccessibilityService : AccessibilityService() {
             type != AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED) return
 
         val app = applicationContext as? PortalPadApp ?: return
+        // ── RELAY CARET BACK-SYNC (Android-keyboard path) ──────────────────
+        // While the relay is open, the TARGET field's caret changes flow back
+        // so the relay's text field mirrors the external caret. TWO triggers:
+        // SELCHG events (apps that announce selection changes), and CLICKs on
+        // the target field with a DIRECT selection read — field-proven
+        // necessary: Chrome's omnibox emits NO SELCHG for a caret tap while
+        // the relay holds input focus (caret.txt: taps arrived as CLICK only),
+        // so an event-driven-only sync sat silent. Runs BEFORE the auto-open
+        // gates on purpose: the sync must work even with auto-open off.
+        if (app.relayOpen &&
+            (type == AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED ||
+                type == AccessibilityEvent.TYPE_VIEW_CLICKED)
+        ) {
+            val sincePush = android.os.SystemClock.uptimeMillis() - lastFieldPushAt
+            val evPkg = event.packageName?.toString()
+            val tgtPkg = runCatching { targetNode?.packageName?.toString() }.getOrNull()
+            val cnow = android.os.SystemClock.uptimeMillis()
+            if (type == AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED) {
+                if (cnow - lastCaretSyncDiag > 500) {
+                    lastCaretSyncDiag = cnow
+                    Log.d(TAG, "DIAG-CARETSYNC SELCHG evPkg=$evPkg tgtPkg=$tgtPkg " +
+                        "from=${event.fromIndex} to=${event.toIndex} sincePush=$sincePush " +
+                        "pass=${sincePush > FIELD_PUSH_ECHO_MS && evPkg != null && evPkg == tgtPkg}")
+                }
+                if (sincePush > FIELD_PUSH_ECHO_MS && evPkg != null && evPkg == tgtPkg) {
+                    val fi = event.fromIndex
+                    val ti = event.toIndex
+                    if (fi >= 0 && ti >= 0) {
+                        relayFieldSelection.tryEmit(minOf(fi, ti) to maxOf(fi, ti))
+                    }
+                }
+            } else if (evPkg != null && evPkg == tgtPkg) {
+                // CLICK: read the selection straight off the node. No echo gate
+                // — we never inject CLICK events at the field, so a click here
+                // is always the user. Guarded to the SAME field where both view
+                // ids are known, so a click in a sibling field of the same app
+                // can't move the relay caret.
+                val src = event.source
+                if (src != null) {
+                    val editable = runCatching { src.isEditable }.getOrDefault(false)
+                    val srcVid = runCatching { src.viewIdResourceName }.getOrNull()
+                    val tgtVid = runCatching { targetNode?.viewIdResourceName }.getOrNull()
+                    val sameField = srcVid == null || tgtVid == null || srcVid == tgtVid
+                    if (editable && sameField) {
+                        runCatching { src.refresh() }
+                        val s = runCatching { src.textSelectionStart }.getOrDefault(-1)
+                        val e = runCatching { src.textSelectionEnd }.getOrDefault(-1)
+                        if (cnow - lastCaretSyncDiag > 500) {
+                            lastCaretSyncDiag = cnow
+                            Log.d(TAG, "DIAG-CARETSYNC CLICK evPkg=$evPkg vid=$srcVid " +
+                                "sel=$s..$e sincePush=$sincePush")
+                        }
+                        if (s >= 0 && e >= 0) {
+                            relayFieldSelection.tryEmit(minOf(s, e) to maxOf(s, e))
+                        }
+                    }
+                    if (src !== targetNode) runCatching { src.recycle() }
+                }
+            }
+        }
         // Respect the in-app master toggle: "Auto-open typing page on field tap".
         // Even when this service is enabled in Android Settings, the toggle is the
         // real on/off — turning it off stops auto-open without disabling the service.
@@ -222,6 +310,16 @@ class PortalPadAccessibilityService : AccessibilityService() {
             // Ignore PortalPad's own UI (e.g. the on-glasses search overlay) so we
             // don't open the relay for our own fields.
             if (pkg == packageName) return
+            // The collapsed caption-handle pill's popup (systemui handle_menu) is the
+            // window-chrome menu that opens when you tap the green handle — never a text
+            // field. It focuses as a non-editable LinearLayout and, with a recent tap
+            // (which grabbing the handle always is), passes the gates and fires a useless
+            // field probe every time it opens. Drop it here.
+            val vid = runCatching { node.viewIdResourceName }.getOrNull()
+            if (vid == "com.android.systemui:id/handle_menu") {
+                Log.i(TAG, "DIAG skip: caption handle_menu — not a field")
+                return
+            }
             // Browser field auto-open: only a deliberate CLICK on an editable node
             // (you tapping the address bar) should open the relay. Everything else in a
             // browser — FOCUS / A11YFOCUS / the probe — is Chrome auto-focusing its
@@ -341,6 +439,12 @@ class PortalPadAccessibilityService : AccessibilityService() {
         node: android.view.accessibility.AccessibilityNodeInfo,
         displayId: Int?,
         evt: String,
+        // Force the relay to open BLANK, skipping the node.text prefill read.
+        // Reader-Find clears the field via async ACTION_SET_TEXT("") just before
+        // this call; the clear hasn't propagated yet, so node.text still returns
+        // the OLD query. Reading it here would re-prefill the stale text (and
+        // re-inject it on the first keystroke). forceBlank skips the read.
+        forceBlank: Boolean = false,
     ) {
         lastLaunchAt = SystemClock.elapsedRealtime()
         Log.i(TAG, "DIAG opening relay (evt=$evt pkg=${node.packageName} disp=$displayId)")
@@ -348,11 +452,33 @@ class PortalPadAccessibilityService : AccessibilityService() {
         // backspace delete the existing text). Skip password fields, and skip PLACEHOLDER
         // text — some fields (YouTube/Chrome search) report their HINT as the text when
         // empty, so text == hint means it's really empty and we open blank.
+        // refresh() re-fetches the node's CURRENT state from the app before the
+        // prefill read — node.text is a snapshot and can lag a just-made app-side
+        // change (the general form of the Reader-Find stale-prefill race that
+        // forceBlank patches for one path). Failure is fine: we read the snapshot.
+        runCatching { node.refresh() }
         val rawText = node.text?.toString()
         val rawHint = try { node.hintText?.toString() } catch (t: Throwable) { null }
         val isPlaceholder = rawText != null && rawText == rawHint
-        val prefill = if (node.isPassword || isPlaceholder) null
+        val prefill = if (forceBlank || node.isPassword || isPlaceholder) null
             else rawText?.takeIf { it.isNotEmpty() }
+        // Seed the relay's caret from the field's CURRENT selection: the tap
+        // that opened the relay already placed the real caret (field workflow:
+        // close relay → tap a mid-text position → auto-reopen — the old open
+        // path always seeded end-of-text, ignoring the click). A full
+        // select-all (omnibox focus behavior) carries through as a selection —
+        // first keystroke replaces, matching the platform convention. Any
+        // unusable read (-1 / out of range) falls back to end-of-text, i.e.
+        // exactly the old behavior — a bad read can never make this worse.
+        val selS = if (prefill != null) {
+            runCatching { node.textSelectionStart }.getOrDefault(-1)
+        } else -1
+        val selE = if (prefill != null) {
+            runCatching { node.textSelectionEnd }.getOrDefault(-1)
+        } else -1
+        if (prefill != null) {
+            Log.i(TAG, "DIAG-CARETSYNC open-seed sel=$selS..$selE len=${prefill.length}")
+        }
         val opts = android.app.ActivityOptions.makeBasic().setLaunchDisplayId(0).toBundle()
         targetNode?.let { old -> if (old !== node) runCatching { old.recycle() } }
         targetNode = node
@@ -360,7 +486,538 @@ class PortalPadAccessibilityService : AccessibilityService() {
             startActivity(
                 android.content.Intent(applicationContext, KeyboardRelayActivity::class.java)
                     .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                    .apply { if (prefill != null) putExtra(KeyboardRelayActivity.EXTRA_PREFILL, prefill) },
+                    .apply {
+                        if (prefill != null) {
+                            putExtra(KeyboardRelayActivity.EXTRA_PREFILL, prefill)
+                            putExtra(KeyboardRelayActivity.EXTRA_CARET_START, selS)
+                            putExtra(KeyboardRelayActivity.EXTRA_CARET_END, selE)
+                        }
+                    },
+                opts,
+            )
+        }
+    }
+
+    /** Reader "Find" helper (called from the Reader panel's Find button). The
+     *  search field may exist in the tree but NOT be focused — Kindle restores
+     *  prior results with its field unfocused, so relay typing lands nowhere and
+     *  the user has to tap the field with the trackpad first. Poll briefly for
+     *  the editable field in the foreground window on [displayId], ACTION_CLICK
+     *  it to give it input focus (by node, so screen position doesn't matter),
+     *  then open the relay on it. Falls back to a plain relay open if no field
+     *  turns up, so it's never worse than the key-only path. Not Kindle-specific:
+     *  it focuses whatever editable is in the foreground reader window. */
+    fun focusReaderSearchField(displayId: Int?) {
+        mainHandler.removeCallbacksAndMessages(readerFindToken)
+        val delays = longArrayOf(200, 500, 800, 1100, 1500)
+        val done = java.util.concurrent.atomic.AtomicBoolean(false)
+        for (idx in delays.indices) {
+            val last = idx == delays.size - 1
+            mainHandler.postAtTime({
+                if (done.get()) return@postAtTime
+                val node = runCatching { firstEditableOnDisplay(displayId) }.getOrNull()
+                if (node != null) {
+                    done.set(true)
+                    mainHandler.removeCallbacksAndMessages(readerFindToken)
+                    Log.i(TAG, "DIAG reader-find: editable found → focus + relay (disp=$displayId cls=${node.className})")
+                    runCatching { node.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_FOCUS) }
+                    runCatching { node.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK) }
+                    // Clear any prior query so re-search starts blank — Kindle
+                    // restores the last search text. Same ACTION_SET_TEXT path the
+                    // relay already uses for deletes.
+                    runCatching {
+                        val clear = android.os.Bundle().apply {
+                            putCharSequence(
+                                android.view.accessibility.AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                                "",
+                            )
+                        }
+                        node.performAction(
+                            android.view.accessibility.AccessibilityNodeInfo.ACTION_SET_TEXT, clear,
+                        )
+                    }
+                    openRelayForField(node, displayId, "READER-FIND", forceBlank = true)
+                } else if (last) {
+                    Log.i(TAG, "DIAG reader-find: no editable after polls → plain relay")
+                    openPlainRelay()
+                }
+            }, readerFindToken, android.os.SystemClock.uptimeMillis() + delays[idx])
+        }
+    }
+
+    /** Collapse the freeform caption bar to a slim handle, or expand it back — by
+     *  driving SystemUI's caption decoration through accessibility (the only reach:
+     *  it's Shell-owned, not settable via am/wm). Two steps per direction: open the
+     *  caption menu (more_window when full, caption_handle when collapsed) → click
+     *  the toggle item (update_caption_to_handle / update_handle_to_caption). Scans
+     *  every non-phone (external/VD) display for the caption. Returns true if a
+     *  toggle was performed. Call OFF the main thread (it polls with short sleeps for
+     *  the menu to animate in). */
+    @Volatile private var lastHandleRectLog = 0L
+    /** Live screen rectangles of any collapsed caption handles (the slim pill) on
+     *  external displays. Used by the cursor layer to treat the handle as a MOVE zone
+     *  (grab-drag moves the window) instead of a resize edge. */
+    fun captionHandles(): List<CaptionHandle> {
+        val out = ArrayList<CaptionHandle>()
+        val byDisplay = runCatching { windowsOnAllDisplays }.getOrNull() ?: return out
+        for (i in 0 until byDisplay.size()) {
+            if (byDisplay.keyAt(i) == 0) continue
+            val wins = byDisplay.valueAt(i) ?: continue
+            for (w in wins) {
+                val root = runCatching { w.root }.getOrNull() ?: continue
+                val handles = runCatching {
+                    root.findAccessibilityNodeInfosByViewId("com.android.systemui:id/caption_handle")
+                }.getOrNull() ?: continue
+                for (h in handles) {
+                    val r = android.graphics.Rect()
+                    runCatching { h.getBoundsInScreen(r) }
+                    if (r.width() > 0 && r.height() > 0) {
+                        val click = runCatching { h.isClickable }.getOrDefault(false)
+                        out.add(CaptionHandle(r, click))
+                    }
+                }
+            }
+        }
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastHandleRectLog > 1500) {
+            lastHandleRectLog = now
+            Log.d(TAG, "captionHandles: found ${out.size}${if (out.isNotEmpty()) " first=${out.first().rect.toShortString()} click=${out.first().clickable}" else ""}")
+        }
+        return out
+    }
+
+    /** Bounds of the caption's tap-only controls on external displays — the window buttons
+     *  (more/minimize/maximize/close/split) and any OPEN handle menu — so the cursor layer
+     *  can keep drag OFF them by their real bounds, independent of window sizing. */
+    /** TRUE while the collapsed pill's popup menu (systemui handle_menu) is on
+     *  screen — stamped by every [captionButtonRects] scan. While the menu is
+     *  open the pill must be TAP-ONLY (field log: with the cursor parked on the
+     *  pill after opening the menu, the next press + natural aiming pause +
+     *  move toward a menu item engaged a caption DRAG — five for five). */
+    @Volatile var handleMenuVisibleNow: Boolean = false
+        private set
+
+    fun captionButtonRects(): List<android.graphics.Rect> {
+        val ids = arrayOf(
+            "more_window", "minimize_window", "maximize_window", "close_window",
+            "split_window", "handle_menu",
+        )
+        var menuSeen = false
+        val out = ArrayList<android.graphics.Rect>()
+        val byDisplay = runCatching { windowsOnAllDisplays }.getOrNull()
+            ?: run { handleMenuVisibleNow = false; return out }
+        for (i in 0 until byDisplay.size()) {
+            if (byDisplay.keyAt(i) == 0) continue
+            val wins = byDisplay.valueAt(i) ?: continue
+            for (w in wins) {
+                val root = runCatching { w.root }.getOrNull() ?: continue
+                for (id in ids) {
+                    val nodes = runCatching {
+                        root.findAccessibilityNodeInfosByViewId("com.android.systemui:id/$id")
+                    }.getOrNull() ?: continue
+                    for (n in nodes) {
+                        val r = android.graphics.Rect()
+                        runCatching { n.getBoundsInScreen(r) }
+                        if (r.width() > 0 && r.height() > 0) {
+                            out.add(r)
+                            if (id == "handle_menu") menuSeen = true
+                        }
+                    }
+                }
+            }
+        }
+        handleMenuVisibleNow = menuSeen
+        return out
+    }
+
+    /** If Samsung's handle (pill) menu popup is open on any external display,
+     *  click its "switch to caption bar" item (update_handle_to_caption).
+     *  Field report: window actions (arrange, top-bar controls) silently no-op
+     *  while that popup is up; converting to the caption bar both dismisses
+     *  the popup and leaves the window in the state those actions expect —
+     *  exactly the manual unblock SH performs. Sleep-free single-pass scan;
+     *  callers should allow ~150ms to settle after a true return. When a menu
+     *  is open WITHOUT the expected item (the expanded bar's ⋯ menu), we
+     *  deliberately do nothing — clicking its counterpart item would COLLAPSE
+     *  the caption, the opposite of helpful — and DIAG-log so a capture can
+     *  teach us that menu's vocabulary. */
+    fun dismissHandleMenuForAction(): Boolean {
+        val byDisplay = runCatching { windowsOnAllDisplays }.getOrNull() ?: return false
+        for (i in 0 until byDisplay.size()) {
+            if (byDisplay.keyAt(i) == 0) continue
+            val wins = byDisplay.valueAt(i) ?: continue
+            for (w in wins) {
+                val root = runCatching { w.root }.getOrNull() ?: continue
+                val menuOpen = runCatching {
+                    root.findAccessibilityNodeInfosByViewId("com.android.systemui:id/handle_menu")
+                }.getOrNull()?.isNotEmpty() == true
+                if (!menuOpen) continue
+                val item = runCatching {
+                    root.findAccessibilityNodeInfosByViewId("com.android.systemui:id/update_handle_to_caption")
+                }.getOrNull()?.firstOrNull()
+                if (item == null) {
+                    Log.i(TAG, "DIAG-MENU handle_menu open without update_handle_to_caption (expanded-bar ⋯ menu?) — leaving as-is")
+                    continue
+                }
+                var n: android.view.accessibility.AccessibilityNodeInfo? = item
+                var clicked = false
+                var hops = 0
+                while (n != null && hops < 4 && !clicked) {
+                    if (n.isClickable) {
+                        clicked = runCatching {
+                            n.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK)
+                        }.getOrDefault(false)
+                    }
+                    n = runCatching { n?.parent }.getOrNull()
+                    hops++
+                }
+                Log.i(TAG, "DIAG-MENU dismiss-for-action: update_handle_to_caption click=$clicked")
+                if (clicked) return true
+            }
+        }
+        return false
+    }
+
+    /** True when SystemUI's close (X) control — caption bar or pill-menu —
+     *  contains screen point (x,y) on a non-phone display. Also DIAG-logs
+     *  EVERY known caption-control id under the point, so if Samsung's
+     *  pill-menu X turns out to use a different view id than close_window, a
+     *  single capture of that click teaches us the real id. */
+    fun isCloseButtonAt(x: Int, y: Int): Boolean {
+        val ids = arrayOf(
+            "close_window", "minimize_window", "maximize_window",
+            "more_window", "split_window", "handle_menu",
+        )
+        var closeHit = false
+        val hits = ArrayList<String>()
+        val byDisplay = runCatching { windowsOnAllDisplays }.getOrNull() ?: return false
+        for (i in 0 until byDisplay.size()) {
+            if (byDisplay.keyAt(i) == 0) continue
+            val wins = byDisplay.valueAt(i) ?: continue
+            for (w in wins) {
+                val root = runCatching { w.root }.getOrNull() ?: continue
+                for (id in ids) {
+                    val nodes = runCatching {
+                        root.findAccessibilityNodeInfosByViewId("com.android.systemui:id/$id")
+                    }.getOrNull() ?: continue
+                    for (n in nodes) {
+                        val r = android.graphics.Rect()
+                        runCatching { n.getBoundsInScreen(r) }
+                        if (r.contains(x, y)) {
+                            hits.add(id)
+                            if (id == "close_window") closeHit = true
+                        }
+                    }
+                }
+            }
+        }
+        if (hits.isNotEmpty()) Log.i(TAG, "DIAG-CLOSEX systemui controls under click ($x,$y): $hits")
+        return closeHit
+    }
+
+
+    /** Give a freeform app window on the external display INPUT focus, so its caption
+     *  ⋯ menu item becomes actionable (a real finger-tap focuses + opens; an a11y
+     *  ACTION_CLICK on the ⋯ opens without conferring focus, leaving the menu item
+     *  non-interactive — the multi-window "opens menu but can't click item" bug).
+     *  Prefers an already-focused app window; else focuses the first one. */
+    private fun focusAFreeformWindow(preferDisplayId: Int?): Boolean {
+        val byDisplay = runCatching { windowsOnAllDisplays }.getOrNull() ?: return false
+        var fallback: android.view.accessibility.AccessibilityNodeInfo? = null
+        for (i in 0 until byDisplay.size()) {
+            val disp = byDisplay.keyAt(i)
+            if (disp == 0) continue
+            if (preferDisplayId != null && preferDisplayId > 0 && byDisplay.size() > 1 && disp != preferDisplayId) continue
+            val wins = byDisplay.valueAt(i) ?: continue
+            for (w in wins) {
+                val root = runCatching { w.root }.getOrNull() ?: continue
+                val pkg = root.packageName?.toString() ?: continue
+                if (pkg == "com.android.systemui" || pkg.contains("launcher", ignoreCase = true) || pkg == packageName) continue
+                if (runCatching { w.isFocused || w.isActive }.getOrDefault(false)) {
+                    runCatching { root.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_FOCUS) }
+                    Log.d(TAG, "caption toggle: target already focused pkg=$pkg")
+                    return true
+                }
+                if (fallback == null) fallback = root
+            }
+        }
+        val f = fallback ?: return false
+        val ok = runCatching { f.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_FOCUS) }.getOrDefault(false)
+        Log.d(TAG, "caption toggle: requested focus on freeform window ok=$ok pkg=${f.packageName}")
+        return ok
+    }
+
+    /** Collapsed/expanded read via the CLICKABLE caption_handle classifier:
+     *  the collapsed mini pill is clickable, the expanded drag strip is not —
+     *  the width-independent distinction from the hover dumps. Immune to the
+     *  open pill menu, unlike more_window presence (the menu contains its own
+     *  more_window node). null = no caption handles visible at all (no
+     *  freeform windows, or mid-swap animation). */
+    private fun captionCollapsedNow(): Boolean? {
+        val handles = captionHandles()
+        if (handles.isEmpty()) return null
+        return handles.any { it.clickable }
+    }
+
+    /** Single-flight guard: the ▭ button's press currently reaches TWO overlay
+     *  instances (duplicate attach, root cause TBD), so every toggle ran twice
+     *  concurrently — confirmed in the field log (two tids clicking the same
+     *  menu item ~50ms apart). Same-direction duplicates happen to be
+     *  idempotent, but a duplicate that starts AFTER the first flip lands
+     *  would read the new state and legitimately toggle it back. Suppress it. */
+    private val captionToggleInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Public entry. The flip DIRECTION is decided ONCE from the starting
+     *  state and held fixed across retries, and success is judged by
+     *  RE-READING the state — not by performAction return values, which are
+     *  unreliable on systemui nodes. The old loop re-derived direction per
+     *  attempt, so an attempt that LANDED but reported failure made the next
+     *  attempt flip the bar straight back (field bug: the toggle showed the
+     *  other bar for a beat, then reverted to whatever was set before). */
+    fun toggleCaptionHandle(preferDisplayId: Int?): Boolean {
+        if (!captionToggleInFlight.compareAndSet(false, true)) {
+            // Duplicate concurrent invocation: report success so the caller
+            // doesn't toast a failure over the primary invocation's work.
+            Log.d(TAG, "caption toggle: suppressed duplicate concurrent invocation")
+            return true
+        }
+        try {
+            // FAST PATH — the pill menu is ALREADY open: the menu IS the
+            // toggle UI, so the whole open-menu/classify dance is one click
+            // away (field: with the menu open, the classifier's caption_handle
+            // read goes null → 2s escalation → intermittent "Couldn't toggle"
+            // toasts; the ONE captured success took the slow path). Click
+            // update_handle_to_caption directly, then settle-verify expanded.
+            if (runCatching { dismissHandleMenuForAction() }.getOrDefault(false)) {
+                repeat(6) {
+                    Thread.sleep(120)
+                    if (captionCollapsedNow() == false) {
+                        Log.d(TAG, "caption toggle: verified flip via open pill menu (expanded)")
+                        return true
+                    }
+                }
+                // Item click reported success; state unreadable mid-animation.
+                Log.w(TAG, "caption toggle: pill-menu item clicked, state unreadable — assuming success")
+                return true
+            }
+            // State read with ESCALATION — "always works when a freeform window
+            // exists" (field: repeated 'Couldn't toggle' toasts, working on the
+            // 3rd-4th click once a transient node gap passed). The caption
+            // nodes go unreadable for seconds after window launches and decor
+            // rebuilds, so a single null read must not mean failure:
+            // (a) poll through the gap (~2s);
+            var start: Boolean? = captionCollapsedNow()
+            if (start == null) {
+                for (i in 0 until 8) {
+                    Thread.sleep(200)
+                    start = captionCollapsedNow()
+                    if (start != null) break
+                }
+            }
+            // (b) focus nudge — focusing a freeform window prompts SystemUI to
+            // publish its caption decor — then a short re-poll;
+            if (start == null) {
+                focusAFreeformWindow(preferDisplayId)
+                for (i in 0 until 4) {
+                    Thread.sleep(200)
+                    start = captionCollapsedNow()
+                    if (start != null) break
+                }
+            }
+            // (c) fallback classifier: more_window nodes with NO caption_handle
+            // means the expanded bar (with no handles there's no open pill menu
+            // to confound the read).
+            if (start == null && moreWindowVisible()) {
+                Log.i(TAG, "caption toggle: classified EXPANDED via more_window fallback")
+                start = false
+            }
+            if (start == null) {
+                Log.w(TAG, "caption toggle: caption nodes unreadable after escalation — giving up")
+                return false
+            }
+            val wantCollapsed = !start
+            var clickedOk = false
+            repeat(3) { attempt ->
+                if (attemptToggleCaptionHandle(preferDisplayId, collapsing = wantCollapsed)) {
+                    clickedOk = true
+                }
+                // Settle poll: the platform animates the swap, so judge by state,
+                // giving it up to ~720ms before retrying the clicks.
+                repeat(6) {
+                    Thread.sleep(120)
+                    if (captionCollapsedNow() == wantCollapsed) {
+                        Log.d(TAG, "caption toggle: verified flip (attempt=$attempt collapsed=$wantCollapsed)")
+                        return true
+                    }
+                }
+                if (attempt < 2) Thread.sleep(200)
+            }
+            // (d) uncertainty tolerance: if the FINAL read is unknown (nodes
+            // mid-rebuild) rather than the WRONG state, and a menu-item click
+            // reported success, the flip almost certainly landed — don't toast
+            // a false failure over it.
+            if (clickedOk && captionCollapsedNow() == null) {
+                Log.w(TAG, "caption toggle: clicked ok, state unreadable — assuming success")
+                return true
+            }
+            Log.w(TAG, "caption toggle: state never flipped after 3 attempts")
+            return false
+        } finally {
+            captionToggleInFlight.set(false)
+        }
+    }
+
+    /** TRUE when any expanded-caption ⋯ (more_window) node exists on a non-0
+     *  display. Fallback state classifier for [toggleCaptionHandle] when the
+     *  caption_handle nodes are unreadable. */
+    private fun moreWindowVisible(): Boolean {
+        val byDisplay = runCatching { windowsOnAllDisplays }.getOrNull() ?: return false
+        for (i in 0 until byDisplay.size()) {
+            if (byDisplay.keyAt(i) == 0) continue
+            val wins = byDisplay.valueAt(i) ?: continue
+            for (w in wins) {
+                val root = runCatching { w.root }.getOrNull() ?: continue
+                val more = runCatching {
+                    root.findAccessibilityNodeInfosByViewId("com.android.systemui:id/more_window")
+                }.getOrNull()
+                if (!more.isNullOrEmpty()) return true
+            }
+        }
+        return false
+    }
+
+    private fun attemptToggleCaptionHandle(preferDisplayId: Int?, collapsing: Boolean): Boolean {
+        // The toggle is GLOBAL (any window's menu flips every freeform window), but a
+        // window's ⋯ menu only opens when that window is FOCUSED — and right after an
+        // auto-arrange none may be. So gather EVERY caption opener (focused windows
+        // first) and try each until one actually opens the menu, rather than betting
+        // on the first node found.
+        // Openers for the FIXED direction: collapsing → the expanded bar's ⋯
+        // (more_window) buttons; expanding → the CLICKABLE collapsed pill only
+        // (an ACTION_CLICK on the non-clickable expanded strip does nothing).
+        fun collectOpeners(): List<android.view.accessibility.AccessibilityNodeInfo> {
+            val focused = ArrayList<android.view.accessibility.AccessibilityNodeInfo>()
+            val others = ArrayList<android.view.accessibility.AccessibilityNodeInfo>()
+            val byDisplay = runCatching { windowsOnAllDisplays }.getOrNull()
+                ?: return emptyList()
+            for (i in 0 until byDisplay.size()) {
+                val disp = byDisplay.keyAt(i)
+                if (disp == 0) continue
+                if (preferDisplayId != null && preferDisplayId > 0 && byDisplay.size() > 1 && disp != preferDisplayId) continue
+                val wins = byDisplay.valueAt(i) ?: continue
+                for (w in wins) {
+                    val root = runCatching { w.root }.getOrNull() ?: continue
+                    val isFront = runCatching { w.isFocused || w.isActive }.getOrDefault(false)
+                    if (collapsing) {
+                        val more = runCatching {
+                            root.findAccessibilityNodeInfosByViewId("com.android.systemui:id/more_window")
+                        }.getOrNull()
+                        if (!more.isNullOrEmpty()) (if (isFront) focused else others).addAll(more)
+                    } else {
+                        val handle = runCatching {
+                            root.findAccessibilityNodeInfosByViewId("com.android.systemui:id/caption_handle")
+                        }.getOrNull()?.filter { runCatching { it.isClickable }.getOrDefault(false) }
+                        if (!handle.isNullOrEmpty()) (if (isFront) focused else others).addAll(handle)
+                    }
+                }
+            }
+            return focused + others
+        }
+
+        fun clickMenuItem(itemId: String): Boolean {
+            repeat(7) {
+                Thread.sleep(70)
+                val byDisplay = runCatching { windowsOnAllDisplays }.getOrNull() ?: return@repeat
+                for (i in 0 until byDisplay.size()) {
+                    if (byDisplay.keyAt(i) == 0) continue
+                    val wins = byDisplay.valueAt(i) ?: continue
+                    for (w in wins) {
+                        val root = runCatching { w.root }.getOrNull() ?: continue
+                        val item = runCatching { root.findAccessibilityNodeInfosByViewId(itemId) }.getOrNull()?.firstOrNull()
+                        if (item != null) {
+                            return runCatching {
+                                item.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK)
+                            }.getOrDefault(false)
+                        }
+                    }
+                }
+            }
+            return false
+        }
+
+        val openers = collectOpeners()
+        if (openers.isEmpty()) { Log.w(TAG, "caption toggle: no caption opener found (collapsing=$collapsing)"); return false }
+        // Option 1: give a freeform window input focus first, then open its ⋯ menu —
+        // the menu item is only actionable on a focused window.
+        focusAFreeformWindow(preferDisplayId)
+        Thread.sleep(130)
+        val itemId = if (collapsing) "com.android.systemui:id/update_caption_to_handle"
+        else "com.android.systemui:id/update_handle_to_caption"
+        for ((idx, opener) in openers.withIndex()) {
+            val opened = runCatching {
+                opener.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK)
+            }.getOrDefault(false)
+            if (!opened) continue
+            if (clickMenuItem(itemId)) {
+                Log.d(TAG, "caption toggle: clicked $itemId (opener #$idx of ${openers.size}, collapsing=$collapsing)")
+                return true
+            }
+            Log.d(TAG, "caption toggle: opener #$idx opened but menu didn't appear — trying next")
+        }
+        Log.w(TAG, "caption toggle: no opener produced the menu (${openers.size} tried)")
+        return false
+    }
+
+    /** First editable node in any interactive window on [displayId] (or any VD
+     *  display when null), regardless of focus — reuses [firstEditableInTree]
+     *  with the window root's own package. */
+    private fun firstEditableOnDisplay(displayId: Int?): android.view.accessibility.AccessibilityNodeInfo? {
+        val byDisplay = runCatching { windowsOnAllDisplays }.getOrNull() ?: return null
+        for (i in 0 until byDisplay.size()) {
+            val disp = byDisplay.keyAt(i)
+            if (disp == 0) continue
+            if (displayId != null && disp != displayId) continue
+            val wins = byDisplay.valueAt(i) ?: continue
+            for (w in wins) {
+                val root = runCatching { w.root }.getOrNull() ?: continue
+                val pkg = root.packageName?.toString() ?: continue
+                val ed = firstEditableInTree(root, pkg, 0)
+                if (ed != null) return ed
+            }
+        }
+        return null
+    }
+
+    /** Center (in display coords) of the foreground application window on
+     *  [displayId], or null if none is resolvable. Prefers the FOCUSED app
+     *  window, else the highest-layer one; filters to TYPE_APPLICATION so our own
+     *  accessibility-overlay windows (cursor / dock / mirror, all type 2032) are
+     *  excluded. Reads the in-memory windowsOnAllDisplays snapshot (no dumpsys),
+     *  so it's cheap enough for the scroll-mode center-tap hot path. Lets the
+     *  center tap land ON the app even when it's a freeform window that doesn't
+     *  fill the display (a plain display-center tap would hit the backdrop). */
+    fun foregroundAppWindowCenter(displayId: Int): Pair<Float, Float>? {
+        val wins = runCatching { windowsOnAllDisplays.get(displayId) }.getOrNull() ?: return null
+        val appWins = wins.filter {
+            it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION
+        }
+        if (appWins.isEmpty()) return null
+        val win = appWins.firstOrNull { it.isFocused }
+            ?: appWins.maxByOrNull { it.layer }
+            ?: return null
+        val r = android.graphics.Rect().also { win.getBoundsInScreen(it) }
+        if (r.width() <= 0 || r.height() <= 0) return null
+        return r.exactCenterX() to r.exactCenterY()
+    }
+
+    /** Open the phone-side relay with no target node (fallback when no field was
+     *  found — the user can focus it manually and still type). */
+    private fun openPlainRelay() {
+        runCatching {
+            val opts = android.app.ActivityOptions.makeBasic().setLaunchDisplayId(0).toBundle()
+            startActivity(
+                android.content.Intent(applicationContext, KeyboardRelayActivity::class.java)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
                 opts,
             )
         }
@@ -508,6 +1165,10 @@ class PortalPadAccessibilityService : AccessibilityService() {
 
     fun setFieldText(text: String): Boolean {
         val n = liveTargetField() ?: return false
+        // Our own writes fire SELCHG (caret jumps to end mid-SET_TEXT before we
+        // re-place it); suppress the back-sync briefly so it can't bounce a
+        // phantom caret move into the relay.
+        lastFieldPushAt = android.os.SystemClock.uptimeMillis()
         return try {
             // refresh() re-reads the node's current state; false/throw means it's
             // stale (window changed) → let the caller fall back.
@@ -535,6 +1196,7 @@ class PortalPadAccessibilityService : AccessibilityService() {
      * plain caret position. Returns false if there's no live field.
      */
     fun setFieldSelection(start: Int, end: Int): Boolean {
+        lastFieldPushAt = android.os.SystemClock.uptimeMillis()
         val n = liveTargetField() ?: return false
         return try {
             if (!n.refresh()) return false
@@ -566,6 +1228,10 @@ class PortalPadAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         Log.i(TAG, "PortalPad accessibility service connected")
+        // If a fresh-install plug left the mirror on the hidden 2038 fallback
+        // (2032 token wasn't ready), the 2032 token is valid now → let the service
+        // re-attach as a visible 2032.
+        runCatching { PortalPadForegroundService.instance?.onAccessibilityConnected() }
     }
 
     override fun onUnbind(intent: android.content.Intent?): Boolean {
@@ -1183,6 +1849,25 @@ class PortalPadAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "PortalPadA11y"
+
+        /** The target field's live selection while the relay is open, published
+         *  by the caret back-sync in [onAccessibilityEvent] (start to end).
+         *  Companion-level so the relay can collect it without holding the
+         *  service instance. SHAREDFLOW deliberately (no replay, no dedup):
+         *  the StateFlow it replaced (a) replayed stale selections into every
+         *  newly-entered keyboard tab, and (b) DEDUPLICATED equal values — a
+         *  second click at the same position emitted NOTHING, so the relay
+         *  caret silently stayed at end (field: producer log showed sel=2..2
+         *  published, consumer never moved). Every click now delivers. */
+        val relayFieldSelection =
+            kotlinx.coroutines.flow.MutableSharedFlow<Pair<Int, Int>>(
+                extraBufferCapacity = 1,
+                onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+            )
+
+        /** Ignore target-field selection events this soon after our OWN write
+         *  to it — they're echoes of SET_TEXT/SET_SELECTION, not user moves. */
+        private const val FIELD_PUSH_ECHO_MS = 800L
 
         /** System UI packages whose dialogs must be usable on the PHONE, not
          *  the external display (they launch transparent and freeze the glass).

@@ -4,7 +4,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Widgets
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -51,6 +54,31 @@ fun AssignedActionLabel(
             fontWeight = FontWeight.SemiBold,
             modifier = modifier,
         )
+        return
+    }
+
+    // Internal "Widget Overlay" sentinel: its magic package isn't installed, so
+    // the PackageManager lookups below would fall back to the raw package name
+    // ("portalpad.internal.widget_overlay", truncated in tight layouts) and a
+    // missing icon. Render the stored label with a widget glyph instead.
+    if (entry.isWidgetOverlay) {
+        Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
+            androidx.compose.material3.Icon(
+                Icons.Default.Widgets,
+                contentDescription = null,
+                tint = AbAccent,
+                modifier = Modifier.size(iconSizeDp.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                entry.label,
+                color = AbAccent,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
         return
     }
 

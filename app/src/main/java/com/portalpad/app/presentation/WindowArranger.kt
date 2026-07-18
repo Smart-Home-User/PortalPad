@@ -31,9 +31,22 @@ object WindowArranger {
     fun arrangeEvenly(scope: CoroutineScope, primaryDisplayId: Int, floorW: Int = 0, silent: Boolean = false) {
         val app = PortalPadApp.instance
         val freeform = app.freeform
+        // Tiling evenly means no window is maximized any more — drop all maximize
+        // intent so a previously-maximized window doesn't snap back to near-full on
+        // the next resolution switch.
+        freeform.clearAllMaximized()
         val injectorDisplayId = app.injector.displayId
         scope.launch {
             val windows = withContext(Dispatchers.IO) {
+                // Samsung's open pill menu silently blocks window ops (field:
+                // "arrange doesn't work when the pill menu is open"). Convert
+                // handle→caption via the menu's own item, which also dismisses
+                // the popup, then give the animation a beat.
+                runCatching {
+                    if (com.portalpad.app.service.PortalPadAccessibilityService
+                            .instance?.dismissHandleMenuForAction() == true
+                    ) Thread.sleep(150)
+                }
                 runCatching {
                     fun isLauncher(t: RunningTask) =
                         t.packageName.contains("launcher", ignoreCase = true) ||

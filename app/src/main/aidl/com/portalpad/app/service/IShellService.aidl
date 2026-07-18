@@ -152,6 +152,18 @@ interface IShellService {
     // which must move named windows individually (not just whatever is focused).
     boolean moveTaskToDisplay(int taskId, int displayId);
 
+    // Direct-binder task resize (ActivityTaskManager.resizeTask via reflection)
+    // — ~100x cheaper than the `am task resize` process spawn, enabling smooth
+    // caption drags. Returns false when the reflection misses on this ROM;
+    // callers fall back to the shell path.
+    boolean resizeTaskFast(int taskId, int left, int top, int right, int bottom);
+    /** Direct-binder ActivityTaskManager.removeTask: finishes the task AND
+     *  removes its Recents entry (DeX-style close). False = reflection missed
+     *  or the call failed — callers keep their shell-spelling fallback. */
+    boolean removeTask(int taskId);
+    /** Direct window-focus grab for a known task (focusTopTask et al). */
+    boolean focusTask(int taskId);
+
     /**
      * Re-assert input focus on the given display by bringing its current top
      * task to front (no relaunch). Returns true if a task on that display was

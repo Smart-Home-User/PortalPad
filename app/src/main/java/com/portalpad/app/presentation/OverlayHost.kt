@@ -47,6 +47,8 @@ data class OverlayHost(
         get() = windowType == TYPE_ACCESSIBILITY_OVERLAY
 
     companion object {
+        private const val TAG = "OverlayHost"
+
         /** TYPE_ACCESSIBILITY_OVERLAY (hidden constant on some Android versions). */
         const val TYPE_ACCESSIBILITY_OVERLAY: Int = 2032
 
@@ -73,29 +75,51 @@ data class OverlayHost(
         fun forDisplay(
             display: Display,
             serviceContext: Context,
+            // When true, skip the 2032 (a11y) path entirely and host as 2038.
+            // Used by the mirror-overlay attach ladder: 2032's window token can
+            // token-null at addView on a freshly-reconnected physical display
+            // (the a11y service has no window-token registration for the new
+            // display id yet), and that failure surfaces at addView — OUTSIDE
+            // the runCatching below — so it can't fall through here. The caller
+            // escalates to force2038 after 2032 fails, and 2038's token (the
+            // app's SYSTEM_ALERT_WINDOW grant) is valid the moment the display
+            // exists.
+            force2038: Boolean = false,
         ): OverlayHost {
             // 2032 path: only a bound AccessibilityService may add
             // TYPE_ACCESSIBILITY_OVERLAY windows, so host them from its context.
-            val a11y = com.portalpad.app.service.PortalPadAccessibilityService.instance
+            val a11y = if (force2038) null
+                else com.portalpad.app.service.PortalPadAccessibilityService.instance
             if (a11y != null) {
                 val host = runCatching {
                     val base = a11y.createDisplayContext(display)
-                    val ctx = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        // A window context isn't strictly required for a privileged
-                        // a11y overlay; try it, but fall back to the plain display
-                        // context if this ROM rejects 2032 for createWindowContext.
-                        runCatching {
-                            base.createWindowContext(TYPE_ACCESSIBILITY_OVERLAY, null)
-                        }.getOrDefault(base)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        // Require a REAL 2032 window context. If this ROM rejects a
+                        // window context for 2032 (some do — notably for a raw
+                        // PHYSICAL external display in the no-VD fallback), do NOT
+                        // host 2032 on a plain display context: its addView fails
+                        // with "token null is not valid" and the cursor/control bar
+                        // never attach (the Sony Xperia raw-fallback regression from
+                        // the 2038→2032 migration). Let it throw and drop to 2038,
+                        // which is what those overlays used before the migration and
+                        // which attaches fine on a raw physical display.
+                        val wctx = base.createWindowContext(TYPE_ACCESSIBILITY_OVERLAY, null)
+                        val wm = wctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                        android.util.Log.d(TAG, "DIAG-OVL disp=${display.displayId} host=2032(windowctx)")
+                        OverlayHost(wctx, wm, TYPE_ACCESSIBILITY_OVERLAY)
                     } else {
-                        base
+                        val wm = base.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                        android.util.Log.d(TAG, "DIAG-OVL disp=${display.displayId} host=2032(base<S)")
+                        OverlayHost(base, wm, TYPE_ACCESSIBILITY_OVERLAY)
                     }
-                    val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-                    OverlayHost(ctx, wm, TYPE_ACCESSIBILITY_OVERLAY)
                 }.getOrNull()
                 if (host != null) return host
+                android.util.Log.w(
+                    TAG,
+                    "DIAG-OVL disp=${display.displayId} 2032 window context unavailable -> 2038 fallback",
+                )
             }
-            // 2038 fallback (original behavior): hosted by the service context.
+            // 2038 fallback (original pre-migration behavior): hosted by the service context.
             val ctx = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 serviceContext.createDisplayContext(display)
                     .createWindowContext(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null)
@@ -103,6 +127,7 @@ data class OverlayHost(
                 serviceContext.createDisplayContext(display)
             }
             val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            android.util.Log.d(TAG, "DIAG-OVL disp=${display.displayId} host=2038")
             return OverlayHost(ctx, wm, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
         }
     }

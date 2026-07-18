@@ -125,7 +125,11 @@ class RootClickBackend(private val context: Context) : BoundShellBackend {
     // ─── task / shell ───────────────────────────────────────────────
     override fun moveFocusedTaskToDisplay(displayId: Int): Boolean = svcCall { it.moveFocusedTaskToDisplay(displayId) }
     override fun moveTaskToDisplay(taskId: Int, displayId: Int): Boolean = svcCall { it.moveTaskToDisplay(taskId, displayId) }
+    override fun resizeTaskFast(taskId: Int, left: Int, top: Int, right: Int, bottom: Int): Boolean =
+        svcCall { it.resizeTaskFast(taskId, left, top, right, bottom) }
+    override fun removeTask(taskId: Int): Boolean = svcCall { it.removeTask(taskId) }
     override fun refocusTopTaskOnDisplay(displayId: Int): Boolean = svcCall { it.refocusTopTaskOnDisplay(displayId) }
+    override fun focusTask(taskId: Int): Boolean = svcCall { it.focusTask(taskId) }
     override fun getFocusedTaskDisplayId(): Int = svcCall(-1) { it.getFocusedTaskDisplayId() }
     override fun runCommand(cmd: String): String = svcCall("") { it.runCommand(cmd) }
     override fun amStart(component: String, displayId: Int): String = svcCall("") { it.amStart(component, displayId) }

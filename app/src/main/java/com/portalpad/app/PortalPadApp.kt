@@ -206,6 +206,62 @@ class PortalPadApp : Application() {
     val folderWindowPreviewActive: StateFlow<Boolean> = _folderWindowPreviewActive.asStateFlow()
     fun setFolderWindowPreviewActive(active: Boolean) { _folderWindowPreviewActive.value = active }
 
+    /** True while the Settings "Widget Overlay" page is open — PFS summons the
+     *  live layer on the external display so backdrop tweaks and widget removals
+     *  are visible as they happen (same pattern as the folder-window preview). */
+    private val _widgetOverlayPreviewActive = MutableStateFlow(false)
+    val widgetOverlayPreviewActive: StateFlow<Boolean> = _widgetOverlayPreviewActive.asStateFlow()
+    fun setWidgetOverlayPreviewActive(active: Boolean) { _widgetOverlayPreviewActive.value = active }
+
+    /** True while the widget overlay layer is SHOWING on the external display.
+     *  The layer is modal: dock and top-bar reveal are suppressed while it's up
+     *  (they'd be unreachable under the full-screen scrim and their hover chrome
+     *  read as broken behind it). One tap dismisses the layer and all chrome
+     *  behavior returns. */
+    private val _widgetOverlayOpen = MutableStateFlow(false)
+    val widgetOverlayOpen: StateFlow<Boolean> = _widgetOverlayOpen.asStateFlow()
+    fun setWidgetOverlayOpen(open: Boolean) { _widgetOverlayOpen.value = open }
+
+    /** Live query typed in the phone-side widget-search box; the widget picker
+     *  on the external display filters on it. The IME lives entirely on the
+     *  phone, so this does NOT revive the cross-display IME-focus fight that
+     *  killed the old on-display search relay. */
+    private val _widgetPickerQuery = MutableStateFlow("")
+    val widgetPickerQuery: StateFlow<String> = _widgetPickerQuery.asStateFlow()
+    fun setWidgetPickerQuery(q: String) { _widgetPickerQuery.value = q }
+
+    /** Phone-side widget pick (WidgetSearchActivity tap): the flattened
+     *  provider ComponentName + the profile user id (profile-aware lookup on
+     *  the consuming side). The display picker collects and adds via the same
+     *  addWidget path as an on-display tap. */
+    private val _widgetPickerPick =
+        kotlinx.coroutines.flow.MutableSharedFlow<String>(extraBufferCapacity = 4)
+    val widgetPickerPick: kotlinx.coroutines.flow.SharedFlow<String> =
+        _widgetPickerPick.asSharedFlow()
+    fun emitWidgetPick(providerFlat: String) { _widgetPickerPick.tryEmit(providerFlat) }
+
+    /** One-shot "enter edit mode" request for the widget overlay (wheel chip
+     *  long-press). The layer collects it while showing; show-path callers set
+     *  it just before showing so a fresh layer opens editing. */
+    private val _widgetOverlayEnterEdit =
+        kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 2)
+    val widgetOverlayEnterEdit: kotlinx.coroutines.flow.SharedFlow<Unit> =
+        _widgetOverlayEnterEdit.asSharedFlow()
+
+    /** Consume-once pending flag alongside the tick: a SharedFlow without
+     *  replay DROPS emissions made before a collector exists — so a long-press
+     *  that OPENED the layer emitted into the void and the layer came up idle,
+     *  while an already-open layer (live collector) entered edit fine (field
+     *  report of exactly that asymmetry). The freshly-composed layer checks
+     *  the flag at init; the flow covers the already-open case. */
+    @Volatile private var pendingWidgetOverlayEdit = false
+    fun requestWidgetOverlayEdit() {
+        pendingWidgetOverlayEdit = true
+        _widgetOverlayEnterEdit.tryEmit(Unit)
+    }
+    fun consumeWidgetOverlayEditRequest(): Boolean =
+        pendingWidgetOverlayEdit.also { pendingWidgetOverlayEdit = false }
+
     /** When set (from the Manage Folders settings screen), the external display
      *  opens THIS real folder with its real contents, live, so reordering/editing
      *  is visible on the display as you do it. Null = not managing a folder. */
@@ -466,6 +522,8 @@ class PortalPadApp : Application() {
     /** When the relay last closed — refocusExternalDisplay skips briefly after
      *  (a launcher-intent refocus relaunches the top app; Chrome resets its
      *  omnibox and the suggestion dropdown dies unclickable). */
+    // MONOTONIC (elapsedRealtime) — the skip-window math this feeds must
+    // survive wall-clock changes like every other interval in the app.
     @Volatile var relayClosedAt = 0L
 
     // Timestamp (elapsedRealtime) of the last deliberate tap injected onto the
@@ -481,10 +539,14 @@ class PortalPadApp : Application() {
     // session back on the external display, so asking would offer a choice
     // that's already been made. A cold reconnect (no flap recovery) leaves this
     // stale, so the popup still fires there.
+    // MONOTONIC (elapsedRealtime) deadline — wall clock froze this window open
+    // for hours after a manual clock change backward (field bug: session
+    // snapshots skipped as "recovery in progress" long after recovery ended,
+    // even across a service restart, because this field lives on the App).
     @Volatile var flapRecoveryUntilMs: Long = 0L
 
     /** True while a flap auto-recovery is restoring (or just restored) the session. */
-    fun isFlapRecovering(): Boolean = System.currentTimeMillis() < flapRecoveryUntilMs
+    fun isFlapRecovering(): Boolean = android.os.SystemClock.elapsedRealtime() < flapRecoveryUntilMs
 
     /** True when the foreground service is running. Used by Settings to show Enable/Disable toggle. */
     private val _serviceRunning = MutableStateFlow(false)
@@ -595,15 +657,25 @@ class PortalPadApp : Application() {
             ).collectLatest { injector.imeOnExternalEnabled = it }
         }
 
-        // Mirror the auto-open-relay pref too. When it's on (phone-keyboard mode),
-        // repinImePolicy pins the glasses display to HIDE so the native keyboard
-        // never pops for a glasses field and fights the relay — the relay becomes
-        // the sole on-phone keyboard, and its injected keys land cleanly.
+        // Mirror the auto-open-relay pref too. It feeds repinImePolicy's matrix;
+        // since the FALLBACK change the external display's IME policy is
+        // FALLBACK_DISPLAY (phone) in phone-keyboard mode regardless of the
+        // relay pref — the old HIDE pin died with keystroke forwarding (it was
+        // what hid the relay's own keyboard on every a11y write).
         appScope.launch {
             prefs.bool(
                 com.portalpad.app.data.PreferencesRepository.Keys.AUTO_OPEN_RELAY_ON_FIELD,
                 default = true,
             ).collectLatest { injector.autoOpenRelayEnabled = it }
+        }
+
+        // DeX-style close: closing a window also purges its Recents card.
+        // Default ON (SH's requested default) — must match the Settings toggle.
+        appScope.launch {
+            prefs.bool(
+                com.portalpad.app.data.PreferencesRepository.Keys.CLOSE_REMOVES_FROM_RECENTS,
+                default = true,
+            ).collectLatest { freeform.closeRemovesFromRecents = it }
         }
 
         // When Shizuku becomes ready, bind the UserService if user has chosen Shizuku

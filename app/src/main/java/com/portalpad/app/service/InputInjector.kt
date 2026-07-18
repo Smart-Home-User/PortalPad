@@ -32,7 +32,7 @@ import kotlinx.coroutines.flow.first
  */
 /** Shape the cursor overlay should render. Driven by resize-edge hover in
  *  desktop-windows mode; ARROW everywhere else. */
-enum class CursorType { ARROW, RESIZE_H, RESIZE_V, RESIZE_NWSE, RESIZE_NESW }
+enum class CursorType { ARROW, RESIZE_H, RESIZE_V, RESIZE_NWSE, RESIZE_NESW, MOVE }
 
 class InputInjector(
     private val accessProvider: () -> ElevatedAccess,
@@ -142,6 +142,19 @@ class InputInjector(
     private var a11yDragActive = false
     private var a11yDragStartX = 0f
     private var a11yDragStartY = 0f
+    // Caption/handle MOVE via shell setBounds instead of a faked touch-drag on the pill:
+    // the injected touch only moves the window on long sustained strokes (Samsung ignores
+    // short ones), so we move the window directly. Captured at dragStart; each dragMove
+    // resizes the window to startBounds + cursor delta (throttled, on the inject thread).
+    @Volatile private var captionMoveActive = false
+    @Volatile private var moveTaskId = -1
+    @Volatile private var moveStartLeft = 0
+    @Volatile private var moveStartTop = 0
+    @Volatile private var moveW = 0
+    @Volatile private var moveH = 0
+    @Volatile private var moveCursorStartX = 0f
+    @Volatile private var moveCursorStartY = 0f
+    @Volatile private var lastMoveResizeAt = 0L
     // One-shot a11y pinch: accumulate scale; dispatch a 2-stroke pinch on commit.
     private var a11yPinchActive = false
     private var a11yPinchScale = 1f
@@ -152,6 +165,20 @@ class InputInjector(
     @Volatile var desktopModeEnabled: Boolean = false
     private val _cursorType = MutableStateFlow(CursorType.ARROW)
     val cursorType: StateFlow<CursorType> = _cursorType.asStateFlow()
+
+    /** One widget's on-screen rect (display px) while the widget overlay is in
+     *  EDIT mode, with which axes its provider allows resizing. Published by
+     *  the overlay (set on edit-enter, cleared on edit-exit/dismiss) so the
+     *  resize-cursor scan can show the same glyphs freeform windows get. */
+    data class WidgetEditRect(
+        val rect: android.graphics.Rect,
+        val hResize: Boolean,
+        val vResize: Boolean,
+    )
+
+    /** Edit-mode widget rects — empty when the overlay isn't editing. Volatile:
+     *  written from the overlay's UI thread, read on the cursor-move path. */
+    @Volatile var widgetEditRects: List<WidgetEditRect> = emptyList()
     private val _onCaption = MutableStateFlow(false)
     /** True when the cursor is over a freeform window's top caption strip (below
      *  the top-resize zone, above the content). Caption grabs use the same quick
@@ -160,6 +187,57 @@ class InputInjector(
     // Throttled snapshot of freeform windows — listTasks() hits the task system,
     // so we never call it per-move; geometry runs against this cache.
     @Volatile private var cachedResizeTasks: List<RunningTask> = emptyList()
+    // Live collapsed-caption handle rects (screen coords), refreshed alongside the
+    // resize-task cache on the scan thread. Over one of these the cursor is a MOVE
+    // zone, not a resize edge.
+    @Volatile private var cachedHandles: List<CaptionHandle> = emptyList()
+    // Tap-only caption controls (window buttons + any open handle menu) to keep drag off.
+    @Volatile private var cachedButtonRects: List<android.graphics.Rect> = emptyList()
+    // When ANY clickable (collapsed-pill) handle was last seen. While this memory is
+    // fresh, an empty handle list means "the pill's node transiently vanished"
+    // (SystemUI rebuilds the caption decor for a few seconds after pill
+    // interactions), NOT "this window has no caption" — so the geometric
+    // caption-band fallback must stay OFF. Field bug: the fallback turned the top
+    // 52px of a collapsed-pill window into a MOVE zone during those windows,
+    // letting drags engage beside/below the pill.
+    @Volatile private var lastClickableHandleSeenAt = 0L
+    // TRUE while the pill's popup menu is open (mirrored from the a11y scan).
+    // The pill is TAP-ONLY then: no drag may engage from it, because the next
+    // press there is nearly always "move the cursor to a menu item" (field
+    // log: five for five unintended window drags, all from a pill press with
+    // the menu open, an aiming pause, then movement toward the item).
+    @Volatile private var cachedMenuOpen = false
+    // When the handle rects last came back NON-empty. Used to hold the last good
+    // rects across a transient empty (the pill menu opening/closing briefly drops
+    // the caption_handle node) so the MOVE zone does not flicker to a resize edge.
+    @Volatile private var lastHandleRectsAt = 0L
+    @Volatile private var lastHandleCursorLog = 0L
+    @Volatile private var lastEditRectLog = 0L
+    @Volatile private var lastDragDiag = 0L
+    @Volatile private var lastDragRateDiag = 0L
+    @Volatile private var captionMoveEvents = 0L
+    @Volatile private var lastDragRateCount = 0L
+    // DIAG-DRAGPOS (caption drags, ~10 Hz): integrated cursor vs the COMMANDED
+    // window origin, plus raw-input stats for the window between samples.
+    // Purpose: split the "cursor doesn't stay on the green bar" complaint
+    // three ways with ONE capture, measured against what the user sees —
+    //  (a) rawSum/maxStep large & erratic while the hand moved steadily
+    //      = upstream input noise (the cursor itself is jumping);
+    //  (b) cursor steady but the periodic ListTasks readbacks lag cmd
+    //      = the window lagging the cursor (resize path too slow);
+    //  (c) both steady & dOff==0 while the eye still sees an offset
+    //      = the cursor OVERLAY rendering, not the drag path.
+    // dOff is (cursor − cmd) minus the grab offset: exactly 0 unless the
+    // keep-on-screen clamp engaged or the delta math drifted.
+    @Volatile private var lastDragPosDiag = 0L
+    @Volatile private var dragRawSumX = 0f
+    @Volatile private var dragRawSumY = 0f
+    @Volatile private var dragMaxStep = 0f
+    @Volatile private var dragGrabOffX = 0f
+    @Volatile private var dragGrabOffY = 0f
+    @Volatile private var lastCmdLeft = 0
+    @Volatile private var lastCmdTop = 0
+    @Volatile private var lastRawDragDiag = 0L
     @Volatile private var lastResizeTaskCacheAt = 0L
     @Volatile private var resizeScanInFlight = false
 
@@ -180,7 +258,136 @@ class InputInjector(
      *  affordance: desktop mode on, a resize drag can actually land (trusted VD +
      *  ready backend), not over the dock, and the window isn't display-filling
      *  (maximized). Cheap rectangle math against a throttled task cache. */
+    /** DIAG (#2): string sampled at trackpad-press time so the caption-move vs resize
+     *  engage decision can be correlated with the actual cursor state and a FRESH
+     *  onHandle re-test at the current cursor position (same outsets as the live hit
+     *  test). Read by TrackpadActivity's pressDiag() override. */
+    fun handlePressDiag(): String {
+        val x = cursorX
+        val y = cursorY
+        val handles = cachedHandles
+        val onHandleNow = handles.any { h ->
+            h.clickable &&
+                x >= h.rect.left - PILL_OUT && x <= h.rect.right + PILL_OUT &&
+                y >= h.rect.top - PILL_OUT && y <= h.rect.bottom
+        }
+        return "type=${_cursorType.value} onCaptionFlow=${_onCaption.value} " +
+            "onHandleNow=$onHandleNow cur=${x.toInt()},${y.toInt()} rects=${handles.size}"
+    }
+
+    /** Authoritative press-time onHandle test (see TrackpadSurface.pressOnHandleNow).
+     *  Re-tests the live cursor position against the handle rects, querying ONE fresh
+     *  set if the cache was momentarily empty — fixes both the stale-flow grab loss and
+     *  the empty-cache fall-through to resize. */
+    fun pressOnHandleNow(): Boolean {
+        // Pill is TAP-ONLY while its menu is open — the next press there is
+        // "move the cursor to a menu item", not "drag the window" (field log:
+        // five of five unintended drags were exactly this).
+        if (cachedMenuOpen) return false
+        var handles = cachedHandles
+        if (handles.isEmpty()) {
+            handles = runCatching {
+                PortalPadAccessibilityService.instance?.captionHandles()
+            }.getOrNull().orEmpty()
+            if (handles.isNotEmpty()) {
+                cachedHandles = handles
+                lastHandleRectsAt = SystemClock.uptimeMillis()
+                if (handles.any { it.clickable }) {
+                    lastClickableHandleSeenAt = SystemClock.uptimeMillis()
+                }
+            }
+        }
+        val x = cursorX
+        val y = cursorY
+        return handles.any { h ->
+            // Only the clickable COLLAPSED pill forces a caption-move; the non-clickable
+            // expanded caption strip must not, or its top edge could never resize.
+            // Vertically EXACT (no PILL_OUT above/below), matching the region model.
+            h.clickable &&
+                x >= h.rect.left - PILL_OUT && x <= h.rect.right + PILL_OUT &&
+                y >= h.rect.top && y <= h.rect.bottom
+        }
+    }
+
+    /** Press-time test: is the cursor on a caption tap-only control (window
+     *  buttons / open pill menu)? The REGION model already keeps our quick
+     *  caption grab off these, but the generic touch-and-hold drag path
+     *  injects a REAL touch there — and the ROM reads a touch drag starting
+     *  on caption chrome as a window move, buttons included (field: windows
+     *  dragged from the caption's far-right icons). The gesture layer uses
+     *  this to refuse ANY drag engage on the buttons: taps only. */
+    fun pressOnButtonNow(): Boolean {
+        val x = cursorX
+        val y = cursorY
+        return cachedButtonRects.any { r ->
+            x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+        }
+    }
+
     private fun updateResizeCursor() {
+        // Widget-overlay EDIT mode: the layer sits above every window, so its
+        // published rects win over freeform task edges — and they're deliberately
+        // NOT gated on desktop mode (the layer works regardless of it).
+        val editRects = widgetEditRects
+        if (editRects.isNotEmpty()) {
+            val t = editRects.firstOrNull { er ->
+                val bb = er.rect
+                cursorX >= bb.left - WIDGET_EDGE_OUT && cursorX <= bb.right + WIDGET_EDGE_OUT &&
+                    cursorY >= bb.top - WIDGET_EDGE_OUT && cursorY <= bb.bottom + WIDGET_EDGE_OUT
+            }?.let { er ->
+                val bb = er.rect
+                // Three honest zones (field spec, all edit-mode only since these
+                // rects only exist then): RESIZE along the full borders — which
+                // now ARE whole-edge drag targets, not just the dots — reaching
+                // WIDGET_EDGE_OUT outward but only WIDGET_EDGE_IN inward, so the
+                // glyph can never sit on the widget's face (the old ±30 dot
+                // boxes swallowed a 1x1's whole interior); the top-bar GRAB
+                // cursor across the interior, inset past the edge reach,
+                // because the interior really does drag the widget; ARROW
+                // everywhere else. E/W checked first so corners read horizontal,
+                // matching the strips' touch priority.
+                val onE = cursorX >= bb.right - WIDGET_EDGE_IN && cursorX <= bb.right + WIDGET_EDGE_OUT &&
+                    cursorY >= bb.top - WIDGET_EDGE_OUT && cursorY <= bb.bottom + WIDGET_EDGE_OUT
+                val onW = cursorX >= bb.left - WIDGET_EDGE_OUT && cursorX <= bb.left + WIDGET_EDGE_IN &&
+                    cursorY >= bb.top - WIDGET_EDGE_OUT && cursorY <= bb.bottom + WIDGET_EDGE_OUT
+                val onN = cursorY >= bb.top - WIDGET_EDGE_OUT && cursorY <= bb.top + WIDGET_EDGE_IN &&
+                    cursorX >= bb.left - WIDGET_EDGE_OUT && cursorX <= bb.right + WIDGET_EDGE_OUT
+                val onS = cursorY >= bb.bottom - WIDGET_EDGE_IN && cursorY <= bb.bottom + WIDGET_EDGE_OUT &&
+                    cursorX >= bb.left - WIDGET_EDGE_OUT && cursorX <= bb.right + WIDGET_EDGE_OUT
+                val inside = cursorX >= bb.left + WIDGET_MOVE_INSET && cursorX <= bb.right - WIDGET_MOVE_INSET &&
+                    cursorY >= bb.top + WIDGET_MOVE_INSET && cursorY <= bb.bottom - WIDGET_MOVE_INSET
+                val result = when {
+                    onE || onW -> CursorType.RESIZE_H
+                    onN || onS -> CursorType.RESIZE_V
+                    inside -> CursorType.MOVE
+                    else -> CursorType.ARROW
+                }
+                val wnow = SystemClock.uptimeMillis()
+                if (wnow - lastEditRectLog > 1000) {
+                    lastEditRectLog = wnow
+                    android.util.Log.d(
+                        TAG,
+                        "DIAG-EDITCURSOR cursor=(${cursorX.toInt()},${cursorY.toInt()}) " +
+                            "rect=[${bb.left},${bb.top} ${bb.width()}x${bb.height()}] " +
+                            "onE=$onE onW=$onW onN=$onN onS=$onS inside=$inside → $result",
+                    )
+                }
+                result
+            } ?: CursorType.ARROW
+            if (_cursorType.value != t) _cursorType.value = t
+            if (_onCaption.value) _onCaption.value = false
+            return
+        }
+        // Widget overlay open (non-edit): the modal layer covers every window,
+        // but the freeform task cache below still holds THEIR rects — the
+        // resize/caption cursor was leaking through onto widgets sitting over a
+        // hidden window's edge (field). Windows aren't interactable behind the
+        // layer, so the window cursor model goes fully dormant.
+        if (runCatching { PortalPadApp.instance.widgetOverlayOpen.value }.getOrDefault(false)) {
+            if (_cursorType.value != CursorType.ARROW) _cursorType.value = CursorType.ARROW
+            if (_onCaption.value) _onCaption.value = false
+            return
+        }
         if (!desktopModeEnabled || !usingVd || !activeBackendReady() || cursorOverDock) {
             if (_cursorType.value != CursorType.ARROW) _cursorType.value = CursorType.ARROW
             if (_onCaption.value) _onCaption.value = false
@@ -201,6 +408,31 @@ class InputInjector(
                         cachedResizeTasks = runCatching {
                             PortalPadApp.instance.freeform.listTasks(scanDisplayId)
                         }.getOrDefault(emptyList())
+                        val freshHandles = runCatching {
+                            PortalPadAccessibilityService.instance?.captionHandles()
+                        }.getOrNull() ?: emptyList()
+                        cachedButtonRects = runCatching {
+                            PortalPadAccessibilityService.instance?.captionButtonRects()
+                        }.getOrNull() ?: emptyList()
+                        // captionButtonRects just stamped menu visibility; mirror it
+                        // here so the region model and press tests read one flag.
+                        cachedMenuOpen = runCatching {
+                            PortalPadAccessibilityService.instance?.handleMenuVisibleNow
+                        }.getOrNull() ?: false
+                        if (freshHandles.isNotEmpty()) {
+                            cachedHandles = freshHandles
+                            lastHandleRectsAt = SystemClock.uptimeMillis()
+                            if (freshHandles.any { it.clickable }) {
+                                lastClickableHandleSeenAt = SystemClock.uptimeMillis()
+                            }
+                        } else if (SystemClock.uptimeMillis() - lastHandleRectsAt > HANDLE_RECTS_GRACE_MS) {
+                            // Grace expired: the handle is genuinely gone — expanded to
+                            // the caption bar, or the window closed. Safe to drop the zone.
+                            cachedHandles = emptyList()
+                        }
+                        // else: transient empty — the pill menu opening/closing momentarily
+                        // drops the caption_handle node, so hold the last rects and the MOVE
+                        // zone does not flicker to a resize edge under the cursor.
                         lastResizeTaskCacheAt = SystemClock.uptimeMillis()
                     } finally {
                         resizeScanInFlight = false
@@ -208,43 +440,91 @@ class InputInjector(
                 }
             }.onFailure { resizeScanInFlight = false }
         }
-        // Topmost window under the cursor — only a thin strip hugging each edge
-        // counts (a little outside, a little inside), so the arrow sits on the
-        // visible border instead of floating in the wallpaper or firing deep in
-        // the window chrome.
+        // ===== Window-top region model — the single source of truth for cursor + drag. =====
+        // Resolve the window under the cursor (thin edge margins so the cursor sits on the
+        // visible border, not deep in chrome).
+        val handles = cachedHandles
         val b = cachedResizeTasks.firstNotNullOfOrNull { t ->
             t.bounds?.takeIf { bb ->
                 cursorX >= bb.left - RESIZE_EDGE_OUT && cursorX <= bb.right + RESIZE_GRAB_IN &&
-                    cursorY >= bb.top - RESIZE_GRAB_IN && cursorY <= bb.bottom + RESIZE_GRAB_IN
+                    cursorY >= bb.top - RESIZE_TOP_OUT && cursorY <= bb.bottom + RESIZE_GRAB_IN
             }
         }
-        val type = when {
-            b == null -> CursorType.ARROW
-            // Fills the display → maximized/fullscreen, not resizable.
-            b.left <= 2 && b.top <= 2 &&
-                b.right >= displayWidth - 2 && b.bottom >= displayHeight - 2 -> CursorType.ARROW
-            else -> {
-                val nearLeft = cursorX >= b.left - RESIZE_EDGE_OUT && cursorX <= b.left + RESIZE_EDGE_IN
-                val nearRight = cursorX >= b.right - RESIZE_EDGE_IN && cursorX <= b.right + RESIZE_GRAB_IN
-                val nearTop = cursorY >= b.top - RESIZE_GRAB_IN && cursorY <= b.top + RESIZE_TOP_IN
-                val nearBottom = cursorY >= b.bottom - RESIZE_EDGE_IN && cursorY <= b.bottom + RESIZE_GRAB_IN
-                when {
-                    (nearLeft && nearTop) || (nearRight && nearBottom) -> CursorType.RESIZE_NWSE
-                    (nearRight && nearTop) || (nearLeft && nearBottom) -> CursorType.RESIZE_NESW
-                    nearLeft || nearRight -> CursorType.RESIZE_H
-                    nearTop || nearBottom -> CursorType.RESIZE_V
-                    else -> CursorType.ARROW // inside the window, not near an edge
-                }
-            }
+        // The caption_handle for the window under the cursor. Its CLICKABLE flag classifies
+        // it (width-independent, so resizing / resolution can't fool it): clickable ⇒ the
+        // COLLAPSED mini pill; non-clickable ⇒ the EXPANDED caption drag strip.
+        val capH = handles.firstOrNull { h ->
+            b == null || (h.rect.centerX() >= b.left && h.rect.centerX() <= b.right && h.rect.top <= b.top + 40)
         }
-        if (_cursorType.value != type) _cursorType.value = type
-        // Caption strip: the top band of a freeform window that isn't a resize edge
-        // (type == ARROW there) and isn't maximized. A grab here moves the window.
+        val collapsed = capH != null && capH.clickable
+        val expandedCap = capH != null && !capH.clickable
+        // On a tap-only caption control (window buttons / open handle menu)? Never drag there
+        // — keyed off the controls' real accessibility bounds, so no window sizing exposes them.
+        val onButton = cachedButtonRects.any { r ->
+            cursorX >= r.left && cursorX <= r.right && cursorY >= r.top && cursorY <= r.bottom
+        }
+        // On the mini green pill? TIGHT: +PILL_OUT sides/top, NOTHING below (the pill menu
+        // opens below and must stay tappable). Clickable pill only — never the wide strip.
+        // Pill MOVE zone: tap-only while its menu is open (!cachedMenuOpen), and
+        // vertically EXACT — no tolerance above or below the bar (field request:
+        // the grab zone stays within the mini bar). Horizontal PILL_OUT kept as
+        // an aiming aid; no sideways complaints and the pill is narrow.
+        val onPill = collapsed && capH != null && !onButton && !cachedMenuOpen &&
+            cursorX >= capH.rect.left - PILL_OUT && cursorX <= capH.rect.right + PILL_OUT &&
+            cursorY >= capH.rect.top && cursorY <= capH.rect.bottom
+        val hnow = SystemClock.uptimeMillis()
         val maximized = b != null && b.left <= 2 && b.top <= 2 &&
             b.right >= displayWidth - 2 && b.bottom >= displayHeight - 2
-        val onCap = b != null && !maximized && type == CursorType.ARROW &&
-            cursorX >= b.left && cursorX <= b.right &&
-            cursorY >= b.top && cursorY <= b.top + CAPTION_STRIP_H
+        var type = CursorType.ARROW
+        var onCap = false
+        if (onPill) {
+            // Mini green bar → MOVE + drag.
+            type = CursorType.MOVE
+            onCap = true
+        } else if (b != null && !maximized) {
+            val nearLeft = cursorX >= b.left - RESIZE_EDGE_OUT && cursorX <= b.left + RESIZE_EDGE_IN
+            val nearRight = cursorX >= b.right - RESIZE_EDGE_IN && cursorX <= b.right + RESIZE_GRAB_IN
+            val nearTop = cursorY >= b.top - RESIZE_TOP_OUT && cursorY <= b.top + RESIZE_TOP_IN
+            val nearBottom = cursorY >= b.bottom - RESIZE_EDGE_IN && cursorY <= b.bottom + RESIZE_GRAB_IN
+            // Caption DRAG body, MINUS the top resize strip (so the very top edge resizes) and
+            // MINUS the tap-only buttons. Expanded: the a11y caption_handle strip. No handle at
+            // all: geometric top band minus the button zone — but ONLY when no collapsed pill
+            // was seen recently, or a transiently-vanished pill node would hand its whole top
+            // band to MOVE (field: drags engaged beside/below the pill for the few seconds
+            // SystemUI rebuilds the decor). Collapsed: none (pill is onPill).
+            val inCaptionBody = !nearTop && !nearBottom && !onButton && when {
+                expandedCap && capH != null ->
+                    cursorX >= capH.rect.left && cursorX <= capH.rect.right &&
+                        cursorY >= capH.rect.top && cursorY <= capH.rect.bottom
+                capH == null &&
+                    SystemClock.uptimeMillis() - lastClickableHandleSeenAt > COLLAPSED_HANDLE_MEMORY_MS ->
+                    cursorX >= b.left && cursorX <= b.right - CAPTION_BUTTON_ZONE &&
+                        cursorY >= b.top && cursorY <= b.top + CAPTION_STRIP_H
+                else -> false
+            }
+            type = when {
+                (nearLeft && nearTop) || (nearRight && nearBottom) -> CursorType.RESIZE_NWSE
+                (nearRight && nearTop) || (nearLeft && nearBottom) -> CursorType.RESIZE_NESW
+                nearLeft || nearRight -> CursorType.RESIZE_H
+                nearTop || nearBottom -> CursorType.RESIZE_V
+                inCaptionBody -> CursorType.MOVE
+                else -> CursorType.ARROW
+            }
+            onCap = type == CursorType.MOVE
+        }
+        // else: no window under the cursor, or a maximized window → ARROW, no drag.
+        // Region DIAG now logs AFTER the final glyph is decided — the old
+        // pre-decision line could never show WHICH cursor the zones resolved
+        // to (field: "no drag cursor over the expanded caption bar" was
+        // unverifiable because type was missing).
+        if (hnow - lastHandleCursorLog > 1500) {
+            lastHandleCursorLog = hnow
+            android.util.Log.d(
+                "PortalPadSleep",
+                "region: cursor=(${cursorX.toInt()},${cursorY.toInt()}) type=$type onCap=$onCap onPill=$onPill onButton=$onButton capClick=${capH?.clickable} winTop=${b?.top} winBot=${b?.bottom} handles=${handles.map { it.rect.toShortString() }}",
+            )
+        }
+        if (_cursorType.value != type) _cursorType.value = type
         if (_onCaption.value != onCap) _onCaption.value = onCap
     }
 
@@ -265,16 +545,30 @@ class InputInjector(
 
     private var displayWidth: Int = 1920
     private var displayHeight: Int = 1080
+    // While TRUE the setters below keep updating the INTERNAL position (it
+    // drives the caption shell-move target math) but stop publishing to the
+    // rendered cursor — during a caption drag the visual cursor is GLUED to
+    // the window instead: postCaptionMoveResize publishes grab-point-on-the-
+    // commanded-bounds each step, so cursor and window move as one object on
+    // one rhythm (field: the smooth cursor over the stepped window read as
+    // the cursor slipping off the bar).
+    @Volatile private var suppressCursorPublish = false
     private var cursorX: Float = 100f
         set(value) {
             field = value
-            _cursorPosition.value = Pair(value, cursorY)
+            if (!suppressCursorPublish) _cursorPosition.value = Pair(value, cursorY)
         }
     private var cursorY: Float = 100f
         set(value) {
             field = value
-            _cursorPosition.value = Pair(cursorX, value)
+            if (!suppressCursorPublish) _cursorPosition.value = Pair(cursorX, value)
         }
+    // Last glued cursor point (grab point on the last COMMANDED bounds) — the
+    // internal cursor snaps here at dragEnd so movement resumes from where the
+    // user SEES the cursor, not from an internal position that kept going past
+    // a clamp.
+    @Volatile private var lastGlueX = 0f
+    @Volatile private var lastGlueY = 0f
     private var downTime: Long = 0
 
     private val _cursorPosition = MutableStateFlow(Pair(100f, 100f))
@@ -292,6 +586,16 @@ class InputInjector(
     @Volatile var cursorOverDock: Boolean = false
     private val _dockRightClickTick = kotlinx.coroutines.flow.MutableSharedFlow<Long>(extraBufferCapacity = 1)
     val dockRightClickTick: kotlinx.coroutines.flow.SharedFlow<Long> = _dockRightClickTick.asSharedFlow()
+
+    // Widget overlay: same in-process right-click routing as the dock. While the
+    // overlay is showing, it sets [cursorOverWidgetOverlay] = true; rightClick()
+    // then emits [widgetOverlayRightClickTick] and skips injection (an injected
+    // long-press reaches this NOT_FOCUSABLE cursor-driven window as a plain tap,
+    // never a hold). The overlay collects the tick to toggle its edit mode — so
+    // the trackpad's press-and-hold (which drives rightClick) enters/exits edit.
+    @Volatile var cursorOverWidgetOverlay: Boolean = false
+    private val _widgetOverlayRightClickTick = kotlinx.coroutines.flow.MutableSharedFlow<Long>(extraBufferCapacity = 1)
+    val widgetOverlayRightClickTick: kotlinx.coroutines.flow.SharedFlow<Long> = _widgetOverlayRightClickTick.asSharedFlow()
 
     // Dock reorder ("wiggle") mode state, hoisted here so it SURVIVES the dock
     // overlay recomposing/remounting when the dock config refreshes after a drop.
@@ -519,6 +823,20 @@ class InputInjector(
      * clears text selections. the reference implementation uses the same hover-mouse pattern.
      */
     fun pointerMove(dx: Float, dy: Float) = safe {
+        // SINGLE-WRITER rule during a caption drag: this pipeline (fed by the
+        // air-mouse gyro among others) was writing the cursor IN PARALLEL with
+        // dragMove's integration — every phone movement in the user's hand
+        // fought the drag for the cursor, teleporting it hundreds of px
+        // between samples while the window chased the chaos (drift3.txt: raw
+        // drag deltas of ±5px with 300-700px cursor jumps between them; and
+        // the original field report's "stabilizes when I leave the phone
+        // alone" = gyro going quiet). Forwarding into dragMove keeps ONE
+        // integration path — so air-mouse-driven window drags, where phone
+        // motion IS the intent, still work.
+        if (captionMoveActive) {
+            dragMove(dx, dy)
+            return@safe
+        }
         val sx = dx * cursorSpeed
         val sy = dy * cursorSpeed
         cursorX = (cursorX + sx).coerceIn(0f, (displayWidth - 1).toFloat())
@@ -596,7 +914,124 @@ class InputInjector(
         debugToast("Pinch end → zoom x${"%.2f".format(lastPinchSpan / PINCH_BASE_SPAN)} disp=$displayId")
     }
 
-    fun dragStart() = safe {
+    /**
+     * Discrete zoom step for the Reader page — a quick pinch centered where the
+     * cursor is (same centering the trackpad pinch uses). [zoomIn] magnifies
+     * (pinch out); otherwise shrinks. The a11y path dispatches a single animated
+     * 200ms pinch; the Shizuku path ramps the span over a few frames so it reads
+     * as a real gesture before releasing.
+     */
+    fun zoomStep(zoomIn: Boolean) {
+        val target = if (zoomIn) 1.4f else 0.72f
+        if (useA11y()) {
+            pinchUpdate(target)
+            pinchCommit()
+            return
+        }
+        pinchUpdate(1.0f)
+        pinchUpdate((1.0f + target) / 2f)
+        pinchUpdate(target)
+        pinchCommit()
+    }
+
+    // Move the grabbed window to startBounds + cursor delta, clamped to keep it mostly
+    // on-screen (caption reachable). Runs the shell resize on the inject thread so the
+    // input path never blocks on it; latest call wins.
+    private fun postCaptionMoveResize() {
+        val ddx = (cursorX - moveCursorStartX).toInt()
+        val ddy = (cursorY - moveCursorStartY).toInt()
+        val left = (moveStartLeft + ddx).coerceIn(160 - moveW, (displayWidth - 160).coerceAtLeast(0))
+        val top = (moveStartTop + ddy).coerceIn(0, (displayHeight - 80).coerceAtLeast(0))
+        lastCmdLeft = left; lastCmdTop = top
+        val tid = moveTaskId
+        val bounds = com.portalpad.app.data.WindowBounds(left, top, left + moveW, top + moveH)
+        // Direct-follow: the cursor setter already published the cursor as it
+        // tracked the finger, so there's no separate "glue" point to republish
+        // — the window simply follows the cursor here.
+        submitCaptionResize(tid, bounds)
+    }
+
+    // ── Coalescing resize submitter ────────────────────────────────────────
+    // Never issue a new resize while one is in flight: stash only the LATEST
+    // target and fire it the instant the previous completes. Without this,
+    // slow resize commands (the shell fallback, or a loaded binder) queued
+    // faster than they completed — the COMMANDED position ran far ahead of the
+    // ACTUAL window, so the glued cursor sailed off the caption bar while the
+    // window lagged behind (field: drift early in a session, tight once the
+    // fast path warmed up). With coalescing, commanded can never lead executed
+    // by more than one step on ANY path; slow paths just take chunkier steps.
+    private val captionResizeLock = Any()
+    private var captionResizeBusy = false
+    private var captionResizePendingTask = -1
+    private var captionResizePendingBounds: com.portalpad.app.data.WindowBounds? = null
+
+    private fun submitCaptionResize(taskId: Int, bounds: com.portalpad.app.data.WindowBounds) {
+        synchronized(captionResizeLock) {
+            if (captionResizeBusy) {
+                captionResizePendingTask = taskId
+                captionResizePendingBounds = bounds
+                return
+            }
+            captionResizeBusy = true
+        }
+        injectExecutor.execute { runCaptionResizeLoop(taskId, bounds) }
+    }
+
+    private fun runCaptionResizeLoop(firstTask: Int, firstBounds: com.portalpad.app.data.WindowBounds) {
+        var tid = firstTask
+        var b: com.portalpad.app.data.WindowBounds? = firstBounds
+        while (true) {
+            val bb = b ?: break
+            runCatching { PortalPadApp.instance.freeform.resize(tid, bb) }
+            synchronized(captionResizeLock) {
+                val nb = captionResizePendingBounds
+                if (nb != null) {
+                    tid = captionResizePendingTask
+                    b = nb
+                    captionResizePendingBounds = null
+                } else {
+                    b = null
+                    captionResizeBusy = false
+                }
+            }
+        }
+    }
+
+    /** If this click landed on a SystemUI close (X) control and the
+     *  close-removes-from-Recents pref is on, the window is about to finish
+     *  itself via Samsung's own handler — schedule a removeTask shortly after
+     *  so the leftover Recents card is purged too (the DeX behavior).
+     *  Entirely off-main; a scan miss or an already-gone task is a harmless
+     *  no-op, so a normal content click costs one background node scan at
+     *  most. The task is resolved from the click point BEFORE the window
+     *  starts closing. */
+    private fun maybePurgeClosedTask(x: Float, y: Float) {
+        if (displayId == 0) return
+        if (!runCatching { PortalPadApp.instance.freeform.closeRemovesFromRecents }.getOrDefault(false)) return
+        val task = cachedResizeTasks.firstOrNull { t ->
+            t.bounds?.let { b -> x >= b.left && x <= b.right && y >= b.top && y <= b.bottom } == true
+        } ?: return
+        Thread {
+            try {
+                val hit = PortalPadAccessibilityService.instance
+                    ?.isCloseButtonAt(x.toInt(), y.toInt()) == true
+                if (!hit) return@Thread
+                Log.i(TAG, "DIAG-CLOSEX close control clicked → purging task=${task.taskId} in 600ms")
+                Thread.sleep(600)
+                val ok = runCatching {
+                    PortalPadApp.instance.activeBoundBackend?.removeTask(task.taskId)
+                }.getOrNull()
+                Log.i(TAG, "DIAG-CLOSEX removeTask(${task.taskId}) → $ok")
+            } catch (t: Throwable) {
+                Log.w(TAG, "DIAG-CLOSEX purge failed", t)
+            }
+        }.start()
+    }
+
+    fun dragStart(captionMove: Boolean = false) = safe {
+        // Fresh drag = fresh publish state (belt-and-braces against a leaked
+        // suppression from an aborted caption move freezing the cursor).
+        suppressCursorPublish = false
         if (useA11y()) {
             a11yDragActive = true
             a11yDragStartX = cursorX
@@ -604,6 +1039,60 @@ class InputInjector(
             clickHaptic()
             Log.d(TAG, "a11y dragStart @(${cursorX.toInt()},${cursorY.toInt()})")
             return@safe
+        }
+        // Caption/handle MOVE → shell setBounds. Find the window under the cursor (the
+        // handle sits at its top, so allow the cursor a little above the top), capture its
+        // bounds, and move it via resize() on each dragMove. No touch injected on the pill
+        // (so it also stops accidentally toggling the pill menu).
+        if (captionMove) {
+            // LIVE menu check (not the TTL cache — full log 2026-07-17
+            // 19:41:08.966: onPill=true while the menu was visibly open
+            // because the cached flag was stale): with the pill menu up, a
+            // hold on the pill area must NOT start a window move — the menu
+            // items live right there and the user is aiming at them. The scan
+            // stamps handleMenuVisibleNow fresh; on true we return with no
+            // drag armed, so the gesture's dragMove/dragEnd fall through as
+            // no-ops.
+            val menuOpen = runCatching {
+                PortalPadAccessibilityService.instance?.captionButtonRects()
+                PortalPadAccessibilityService.instance?.handleMenuVisibleNow == true
+            }.getOrDefault(false)
+            if (menuOpen) {
+                cachedMenuOpen = true
+                Log.d(TAG, "dragStart CAPTION suppressed — pill menu open")
+                return@safe
+            }
+            val task = runCatching {
+                PortalPadApp.instance.freeform.listTasks(displayId).firstOrNull { t ->
+                    val b = t.bounds
+                    b != null && cursorX >= b.left && cursorX <= b.right &&
+                        cursorY >= b.top - 80 && cursorY <= b.bottom
+                }
+            }.getOrNull()
+            val b = task?.bounds
+            if (task != null && b != null) {
+                captionMoveActive = true
+                // Every drag logs its resize path (see resetResizePathLog).
+                runCatching { PortalPadApp.instance.freeform.resetResizePathLog() }
+                moveTaskId = task.taskId
+                moveStartLeft = b.left
+                moveStartTop = b.top
+                moveW = b.right - b.left
+                moveH = b.bottom - b.top
+                moveCursorStartX = cursorX
+                moveCursorStartY = cursorY
+                lastMoveResizeAt = 0L
+                lastDragPosDiag = 0L
+                dragRawSumX = 0f; dragRawSumY = 0f; dragMaxStep = 0f
+                dragGrabOffX = cursorX - moveStartLeft
+                dragGrabOffY = cursorY - moveStartTop
+                lastCmdLeft = moveStartLeft; lastCmdTop = moveStartTop
+                clickHaptic()
+                Log.d(TAG, "dragStart CAPTION shell-move task=$moveTaskId from=($moveStartLeft,$moveStartTop) size=${moveW}x$moveH")
+                Log.d(TAG, "DIAG-DRAGPOS start cursor=(${cursorX.toInt()},${cursorY.toInt()}) grabOff=(${dragGrabOffX.toInt()},${dragGrabOffY.toInt()})")
+                return@safe
+            }
+            // Couldn't resolve the window — fall through to the touch-drag as a best effort.
         }
         val backend = PortalPadApp.instance.clickBackend as? ClickBackend.ShizukuUserService
             ?: return@safe
@@ -619,6 +1108,11 @@ class InputInjector(
         // chance to trigger. Otherwise the touch-down is at the cursor (a move).
         var startX = cursorX
         var startY = cursorY
+        // A caption/handle grab is an explicit MOVE: keep the touch-down AT the cursor
+        // so Android moves the window. The collapsed handle sits ON the window's top
+        // resize edge, so WITHOUT this guard the edge-snap below turned every handle
+        // drag into a vertical resize. Only non-caption grabs snap to a resize edge.
+        if (!captionMove) {
         runCatching {
             val tasks = PortalPadApp.instance.freeform.listTasks(displayId)
             // Focused = the task whose bounds contain the cursor (topmost wins;
@@ -648,6 +1142,25 @@ class InputInjector(
                 }
             }
         }
+        } else {
+            // Snap the touch-down onto the ACTUAL handle pill. The grab ZONE is generous
+            // (±HANDLE_GRAB_OUT), so the raw cursor can sit off the real pill; Samsung only
+            // starts a handle-drag when the touch lands ON the pill (like a real finger in
+            // DeX). Land it on the center of the pill under the cursor's x-span, and move
+            // the cursor there so the drag is continuous and the cursor stays glued to it.
+            val pill = cachedHandles.firstOrNull { h ->
+                h.clickable &&
+                    cursorX >= h.rect.left - HANDLE_GRAB_OUT_X && cursorX <= h.rect.right + HANDLE_GRAB_OUT_X &&
+                    cursorY >= h.rect.top - 80f && cursorY <= h.rect.bottom + 80f
+            }?.rect
+            if (pill != null) {
+                startX = (pill.left + pill.right) / 2f
+                startY = (pill.top + pill.bottom) / 2f
+                cursorX = startX
+                cursorY = startY
+                Log.d(TAG, "dragStart HANDLE snap → pill center ($startX,$startY)")
+            }
+        } // end if (!captionMove)
 
         sendHoverExitViaBackend(startX, startY)
         backend.backend.pointer(
@@ -673,6 +1186,64 @@ class InputInjector(
     }
 
     fun dragMove(dx: Float, dy: Float) = safe {
+        if (captionMoveActive) {
+            // Direct-follow: the cursor tracks the finger 1:1 and the window
+            // follows the cursor. This is the ORIGINAL model — the glue /
+            // coalescing / smoothing / velocity-clamp layers added on top of
+            // it each chased a "bounce" that turned out to be upstream input
+            // noise, and each added its own feel problems (lag, rubber-band,
+            // visible detach). Reverted to simple and direct on purpose.
+            cursorX = (cursorX + dx * cursorSpeed).coerceIn(0f, (displayWidth - 1).toFloat())
+            cursorY = (cursorY + dy * cursorSpeed).coerceIn(0f, (displayHeight - 1).toFloat())
+            captionMoveEvents++
+            val now = SystemClock.uptimeMillis()
+            // DIAG-DRAG rate: confirms move events are actually ARRIVING during
+            // the drag (drift.txt showed a 14s caption drag with resizes only
+            // at start/end — either dragMove wasn't called, or the throttle
+            // starved it). One line/sec with the event count since last line.
+            if (now - lastDragRateDiag > 1000) {
+                lastDragRateDiag = now
+                Log.d(TAG, "DIAG-DRAG move events in last ~1s: ${captionMoveEvents - lastDragRateCount}")
+                lastDragRateCount = captionMoveEvents
+            }
+            // DIAG-DRAGPOS sample (~10 Hz; see the field block for what each
+            // column discriminates). ASCII-only values — PowerShell captures
+            // mangle non-ASCII.
+            val stepX = kotlin.math.abs(dx * cursorSpeed)
+            val stepY = kotlin.math.abs(dy * cursorSpeed)
+            dragRawSumX += dx * cursorSpeed
+            dragRawSumY += dy * cursorSpeed
+            val step = if (stepX > stepY) stepX else stepY
+            if (step > dragMaxStep) dragMaxStep = step
+            if (now - lastDragPosDiag > 100) {
+                lastDragPosDiag = now
+                Log.d(
+                    TAG,
+                    "DIAG-DRAGPOS cursor=(${cursorX.toInt()},${cursorY.toInt()}) " +
+                        "cmd=($lastCmdLeft,$lastCmdTop) " +
+                        "dOff=(${(cursorX - lastCmdLeft - dragGrabOffX).toInt()}," +
+                        "${(cursorY - lastCmdTop - dragGrabOffY).toInt()}) " +
+                        "rawSum=(${dragRawSumX.toInt()},${dragRawSumY.toInt()}) " +
+                        "maxStep=${dragMaxStep.toInt()}",
+                )
+                dragRawSumX = 0f; dragRawSumY = 0f; dragMaxStep = 0f
+            }
+            // Cadence: both resize paths pace at ~11 steps/s. The old claim
+            // that the fast binder "sustains ~33 steps/s" measured SUBMISSION,
+            // not application — WM wraps every resizeTask in a queued
+            // transition and drains ~25-30/s max, so faster submits only grew
+            // a playback backlog (see CAPTION_MOVE_THROTTLE_* for the drag-
+            // test evidence).
+            val moveThrottle = if (runCatching {
+                    PortalPadApp.instance.freeform.lastResizeWasFast
+                }.getOrDefault(false)
+            ) CAPTION_MOVE_THROTTLE_FAST_MS else CAPTION_MOVE_THROTTLE_MS
+            if (now - lastMoveResizeAt >= moveThrottle) {
+                lastMoveResizeAt = now
+                postCaptionMoveResize()
+            }
+            return@safe
+        }
         if (a11yDragActive) {
             // Cursor tracks the finger so the user sees the drag; the actual drag
             // gesture is dispatched once on dragEnd (start→end).
@@ -703,6 +1274,23 @@ class InputInjector(
     }
 
     fun dragEnd() = safe {
+        if (captionMoveActive) {
+            captionMoveActive = false
+            postCaptionMoveResize() // land the final position exactly
+            moveTaskId = -1
+            // The pill just MOVED with its window: the cached handle rect now
+            // points at the pill's OLD position, and the 250ms scan + 600ms
+            // grace kept honoring it — field bug: a phantom grab zone lingered
+            // where the pill used to be (~100px off after a long move). Drop
+            // the cache and force an immediate rescan; the press-time test
+            // queries fresh rects on an empty cache, so the next grab is
+            // judged against the pill's REAL position.
+            cachedHandles = emptyList()
+            lastHandleRectsAt = 0L
+            lastResizeTaskCacheAt = 0L
+            Log.d(TAG, "dragEnd CAPTION shell-move → ($cursorX,$cursorY) — handle cache invalidated")
+            return@safe
+        }
         if (a11yDragActive) {
             a11yDragActive = false
             // Slow swipe (350ms) so it reads as a drag, not a fling. Window-move
@@ -935,6 +1523,25 @@ class InputInjector(
         // Notify desktop-mode window controls of the click coordinate (used for
         // click-to-grab window move/resize). Cheap no-op when nothing observes.
         emitClickEvent(x.toFloat(), y.toFloat())
+        // DeX-style Recents purge for SAMSUNG's own close controls (caption X /
+        // pill-menu X) — SystemUI-owned buttons whose clicks never route
+        // through FreeformManager.close.
+        maybePurgeClosedTask(x.toFloat(), y.toFloat())
+        // A click on the external display can open/close the pill menu, which
+        // changes the whole zone model (the pill stops being a drag target
+        // while its menu is up). Invalidate the TTL cache now AND after the
+        // menu's animate-in, so the next region pass reads fresh state instead
+        // of dragging on stale zones (19:41:08.966: onPill=true with the menu
+        // open).
+        if (displayId != 0) {
+            lastResizeTaskCacheAt = 0L
+            Thread {
+                runCatching {
+                    Thread.sleep(400)
+                    lastResizeTaskCacheAt = 0L
+                }
+            }.start()
+        }
         // Accessibility fallback: on a NON-trusted display (the trusted VD
         // couldn't be created), Shizuku-injected touches frequently don't land in
         // foreign app windows. An a11y-dispatched gesture is system-sourced and
@@ -1034,6 +1641,13 @@ class InputInjector(
         // injected long-press reaches the dock as a tap and would just launch.
         if (cursorOverDock) {
             _dockRightClickTick.tryEmit(android.os.SystemClock.uptimeMillis())
+            return@safe
+        }
+        // Same in-process handling for the widget overlay (see the flag's doc):
+        // an injected long-press would land as a tap, so route the hold to the
+        // overlay's edit-mode toggle instead of injecting.
+        if (cursorOverWidgetOverlay) {
+            _widgetOverlayRightClickTick.tryEmit(android.os.SystemClock.uptimeMillis())
             return@safe
         }
         val x = cursorX.toInt(); val y = cursorY.toInt()
@@ -1274,8 +1888,24 @@ class InputInjector(
     fun remoteScrollRight() = remoteSwipe(-displayWidth / 3f, 0f)
     fun remoteScrollLeft() = remoteSwipe(displayWidth / 3f, 0f)
 
-    /** Scroll-mode OK: a tap at the centre of the external display. */
-    fun remoteCenterTap() = tapAt(displayWidth / 2f, displayHeight / 2f)
+    /** Tap point for the scroll-mode / reader center tap: the centre of the
+     *  foreground app window on the injection display, or the display centre when
+     *  that can't be resolved (a11y unbound, no app window, empty bounds). Never
+     *  worse than the plain display-centre tap — only more accurate for a freeform
+     *  window, where the app isn't at display centre. Cheap: in-memory a11y snapshot. */
+    private fun centerTapPoint(): Pair<Float, Float> {
+        val c = com.portalpad.app.service.PortalPadAccessibilityService.instance
+            ?.let { runCatching { it.foregroundAppWindowCenter(displayId) }.getOrNull() }
+        return c ?: (displayWidth / 2f to displayHeight / 2f)
+    }
+
+    /** Scroll-mode / reader OK: a tap at the centre of the foreground app window
+     *  on the external display (display centre as fallback). Also what the Reader
+     *  "Exit Zoom" button sends — a tap is what dismisses Kindle's zoom overlay. */
+    fun remoteCenterTap() {
+        val (x, y) = centerTapPoint()
+        tapAt(x, y)
+    }
 
     /** Scroll-mode long-press OK: a touch long-press at the centre. */
     fun remoteCenterLongPress() = safe {
@@ -1533,6 +2163,10 @@ class InputInjector(
     fun dpadDown() = pressKey(KeyEvent.KEYCODE_DPAD_DOWN, repin = false)
     fun dpadLeft() = pressKey(KeyEvent.KEYCODE_DPAD_LEFT, repin = false)
     fun dpadRight() = pressKey(KeyEvent.KEYCODE_DPAD_RIGHT, repin = false)
+
+    // Reader page-flip keys (focus-following, so they work in freeform windows).
+    fun pageUp() = pressKey(KeyEvent.KEYCODE_PAGE_UP, repin = false)
+    fun pageDown() = pressKey(KeyEvent.KEYCODE_PAGE_DOWN, repin = false)
     fun dpadCenter() = pressKey(KeyEvent.KEYCODE_DPAD_CENTER, repin = false)
     fun enter() = pressKey(KeyEvent.KEYCODE_ENTER)
 
@@ -1675,17 +2309,22 @@ class InputInjector(
         // IME_ON_EXTERNAL pref means "force IME onto external (LOCAL, policy 0)".
         //  • glasses mode (IME_ON_EXTERNAL on) → LOCAL(0): keep the IME on the VD,
         //    the reference implementation's confirmed-good behavior.
-        //  • phone mode + auto-open relay ON → HIDE(2): the relay is meant to be the
-        //    ONLY keyboard for glasses fields, so we forbid the native Samsung
-        //    keyboard from ever showing for the VD field. The relay opens on field
-        //    tap and types via injection; the native keyboard never leaks. (The
-        //    detector keys on the focused-window display + soft-input mode, which are
-        //    window attributes that survive HIDE, so HIDE no longer blinds it.)
-        //  • phone mode + relay OFF → FALLBACK(1): no relay to type with, so route
-        //    the native Samsung keyboard to the phone, bound to the glasses field.
+        //  • phone mode → FALLBACK(1), relay on or off. History: relay-on used
+        //    to pin HIDE(2) so the native keyboard "never leaks" for a VD field
+        //    while the relay typed via INJECTED KEYSTROKES. That injection path
+        //    is gone (FORWARD_LIVE_KEYSTROKES, KeyboardRelayActivity), and HIDE
+        //    became the direct cause of the relay's blink cycle: every debounced
+        //    a11y write migrates the IME target to the VD field for a beat, and
+        //    a HIDE-policy target fires HIDE_DISPLAY_IME_POLICY_HIDE (kb tests
+        //    2026-07-17: hide ~25ms after each write, recovery seconds later).
+        //    Under FALLBACK the same migration keeps the keyboard UP on the
+        //    phone, briefly bound cross-display, until the relay refocuses —
+        //    no hide to recover from. (A 2025-era note says FALLBACK failed for
+        //    the relay — that failure was per-key Chrome focus gain from the
+        //    injected keystrokes, which no longer exist.)
         // Constants: 0=LOCAL, 1=FALLBACK_DISPLAY, 2=HIDE.
         val imeOnExternal = imeOnExternalEnabled
-        val policy = if (imeOnExternal) 0 else if (autoOpenRelayEnabled) 2 else 1
+        val policy = if (imeOnExternal) 0 else 1
         if (imePolicyApplied[targetDisplay] == policy) {
             Log.d(TAG, "repin NO-OP disp=$targetDisplay policy=$policy already applied (dropdown-safe)")
             return
@@ -1711,15 +2350,13 @@ class InputInjector(
      * HIDE_DISPLAY_IME_POLICY_HIDE — which collapses the phone keyboard
      * serving the relay field. Result: one key types, keyboard vanishes.
      *
-     * Fix: while relaying, explicitly set the VD's IME policy to HIDE (1).
-     * Counter-intuitively, telling the VD "never show an IME here" stops
-     * Chrome from *requesting* IME placement on the VD, so the failed-
-     * placement → hide cascade never fires and the phone keyboard stays up.
+     * Fix (current): while relaying, set the VD's IME policy to
+     * FALLBACK_DISPLAY (1) so any moment the VD field becomes the IME target
+     * (the debounced a11y writes) the keyboard stays up on the phone instead
+     * of hiding. HIDE (2) was the keystroke-forwarding-era fix and became the
+     * blink cycle's cause once forwarding was removed — see the inline
+     * comment below for the full history.
      * On exit we restore the normal policy via repinImePolicy().
-     *
-     * HIDE is otherwise avoided (it was the original dropdown culprit), but
-     * here it's scoped strictly to the relay session and the user is typing
-     * on the phone, not interacting with a VD dropdown — so it's safe.
      */
     fun setRelayImeMode(active: Boolean) {
         suppressImeRepin = active
@@ -1729,22 +2366,28 @@ class InputInjector(
         val shizuku = (backend as? ClickBackend.ShizukuUserService)?.backend ?: return
         if (!shizuku.isReady) return
         if (active) {
-            // 2 = DISPLAY_IME_POLICY_HIDE — tell the VD "never show an IME
-            // here" so Chrome on the VD stops *requesting* IME placement on
-            // it. That request is what triggers Samsung's failed-placement →
-            // hide cascade (semComputeImeDisplayIdForTarget returns -1), which
-            // collapses the phone keyboard serving the relay field. HIDE breaks
-            // that cascade so the phone keyboard stays up. (Was previously set
-            // to 1=FALLBACK_DISPLAY, which does NOT stop the request — the
-            // relay keyboard kept vanishing after one keystroke.)
-            if (imePolicyApplied[targetDisplay] == 2) {
-                Log.d(TAG, "relay IME mode ON: disp=$targetDisplay already HIDE — NO-OP (dropdown survives)")
+            // 1 = DISPLAY_IME_POLICY_FALLBACK_DISPLAY. HISTORY: this was 2
+            // (HIDE) through the keystroke-forwarding era — each INJECTED key
+            // made Chrome-on-the-VD gain focus and request IME placement
+            // there, and HIDE was the only thing that broke Samsung's failed-
+            // placement → hide cascade (FALLBACK was tried then and failed).
+            // That per-key focus gain died with FORWARD_LIVE_KEYSTROKES
+            // (typing is a11y SET_TEXT now); what remained of HIDE was pure
+            // downside: every debounced write briefly makes the VD field the
+            // IME target, and a HIDE-policy target fires
+            // HIDE_DISPLAY_IME_POLICY_HIDE — the relay's blink cycle (kb
+            // tests 2026-07-17). FALLBACK keeps the keyboard up on the phone
+            // through those migrations. If the one-key-then-vanish pattern
+            // ever returns, capture a log before touching this — the old
+            // mechanism CANNOT fire without key injection.
+            if (imePolicyApplied[targetDisplay] == 1) {
+                Log.d(TAG, "relay IME mode ON: disp=$targetDisplay already FALLBACK — NO-OP (dropdown survives)")
                 return
             }
-            val ok = runCatching { shizuku.setImePolicy(targetDisplay, 2) }.getOrDefault(false)
-            if (ok) imePolicyApplied[targetDisplay] = 2
+            val ok = runCatching { shizuku.setImePolicy(targetDisplay, 1) }.getOrDefault(false)
+            if (ok) imePolicyApplied[targetDisplay] = 1
             touchedImeDisplays.add(targetDisplay)
-            Log.d(TAG, "relay IME mode ON: disp=$targetDisplay policy=2(HIDE) ok=$ok")
+            Log.d(TAG, "relay IME mode ON: disp=$targetDisplay policy=1(FALLBACK) ok=$ok")
         } else {
             // LAZY restore — deliberately NO policy write here. The eager
             // repin at relay close forced the IME relayout that dismissed
@@ -1859,14 +2502,71 @@ class InputInjector(
         // The top edge's inside reach is a bit wider than the other edges' arrow
         // strip so it's easier to catch, while still leaving the caption below it
         // for title-bar moves.
-        private const val RESIZE_TOP_IN = 20f
+        private const val RESIZE_TOP_IN = 12f
+        // How far ABOVE the window's top edge the resize/move cursors reach. Small, so the
+        // cursor never floats out in the wallpaper above the window — it only appears once
+        // you're actually on the top edge.
+        private const val RESIZE_TOP_OUT = 8f
         // Height of the freeform caption strip (below the top-resize zone) that a
         // grab treats as "move the window". Android captions run ~40–48px; tunable.
-        private const val CAPTION_STRIP_H = 48f
+        private const val CAPTION_STRIP_H = 52f
         // The resize GRAB zone is more forgiving than the arrow strip so you don't
         // have to be pixel-perfect. Applied inward on left/right/bottom; the top
         // stays thin (RESIZE_EDGE_IN) so title-bar grabs remain clean moves.
         private const val RESIZE_GRAB_IN = 30f
+        // Margin around the collapsed caption handle pill that still counts as "on the
+        // handle" — makes the small pill easier to land the cursor on. Asymmetric:
+        // the pill is only ~33px tall and sits dead-center on the window's full-width
+        // top resize-V band, so a thin resize sliver hugs it (mostly above). A larger
+        // VERTICAL outset swallows that sliver; a modest HORIZONTAL outset keeps the
+        // top edge to the left/right of the pill available for real resizing.
+        private const val HANDLE_GRAB_OUT_X = 16f
+        // TIGHT mini-green-bar zone: a small margin on the sides/top of the pill, and
+        // NOTHING below it (the pill menu opens right below and must stay tappable, not
+        // draggable). Used for both the hover cursor and the press re-test.
+        private const val PILL_OUT = 8f
+        // Right-side carve-out on the Android caption bar: the maximize/close/fullscreen
+        // button cluster lives here, so the drag body stops this far in from the right.
+        private const val CAPTION_BUTTON_ZONE = 250f
+        // How long to keep the last non-empty handle rects after captionHandles
+        // momentarily returns empty (the pill menu opening/closing drops the node),
+        // so the MOVE zone does not flicker to a resize edge mid-interaction.
+        private const val HANDLE_RECTS_GRACE_MS = 600L
+        // Widget edit-mode cursor zones (px). Edges reach generously OUTWARD
+        // (covers the half-in dots and the 1-tall widget's fully-out S dot) but
+        // barely inward, so resize glyphs never sit on the widget's face; the
+        // interior MOVE zone insets past the inward reach so the two can't
+        // overlap.
+        private const val WIDGET_EDGE_IN = 10f
+        private const val WIDGET_EDGE_OUT = 28f
+        private const val WIDGET_MOVE_INSET = 14f
+        // How long "we saw a collapsed pill" suppresses the geometric caption
+        // fallback after the handle node vanishes. Long enough to ride out
+        // SystemUI's decor rebuild (observed multi-second flicker after pill
+        // interactions), short enough that a window GENUINELY losing its
+        // handle regains the geometric band quickly.
+        private const val COLLAPSED_HANDLE_MEMORY_MS = 4000L
+        // How often the caption/handle shell-move re-sends bounds during a drag.
+        // BOTH paths are throttled to ~11 steps/s — NOT for IPC cost, but
+        // because on this ROM every resizeTask (fast binder OR shell) wraps
+        // the bounds change in a WM TRANSITION that takes ~30-80ms to play,
+        // serialized on one thread (~25-30/s max drain). The old 16ms fast
+        // cadence submitted 60/s: WM queued nearly every one (drag test
+        // 2026-07-17: 1621 of 1627 resizes hit "Queueing transition") and the
+        // window played back a RECORDING of the finger — laggy tracking,
+        // cursor off the caption bar, and 10.5 SECONDS of the window moving
+        // by itself after release while the backlog drained. Coalescing can't
+        // prevent this: resizeTask RETURNS when the transition is queued, not
+        // when it's applied, so "not busy" never meant "caught up". At 90ms
+        // the queue can't form; worst-case visual lag is one pending step
+        // (~90ms) + one play (~40ms), and the window STOPS when the finger
+        // stops. If drags still feel wrong, tune with a new DIAG-DRAGPOS
+        // capture — do NOT drop this below the measured drain rate. (Future
+        // smooth path: WindowContainerTransaction/applyTransaction, the
+        // transition-less mechanism DeX-style drags use — a research project,
+        // not a tweak.)
+        private const val CAPTION_MOVE_THROTTLE_MS = 90L
+        private const val CAPTION_MOVE_THROTTLE_FAST_MS = 90L
         /** Reference finger span (px) for scale=1.0 in the injected pinch; the
          *  live span is PINCH_BASE_SPAN * pinchScale. */
         private const val PINCH_BASE_SPAN = 240f

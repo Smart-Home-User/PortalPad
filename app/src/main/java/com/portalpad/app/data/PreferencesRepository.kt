@@ -43,6 +43,7 @@ class PreferencesRepository(private val context: Context) {
         val DOCK_CONFIG = stringPreferencesKey("dock_config")          // JSON DockConfig
         val TOP_BAR_CONFIG = stringPreferencesKey("top_bar_config")    // JSON TopBarConfig
         val FOLDER_WINDOW_CONFIG = stringPreferencesKey("folder_window_config") // JSON FolderWindowConfig
+        val WIDGET_OVERLAY_CONFIG = stringPreferencesKey("widget_overlay_config") // JSON WidgetOverlayConfig
         val SIDE_MODE_CONFIG = stringPreferencesKey("side_mode_config") // JSON SideModeConfig (per-interface)
         val DISPLAY_DPI = intPreferencesKey("display_dpi")             // 0 = use 213 default
         val SHIZUKU_AUTH_KEY = stringPreferencesKey("shizuku_auth_key") // Shizuku automation 'auth' Extras value
@@ -165,6 +166,16 @@ class PreferencesRepository(private val context: Context) {
          * a separate path that races it. Opt in only to use the relay instead.
          */
         val AUTO_OPEN_RELAY_ON_FIELD = booleanPreferencesKey("auto_open_relay_on_field")
+        /** Closing a window (Close all, Manage windows, radial/top-bar close,
+         *  or Samsung's own caption/pill X) also removes its card from phone
+         *  Recents via the removeTask binder. Default ON per SH; turning it
+         *  off restores the historical behavior (Recents card may remain). */
+        val CLOSE_REMOVES_FROM_RECENTS = booleanPreferencesKey("close_removes_from_recents")
+        /** Android-keyboard relay: ms of typing stillness before the external
+         *  write fires. Writes NEVER happen mid-typing (each one migrates the
+         *  IME target and the user's own keypresses then re-steal display
+         *  focus — the "types a few chars then stops" ROM behavior). */
+        val RELAY_PAUSE_FLUSH_MS = intPreferencesKey("relay_pause_flush_ms")
         /**
          * When true (default): a quick finger tap on the trackpad surface
          * fires a left click. When false: the trackpad is motion-only — taps
@@ -183,6 +194,12 @@ class PreferencesRepository(private val context: Context) {
         // reappears instantly on the next trackpad movement.
         val MEDIA_AUTOHIDE_CURSOR = booleanPreferencesKey("media_autohide_cursor")
         val MEDIA_AUTOHIDE_CURSOR_SEC = intPreferencesKey("media_autohide_cursor_sec")
+        val READER_FLIP_METHOD = intPreferencesKey("reader_flip_method") // 0 = Page up/down, 1 = Arrows, 2 = Scroll
+        // Remote-interface D-pad-area sub-mode (the "Input" dropdown in
+        // MediaControlsPanel): 0 = D-pad, 1 = Scroll, 2 = Gesture, 3 = Reader.
+        // Distinct from the pointing-mode InputMode enum. Persisted so Reader
+        // (and Scroll/Gesture) survive disconnect / relay round-trip / recreate.
+        val REMOTE_INPUT_MODE = intPreferencesKey("remote_input_mode")
         val SCROLL_SPEED = androidx.datastore.preferences.core.floatPreferencesKey("scroll_speed")
         val INVERT_SCROLL = booleanPreferencesKey("invert_scroll")
         // Velocity-based pointer acceleration strength. 1.0 = tuned default,
@@ -213,6 +230,8 @@ class PreferencesRepository(private val context: Context) {
         // One-time hint: shown the first time the trackpad arrange button is
         // tapped, teaching the long-press (arrange in order) gesture.
         val ARRANGE_LONGPRESS_HINT_SEEN = booleanPreferencesKey("arrange_longpress_hint_seen")
+        val WIDGET_OVERLAY_NUDGE_SEEN = booleanPreferencesKey("widget_overlay_nudge_seen") // one-time Workspace discovery card
+        val WIDGET_OVERLAY_EDIT_HINT_COUNT = intPreferencesKey("widget_overlay_edit_hint_count") // times user entered edit; hint retires at 3
         val AIR_MOUSE_INVERT_Y = booleanPreferencesKey("air_mouse_invert_y")
         val SCREEN_OFF_EXPLAINED = booleanPreferencesKey("screen_off_explained")
         // Start-setup page: did the user say they'll use media controls / the
@@ -589,13 +608,27 @@ class PreferencesRepository(private val context: Context) {
      */
     suspend fun sessionForCanvas(w: Int, h: Int): Triple<SavedSession, Float, Float> {
         val map = sessionsByWidth.first().byWidth
-        map[w]?.takeIf { it.windows.isNotEmpty() }?.let { return Triple(it, 1f, 1f) }
+        map[w]?.takeIf { it.windows.isNotEmpty() }?.let {
+            android.util.Log.d(
+                "PortalPadSleep",
+                "sessionForCanvas: VISITED width=$w → restore saved (${it.windows.size} win, scale 1.0)",
+            )
+            return Triple(it, 1f, 1f)
+        }
         val last = lastSession.first()
         val seed = last.takeIf { it.windows.isNotEmpty() }
             ?: map.values.filter { it.windows.isNotEmpty() }.maxByOrNull { it.savedAtMillis }
-            ?: return Triple(SavedSession(), 1f, 1f)
+            ?: run {
+                android.util.Log.d("PortalPadSleep", "sessionForCanvas: NEVER-VISITED width=$w → no seed available (empty)")
+                return Triple(SavedSession(), 1f, 1f)
+            }
         val sx = if (seed.canvasWidth > 0) w.toFloat() / seed.canvasWidth else 1f
         val sy = if (seed.canvasHeight > 0) h.toFloat() / seed.canvasHeight else 1f
+        android.util.Log.d(
+            "PortalPadSleep",
+            "sessionForCanvas: NEVER-VISITED width=$w → carry-over seed from width=${seed.canvasWidth} " +
+                "(${seed.windows.size} win) scale=${sx}x$sy",
+        )
         return Triple(seed, sx, sy)
     }
 
@@ -613,6 +646,11 @@ class PreferencesRepository(private val context: Context) {
         p[Keys.FOLDER_WINDOW_CONFIG]?.let {
             runCatching { json.decodeFromString<FolderWindowConfig>(it) }.getOrNull()
         } ?: FolderWindowConfig()
+    }
+    val widgetOverlayConfig: Flow<WidgetOverlayConfig> = context.dataStore.data.map { p ->
+        p[Keys.WIDGET_OVERLAY_CONFIG]?.let {
+            runCatching { json.decodeFromString<WidgetOverlayConfig>(it) }.getOrNull()
+        } ?: WidgetOverlayConfig()
     }
     val displayDpi: Flow<Int> = context.dataStore.data.map { it[Keys.DISPLAY_DPI] ?: 0 }
     val shizukuAuthKey: Flow<String> = context.dataStore.data.map { it[Keys.SHIZUKU_AUTH_KEY] ?: "" }
@@ -671,6 +709,8 @@ class PreferencesRepository(private val context: Context) {
     val colorTuning: Flow<String> = context.dataStore.data.map { it[Keys.COLOR_TUNING] ?: "" }
     val gpuColorPipeline: Flow<Boolean> = context.dataStore.data.map { it[Keys.GPU_COLOR_PIPELINE] ?: true }
     val panelSystemMirror: Flow<Boolean> = context.dataStore.data.map { it[Keys.PANEL_SYSTEM_MIRROR] ?: false }
+    val readerFlipMethod: Flow<Int> = context.dataStore.data.map { it[Keys.READER_FLIP_METHOD] ?: 1 }
+    val remoteInputMode: Flow<Int> = context.dataStore.data.map { it[Keys.REMOTE_INPUT_MODE] ?: 0 }
     // Global haptic strength (ms). Default 25 = Medium. 0 = Off.
     val vibrationMs: Flow<Int> = context.dataStore.data.map { it[Keys.VIBRATION_MS] ?: 25 }
     fun bool(key: Preferences.Key<Boolean>, default: Boolean = false): Flow<Boolean> =
@@ -837,6 +877,9 @@ class PreferencesRepository(private val context: Context) {
     suspend fun setFolderWindowConfig(config: FolderWindowConfig) = context.dataStore.edit {
         it[Keys.FOLDER_WINDOW_CONFIG] = json.encodeToString(config)
     }
+    suspend fun setWidgetOverlayConfig(config: WidgetOverlayConfig) = context.dataStore.edit {
+        it[Keys.WIDGET_OVERLAY_CONFIG] = json.encodeToString(config)
+    }
     suspend fun setDisplayDpi(value: Int) = context.dataStore.edit { it[Keys.DISPLAY_DPI] = value }
     suspend fun setShizukuAuthKey(value: String) = context.dataStore.edit { it[Keys.SHIZUKU_AUTH_KEY] = value }
     suspend fun setAspectRatio(value: String) = context.dataStore.edit { it[Keys.ASPECT_RATIO] = value }
@@ -869,6 +912,8 @@ class PreferencesRepository(private val context: Context) {
     suspend fun setColorTuning(value: String) = context.dataStore.edit { it[Keys.COLOR_TUNING] = value }
     suspend fun setGpuColorPipeline(value: Boolean) = context.dataStore.edit { it[Keys.GPU_COLOR_PIPELINE] = value }
     suspend fun setPanelSystemMirror(value: Boolean) = context.dataStore.edit { it[Keys.PANEL_SYSTEM_MIRROR] = value }
+    suspend fun setReaderFlipMethod(value: Int) = context.dataStore.edit { it[Keys.READER_FLIP_METHOD] = value }
+    suspend fun setRemoteInputMode(value: Int) = context.dataStore.edit { it[Keys.REMOTE_INPUT_MODE] = value }
     suspend fun setVibrationMs(value: Int) = context.dataStore.edit { it[Keys.VIBRATION_MS] = value }
     suspend fun setBool(key: Preferences.Key<Boolean>, value: Boolean) =
         context.dataStore.edit { it[key] = value }

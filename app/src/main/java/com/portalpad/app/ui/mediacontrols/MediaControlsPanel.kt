@@ -76,6 +76,7 @@ import com.portalpad.app.ui.theme.AbPrimaryBright
 import com.portalpad.app.ui.theme.AbSurface
 import com.portalpad.app.ui.theme.AbSurfaceElevated
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 /**
@@ -128,7 +129,54 @@ fun MediaControlsPanel(
     var inputMode by remember { mutableStateOf(0) }
     val scrollMode = inputMode == 1
     val gestureMode = inputMode == 2
-    val inputModeName = when (inputMode) { 1 -> "Scroll"; 2 -> "Gesture"; else -> "D-pad" }
+    val readerMode = inputMode == 3
+    val inputModeName = when (inputMode) { 1 -> "Scroll"; 2 -> "Gesture"; 3 -> "Reader"; else -> "D-pad" }
+    val readerFlip by app.prefs.readerFlipMethod.collectAsState(initial = 1)
+    val readerScope = androidx.compose.runtime.rememberCoroutineScope()
+    // Persist the Input sub-mode so Reader (and Scroll/Gesture) survive a
+    // disconnect / relay round-trip / activity recreate. Seed ONCE from the
+    // saved value on (re)composition — a fresh composition after recreate
+    // re-reads it here. The seed assigns inputMode directly (not via the
+    // helper) so it does not write back. Every user-driven change goes through
+    // setInputMode, which updates the live state AND persists.
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        val saved = app.prefs.remoteInputMode.first()
+        if (saved != inputMode) inputMode = saved
+    }
+    val setInputMode: (Int) -> Unit = { v ->
+        inputMode = v
+        readerScope.launch { app.prefs.setRemoteInputMode(v) }
+    }
+    // Reader brightness: a TRANSIENT override of the GL color pass (value 0 of
+    // the tuning vector). Seeded from the saved value on Reader open, driven live
+    // while reading, never persisted, reverted to saved on exit. Only usable
+    // off-mirror with the GPU pipeline on — the only state where that GL pass
+    // exists — so it's greyed otherwise.
+    val readerSavedTuning by app.prefs.colorTuning.collectAsState(initial = "")
+    val readerGpuOn by app.prefs.gpuColorPipeline.collectAsState(initial = true)
+    val readerMirror by app.prefs.panelSystemMirror.collectAsState(initial = false)
+    val readerBrightnessAvailable = readerGpuOn && !readerMirror
+    var readerBrightness by remember { mutableStateOf(1f) }
+    var readerBrightnessTouched by remember { mutableStateOf(false) }
+    // value == null reverts to the saved brightness; otherwise overrides value 0.
+    fun readerApplyBrightness(value: Float?) {
+        readerScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val svc = com.portalpad.app.service.PortalPadForegroundService.instance ?: return@launch
+            val vals = com.portalpad.app.presentation.GlColorRenderer.parseValues(readerSavedTuning)
+            if (value != null && vals.isNotEmpty()) vals[0] = value
+            val mtx = com.portalpad.app.presentation.GlColorRenderer.matrixFromValues(vals)
+            runCatching { svc.applyGlassesColorMatrix(mtx, vals.getOrElse(5) { 1f }) }
+        }
+    }
+    androidx.compose.runtime.LaunchedEffect(readerMode) {
+        if (readerMode) {
+            readerBrightness = com.portalpad.app.presentation.GlColorRenderer
+                .parseValues(readerSavedTuning).getOrElse(0) { 1f }
+        } else if (readerBrightnessTouched) {
+            readerApplyBrightness(null) // revert to the saved Display brightness
+            readerBrightnessTouched = false
+        }
+    }
     var inClusterMenuOpen by remember { mutableStateOf(false) }
     var overlayMenuOpen by remember { mutableStateOf(false) }
     var showRemoteGuide by remember { mutableStateOf(false) }
@@ -470,7 +518,7 @@ fun MediaControlsPanel(
                     expanded = inClusterMenuOpen,
                     onDismissRequest = { inClusterMenuOpen = false },
                 ) {
-                    listOf(0 to "D-pad", 1 to "Scroll", 2 to "Gesture").forEach { (value, label) ->
+                    listOf(0 to "D-pad", 1 to "Scroll", 2 to "Gesture", 3 to "Reader").forEach { (value, label) ->
                         androidx.compose.material3.DropdownMenuItem(
                             text = {
                                 Text(
@@ -481,7 +529,7 @@ fun MediaControlsPanel(
                             },
                             onClick = {
                                 com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = false)
-                                inputMode = value
+                                setInputMode(value)
                                 inClusterMenuOpen = false
                             },
                         )
@@ -877,7 +925,7 @@ fun MediaControlsPanel(
                                 expanded = overlayMenuOpen,
                                 onDismissRequest = { overlayMenuOpen = false },
                             ) {
-                                listOf(0 to "D-pad", 1 to "Scroll", 2 to "Gesture").forEach { (value, label) ->
+                                listOf(0 to "D-pad", 1 to "Scroll", 2 to "Gesture", 3 to "Reader").forEach { (value, label) ->
                                     androidx.compose.material3.DropdownMenuItem(
                                         text = {
                                             Text(
@@ -888,7 +936,7 @@ fun MediaControlsPanel(
                                         },
                                         onClick = {
                                             com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = false)
-                                            inputMode = value
+                                            setInputMode(value)
                                             overlayMenuOpen = false
                                         },
                                     )
@@ -959,7 +1007,163 @@ fun MediaControlsPanel(
                             .border(1.dp, Color(0xFF3C3358), RoundedCornerShape(16.dp))
                             .clickable {
                                 com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = false)
-                                inputMode = 0
+                                setInputMode(0)
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            "Tap to exit",
+                            color = AbOnSurface,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
+            }
+        }
+
+        // ── Reader overlay ───────────────────────────────────────────────
+        // Input = Reader: a reading surface (flip-method selector + big
+        // Previous/Next page zones + pinch zoom) floating on the remote, with
+        // the same chrome as the gesture overlay. Flip/scroll drive
+        // focus-following keys/scroll, so they work in freeform windows too.
+        // Tap-to-exit drops back to D-pad.
+        if (readerMode) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .drawBehind {
+                        drawRect(
+                            brush = Brush.radialGradient(
+                                colors = listOf(Color(0xFF271C4C), Color(0xFF181126), Color(0xFF0E0A1A)),
+                                center = androidx.compose.ui.geometry.Offset(size.width * 0.5f, size.height * 0.40f),
+                                radius = size.maxDimension * 0.62f,
+                            ),
+                        )
+                    },
+            ) {
+                Column(
+                    Modifier
+                        .fillMaxSize()
+                        .padding(start = 20.dp, top = 20.dp, end = 20.dp, bottom = 16.dp),
+                ) {
+                    Box(Modifier.fillMaxWidth().height(58.dp)) {
+                        com.portalpad.app.ui.power.ExtinguishPowerButton(
+                            modifier = Modifier.align(Alignment.TopStart).padding(8.dp),
+                        )
+                        com.portalpad.app.ui.common.ModeStatusLabel(
+                            modifier = Modifier.align(Alignment.TopCenter).padding(top = 4.dp),
+                        )
+                        Box(Modifier.align(Alignment.TopCenter).padding(top = 26.dp)) {
+                            androidx.compose.foundation.layout.Row(
+                                Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .background(AbPrimary.copy(alpha = 0.16f))
+                                    .border(1.5.dp, AbPrimary.copy(alpha = 0.62f), RoundedCornerShape(50))
+                                    .clickable {
+                                        com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = false)
+                                        overlayMenuOpen = true
+                                    }
+                                    .padding(horizontal = 14.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("Input: ", color = AbPrimaryBright, style = MaterialTheme.typography.bodySmall)
+                                Text(
+                                    inputModeName,
+                                    color = Color(0xFFC9A9FF),
+                                    fontWeight = FontWeight.SemiBold,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                                Text(" \u25BE", color = AbPrimaryBright, style = MaterialTheme.typography.bodySmall)
+                            }
+                            androidx.compose.material3.DropdownMenu(
+                                expanded = overlayMenuOpen,
+                                onDismissRequest = { overlayMenuOpen = false },
+                            ) {
+                                listOf(0 to "D-pad", 1 to "Scroll", 2 to "Gesture", 3 to "Reader").forEach { (value, label) ->
+                                    androidx.compose.material3.DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                label,
+                                                color = if (value == inputMode) AbPrimaryBright else AbOnSurface,
+                                                fontWeight = if (value == inputMode) FontWeight.SemiBold else FontWeight.Normal,
+                                            )
+                                        },
+                                        onClick = {
+                                            com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = false)
+                                            setInputMode(value)
+                                            overlayMenuOpen = false
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    ReaderControls(
+                        flipMethod = readerFlip,
+                        onSelectFlip = { readerScope.launch { app.prefs.setReaderFlipMethod(it) } },
+                        onPrev = {
+                            when (readerFlip) {
+                                2 -> app.injector.remoteScrollUp()
+                                1 -> app.injector.dpadLeft()
+                                else -> app.injector.pageUp()
+                            }
+                        },
+                        onNext = {
+                            when (readerFlip) {
+                                2 -> app.injector.remoteScrollDown()
+                                1 -> app.injector.dpadRight()
+                                else -> app.injector.pageDown()
+                            }
+                        },
+                        onZoomIn = { app.injector.zoomStep(true) },
+                        onZoomOut = { app.injector.zoomStep(false) },
+                        onFind = {
+                            // Ctrl+F opens the find bar in apps that honor it;
+                            // KEYCODE_SEARCH is a fallback some apps (Kindle) map to
+                            // in-app search. Then the a11y service finds the search
+                            // field by NODE and clicks it to give it input focus —
+                            // Kindle re-opens search with the field unfocused, so
+                            // relay typing otherwise lands nowhere. It opens the
+                            // relay on the field (or a plain relay if none found).
+                            app.injector.pressKeyWithMeta(
+                                android.view.KeyEvent.KEYCODE_F,
+                                android.view.KeyEvent.META_CTRL_ON,
+                            )
+                            app.injector.pressKey(android.view.KeyEvent.KEYCODE_SEARCH, repin = false)
+                            val a11y = com.portalpad.app.service.PortalPadAccessibilityService.instance
+                            if (a11y != null) {
+                                a11y.focusReaderSearchField(app.externalDisplayId.value)
+                            } else {
+                                readerScope.launch {
+                                    kotlinx.coroutines.delay(250)
+                                    runCatching {
+                                        app.startActivity(
+                                            android.content.Intent(app, com.portalpad.app.KeyboardRelayActivity::class.java)
+                                                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                                            android.app.ActivityOptions.makeBasic().setLaunchDisplayId(0).toBundle(),
+                                        )
+                                    }
+                                }
+                            }
+                        },
+                        brightnessAvailable = readerBrightnessAvailable,
+                        brightness = readerBrightness,
+                        onBrightnessChange = { v -> readerBrightness = v; readerBrightnessTouched = true; readerApplyBrightness(v) },
+                        onExitZoom = { app.injector.remoteCenterTap() },
+                        onFixMirror = { readerScope.launch { app.prefs.setPanelSystemMirror(false) } },
+                        modifier = Modifier.weight(1f).fillMaxWidth().padding(top = 6.dp),
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(46.dp)
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(AbSurfaceElevated)
+                            .border(1.dp, Color(0xFF3C3358), RoundedCornerShape(16.dp))
+                            .clickable {
+                                com.portalpad.app.PortalPadApp.instance.injector.buzz(longPress = false)
+                                setInputMode(0)
                             },
                         contentAlignment = Alignment.Center,
                     ) {

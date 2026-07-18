@@ -53,6 +53,14 @@ class GlColorRenderer(
     private var recordEglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
     @Volatile private var recordActive = false
 
+    // Set true the first time a real VD frame flows through drawFrame (onFrameAvailable
+    // fired → updateTexImage succeeded). This is the definitive "mirror is pumping" signal:
+    // a bound-but-stuck mirror sits on its black init frame and NEVER runs drawFrame, so
+    // the service can poll this shortly after attach and auto-kick a composition if it's
+    // still false (black-panel-on-plug guard).
+    @Volatile private var contentFramePresented = false
+    val hasPresentedContentFrame: Boolean get() = contentFramePresented
+
     private var program = 0
     private var texId = 0
     private var aPos = 0
@@ -171,6 +179,10 @@ class GlColorRenderer(
             Log.w(TAG, "updateTexImage failed", t); return
         }
         val frameTsNs = st.timestamp
+        if (!contentFramePresented) {
+            contentFramePresented = true
+            Log.d(TAG, "first content frame presented (mirror live)")
+        }
 
         // Primary output: the glasses.
         drawQuad()

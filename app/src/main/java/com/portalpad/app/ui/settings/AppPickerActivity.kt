@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Widgets
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -33,6 +34,8 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
@@ -62,13 +65,20 @@ class AppPickerActivity : com.portalpad.app.PinnedDensityActivity() {
                 AppPickerScreen(
                     target = target,
                     onPickedSingle = { entry ->
-                        lifecycleScope.launch { applySingle(target, entry); finish() }
+                        lifecycleScope.launch {
+                            applySingle(target, entry)
+                            // Home/Back: apply but stay on the picker (leave via Back).
+                            if (target != "home" && target != "back") finish()
+                        }
                     },
                     onPickedMulti = { entries ->
                         lifecycleScope.launch { applyMulti(entries); finish() }
                     },
                     onReset = {
-                        lifecycleScope.launch { applyReset(target); finish() }
+                        lifecycleScope.launch {
+                            applyReset(target)
+                            if (target != "home" && target != "back") finish()
+                        }
                     },
                     onCreateFolder = { name ->
                         lifecycleScope.launch { applyCreateFolder(name) }
@@ -183,7 +193,7 @@ class AppPickerActivity : com.portalpad.app.PinnedDensityActivity() {
     private suspend fun applyReset(target: String) {
         val app = PortalPadApp.instance
         when {
-            target == "home" -> app.prefs.setHomeAction(null)             // → "Not set (System Home)"
+            target == "home" -> app.prefs.setHomeAction(null)             // → "Wallpaper (Default)"
             target == "back" -> app.prefs.setBackAction(BackAction.System) // → "Back action"
             target.startsWith("wheel:") ->
                 target.removePrefix("wheel:").toIntOrNull()?.let { app.prefs.setWheelSlot(it, null) }
@@ -295,6 +305,11 @@ private fun AppPickerScreen(
     val app = PortalPadApp.instance
     val homeActionState by app.prefs.homeAction.collectAsState(initial = null)
     val backActionState by app.prefs.backAction.collectAsState(initial = BackAction.System)
+    val wheelSlotsState by app.prefs.wheelSlots.collectAsState(initial = emptyList())
+    val gestureUpState by app.prefs.gestureAppUp.collectAsState(initial = null)
+    val gestureDownState by app.prefs.gestureAppDown.collectAsState(initial = null)
+    val gestureLeftState by app.prefs.gestureAppLeft.collectAsState(initial = null)
+    val gestureRightState by app.prefs.gestureAppRight.collectAsState(initial = null)
     val isAlreadyDefault = when (target) {
         "home" -> homeActionState == null
         "back" -> backActionState == BackAction.System
@@ -369,39 +384,73 @@ private fun AppPickerScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {},
-                navigationIcon = {
+            val cancel: @Composable () -> Unit = {
+                Text(
+                    "Cancel", color = AbPrimaryBright,
+                    modifier = Modifier.clickable { onCancel() }.padding(12.dp),
+                )
+            }
+            val barColors = TopAppBarDefaults.topAppBarColors(containerColor = AbBackground)
+            if (!isMultiSelect) {
+                // No right-side actions → compact header: Cancel on the left, title
+                // centered and level with it. A custom Box (not a Material app bar)
+                // keeps the header short so the title sits close to the content
+                // instead of leaving the tall app bar's empty gap below it.
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(AbBackground)
+                        .statusBarsPadding()
+                        .padding(horizontal = 4.dp, vertical = 4.dp),
+                ) {
                     Text(
                         "Cancel", color = AbPrimaryBright,
-                        modifier = Modifier.clickable { onCancel() }.padding(12.dp),
+                        modifier = Modifier
+                            .align(Alignment.CenterStart)
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { onCancel() }
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
                     )
-                },
-                actions = {
-                    if (target == "dock") {
-                        Text(
-                            "New folder",
-                            color = AbPrimaryBright,
-                            modifier = Modifier
-                                .clickable { showNewFolderDialog = true }
-                                .padding(12.dp),
-                        )
-                    }
-                    if (isMultiSelect) {
-                        Text(
-                            "Done",
-                            color = if (hasChanges) AbAccent else AbOnSurfaceDim,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier
-                                .clickable(enabled = hasChanges) {
-                                    onPickedMulti(selected.toList())
-                                }
-                                .padding(12.dp),
-                        )
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = AbBackground),
-            )
+                    Text(
+                        title,
+                        color = AbOnSurface,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.align(Alignment.Center),
+                    )
+                }
+            } else {
+                // Multi-select (dock / folder): keep the title on its own line below
+                // so it isn't cramped between Cancel and the New folder / Done actions.
+                TopAppBar(
+                    title = {},
+                    navigationIcon = cancel,
+                    actions = {
+                        if (target == "dock") {
+                            Text(
+                                "New folder",
+                                color = AbPrimaryBright,
+                                modifier = Modifier
+                                    .clickable { showNewFolderDialog = true }
+                                    .padding(12.dp),
+                            )
+                        }
+                        if (isMultiSelect) {
+                            Text(
+                                "Done",
+                                color = if (hasChanges) AbAccent else AbOnSurfaceDim,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier
+                                    .clickable(enabled = hasChanges) {
+                                        onPickedMulti(selected.toList())
+                                    }
+                                    .padding(12.dp),
+                            )
+                        }
+                    },
+                    colors = barColors,
+                )
+            }
         },
         bottomBar = {
             // Pinned bottom back button, matching the controls subpage style
@@ -429,95 +478,134 @@ private fun AppPickerScreen(
         containerColor = AbBackground,
     ) { padding ->
         Column(Modifier.padding(padding).imePadding().padding(horizontal = 12.dp)) {
-            // Title on its own centered line, below the Cancel / New folder / Done
-            // row (it used to sit cramped inline between them in the top bar).
-            Text(
-                title,
-                color = AbOnSurface,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 4.dp),
-            )
+            // Single-select pickers show the title IN the bar (aligned with Cancel);
+            // multi-select keeps it on its own centered line here to avoid cramping.
+            if (isMultiSelect) {
+                Text(
+                    title,
+                    color = AbOnSurface,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 4.dp),
+                )
+            }
             // Quick reset to the default action, separate from the app list.
             if (canReset) {
                 val resetLabel = when {
-                    target == "home" -> "Use System Home (default)"
                     target.startsWith("wheel:") -> "Clear this slot"
-                    else -> "Use Back action (default)"
+                    else -> "Reset to defaults"
                 }
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .padding(top = 8.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .then(
-                            // Active (assignable) → elevated background + clickable.
-                            // Already default → blends into the screen, not clickable.
-                            if (isAlreadyDefault) Modifier
-                            else Modifier
-                                .background(AbSurfaceElevated)
-                                .clickable { onReset() },
+                val resetRow: @Composable () -> Unit = {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .then(
+                                // Plain text in both states; clickable only when there's
+                                // a non-default to reset (matches the Back screen look).
+                                if (isAlreadyDefault) Modifier
+                                else Modifier.clickable { onReset() },
+                            )
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center,
+                    ) {
+                        Icon(
+                            Icons.Default.Refresh,
+                            contentDescription = null,
+                            tint = if (isAlreadyDefault) AbOnSurfaceDim else AbPrimaryBright,
+                            modifier = Modifier.size(20.dp),
                         )
-                        .padding(horizontal = 14.dp, vertical = 14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(
-                        Icons.Default.Refresh,
-                        contentDescription = null,
-                        tint = if (isAlreadyDefault) AbOnSurfaceDim else AbPrimaryBright,
-                        modifier = Modifier.size(20.dp),
-                    )
-                    Spacer(Modifier.size(10.dp))
-                    Text(
-                        if (isAlreadyDefault) "$resetLabel — current" else resetLabel,
-                        color = if (isAlreadyDefault) AbOnSurfaceDim else AbOnSurface,
-                        fontWeight = FontWeight.Medium,
-                    )
+                        Spacer(Modifier.size(10.dp))
+                        Text(
+                            resetLabel,
+                            color = if (isAlreadyDefault) AbOnSurfaceDim else AbOnSurface,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
+                }
+                // Wheel/gesture slots show Reset on top; Home/Back render it just
+                // below their current-action block instead (see that section).
+                if (target != "home" && target != "back") resetRow()
+                // Widget Overlay assignable to a wheel slot or a 3-finger swipe
+                // gesture too (Home/Back get their own richer row below). Tapping
+                // assigns the sentinel; firing that control then toggles the layer
+                // (dispatch: GestureAction.LAUNCH_APP → launchEntry → sentinel).
+                if (target.startsWith("wheel:") || target.startsWith("gesture_")) {
+                    val slotIdx = target.removePrefix("wheel:").toIntOrNull()
+                    val slotIsWidget = when {
+                        target.startsWith("wheel:") -> slotIdx?.let {
+                            wheelSlotsState.getOrNull(it)?.isWidgetOverlay == true
+                        } ?: false
+                        target == "gesture_up" -> gestureUpState?.isWidgetOverlay == true
+                        target == "gesture_down" -> gestureDownState?.isWidgetOverlay == true
+                        target == "gesture_left" -> gestureLeftState?.isWidgetOverlay == true
+                        target == "gesture_right" -> gestureRightState?.isWidgetOverlay == true
+                        else -> false
+                    }
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .then(
+                                if (slotIsWidget) Modifier
+                                else Modifier
+                                    .background(AbSurfaceElevated)
+                                    .clickable { onPickedSingle(AppEntry.widgetOverlayEntry()) },
+                            )
+                            .padding(horizontal = 14.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            Icons.Default.Widgets,
+                            contentDescription = null,
+                            tint = if (slotIsWidget) AbOnSurfaceDim else AbPrimaryBright,
+                            modifier = Modifier.size(20.dp),
+                        )
+                        Spacer(Modifier.size(10.dp))
+                        Text(
+                            if (slotIsWidget) "Widget Overlay — current" else "Widget Overlay",
+                            color = if (slotIsWidget) AbOnSurfaceDim else AbOnSurface,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
                 }
                 // Current assignment (Home/Back only — wheel slots just clear).
                 if (target == "home" || target == "back") {
-                Spacer(Modifier.size(14.dp))
                 val currentActionValue = when (target) {
-                    "home" -> homeActionState?.label ?: "Not set (System Home)"
+                    "home" -> homeActionState?.label ?: "Wallpaper (default)"
                     "back" -> when (val b = backActionState) {
                         is BackAction.Launch -> b.entry.label
-                        else -> "Back action"
+                        else -> "Back action (default)"
                     }
                     else -> ""
                 }
-                val currentHeading = if (target == "home") "Current Home Action:" else "Current Back Action:"
-                // Is something actually assigned? (Drives whether the value is
-                // emphasized in accent, or muted because it's "Not set".)
-                val hasAssignment = when (target) {
-                    "home" -> homeActionState != null
-                    "back" -> backActionState is BackAction.Launch
-                    else -> false
+                // Current-action strip: one edge-to-edge line with a hairline above
+                // and below — read-only status, so no fill/border (won't read as a
+                // tappable control). Faint-purple prefix + muted grey value at
+                // regular weight; a long value ellipsizes.
+                val actionLine = buildAnnotatedString {
+                    withStyle(SpanStyle(color = Color(0xFFB9A7E6))) { append("Current action: ") }
+                    withStyle(SpanStyle(color = AbOnSurfaceMuted)) { append(currentActionValue) }
                 }
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .padding(start = 14.dp, end = 14.dp, bottom = 2.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
+                Column(Modifier.fillMaxWidth()) {
+                    HorizontalDivider(color = AbOnSurfaceDim.copy(alpha = 0.3f), thickness = 0.5.dp)
                     Text(
-                        text = currentHeading,
-                        color = Color(0xFFB9A7E6),  // faint purple heading (muted)
+                        actionLine,
                         style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Bold,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                    )
-                    Text(
-                        text = currentActionValue,
-                        color = if (hasAssignment) AbPrimaryBright else AbOnSurfaceMuted,
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = if (hasAssignment) FontWeight.SemiBold else FontWeight.Normal,
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                         maxLines = 1,
                         overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 10.dp, horizontal = 12.dp),
                     )
+                    HorizontalDivider(color = AbOnSurfaceDim.copy(alpha = 0.3f), thickness = 0.5.dp)
                 }
+                Spacer(Modifier.height(12.dp))
                 // Per-assignment launch mode — ALWAYS visible for the Home/Back
                 // pickers so the option and the fullscreen default are
                 // discoverable before anything is assigned. Live and editable
@@ -535,12 +623,13 @@ private fun AppPickerScreen(
                         else -> null
                     }
                     val isShortcutEntry = currentEntry?.isShortcut == true
-                    val editable = currentEntry != null && !isShortcutEntry
+                    val isWidgetEntry = currentEntry?.isWidgetOverlay == true
+                    val editable = currentEntry != null && !isShortcutEntry && !isWidgetEntry
                     val ffScope = rememberCoroutineScope()
                     Row(
                         Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 6.dp),
+                            .padding(horizontal = 16.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Column(Modifier.weight(1f).padding(end = 12.dp)) {
@@ -553,12 +642,14 @@ private fun AppPickerScreen(
                                 when {
                                     isShortcutEntry ->
                                         "Not applicable to shortcuts — they run on the phone."
+                                    isWidgetEntry ->
+                                        "Not applicable to the widget overlay."
                                     currentEntry == null ->
-                                        "Assign an app or activity to use this. New assignments launch full screen."
+                                        "Assign an app or activity to use this.\nNew assignments launch full screen."
                                     else ->
                                         "Best for TV-style launchers. Turn off to launch as a freeform window. Applies on the app's next launch."
                                 },
-                                color = if (editable) AbOnSurfaceMuted else AbOnSurfaceDim,
+                                color = if (editable) AbOnSurfaceMuted else AbOnSurfaceDim.copy(alpha = 0.6f),
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }
@@ -584,6 +675,51 @@ private fun AppPickerScreen(
                         )
                     }
                 }
+                // ── Special action dropdown (Home: Wallpaper / Widget Overlay;
+                // Back: Back action / Widget Overlay). The app / app-activity list
+                // below still assigns a specific app. Placed after the full-screen
+                // toggle so it reads with the other assignment controls. ──
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    if (target == "home") "Preset Home action" else "Preset Back action",
+                    color = AbOnSurfaceMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 4.dp),
+                )
+                val specialLabel = if (target == "home") {
+                    val ha = homeActionState
+                    when {
+                        ha == null -> "Wallpaper (default)"
+                        ha.isWidgetOverlay -> "Widget Overlay"
+                        else -> "Not selected"   // a specific app / activity / shortcut is assigned
+                    }
+                } else {
+                    when (val b = backActionState) {
+                        is BackAction.Launch ->
+                            if (b.entry.isWidgetOverlay) "Widget Overlay" else "Not selected"
+                        else -> "Back action (default)"
+                    }
+                }
+                val specialOptions = if (target == "home") {
+                    listOf("Wallpaper (default)", "Widget Overlay")
+                } else {
+                    listOf("Back action (default)", "Widget Overlay")
+                }
+                Box(Modifier.padding(horizontal = 16.dp)) {
+                    PickerDropdown(
+                        current = specialLabel,
+                        options = specialOptions,
+                        onSelect = { choice ->
+                            if (choice == "Widget Overlay") {
+                                onPickedSingle(AppEntry.widgetOverlayEntry())
+                            } else {
+                                onReset()
+                            }
+                        },
+                    )
+                }
+                Spacer(Modifier.height(12.dp))
+                resetRow()
                 }
             }
             // Auto Launch: two labeled dropdowns. The app picker below appears
@@ -722,11 +858,12 @@ private fun AppPickerScreen(
             // the Launch-triggers group (which reclaims the space). When the
             // search field is focused, always show the list (top section hides).
             if (target != "autolaunch" || searchFocused || (autoLaunchPickingApp && !triggersExpanded)) {
+            Spacer(Modifier.height(12.dp))
+            HorizontalDivider(color = AbOnSurfaceDim.copy(alpha = 0.3f), thickness = 0.5.dp)
             TabRow(
                 selectedTabIndex = selectedTab,
                 containerColor = AbBackground,
                 contentColor = AbPrimaryBright,
-                modifier = Modifier.padding(top = 8.dp),
             ) {
                 Tab(
                     selected = selectedTab == 0,
@@ -937,29 +1074,12 @@ private fun ShortcutsSpikeTab(
             val pkg = shortcutIntent.`package`
                 ?: shortcutIntent.component?.packageName
                 ?: "shortcut"
-            // Some shortcut-CREATOR apps (Tasker, AutoInput, etc.) run/preview the
-            // target as a side effect of ACTION_CREATE_SHORTCUT — happening in
-            // THEIR process before this callback fires, so we can't prevent it.
-            // Best-effort recovery: show a brief PortalPad cover and bring the
-            // trackpad back to the front so the user lands back on their last-used
-            // interface (Trackpad/AirMouse/Remote, restored from prefs) instead of
-            // being left in whatever the creator launched. The cover smooths the
-            // RETURN transition; it can't hide the creator's initial flash (that
-            // already happened in the creator's process).
-            runCatching {
-                com.portalpad.app.presentation.DisableTransitionOverlay.show(
-                    ctx.applicationContext, durationMs = 1100L, status = "Returning to PortalPad…",
-                )
-            }
-            runCatching {
-                ctx.startActivity(
-                    android.content.Intent(ctx, com.portalpad.app.TrackpadActivity::class.java)
-                        .addFlags(
-                            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
-                                android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT,
-                        )
-                )
-            }
+            // Some shortcut-CREATOR apps (Tasker, AutoInput, etc.) may run/preview
+            // the target as a side effect of ACTION_CREATE_SHORTCUT in THEIR own
+            // process. We no longer force the trackpad back to front here — the
+            // shortcut is applied and this picker (the result recipient) resumes,
+            // so the user lands back on the picker, consistent with app/activity
+            // selection. They leave via Back.
             // Build a phone-shortcut AppEntry and return it as the chosen action.
             onPickedSingle(
                 AppEntry(

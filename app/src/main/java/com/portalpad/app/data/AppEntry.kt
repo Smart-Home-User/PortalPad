@@ -37,5 +37,25 @@ data class AppEntry(
     /** True when this is a phone shortcut (Tasker task / app shortcut) that should
      *  fire on the phone screen rather than launch on the external display. */
     val isShortcut: Boolean get() = shortcutUri != null
+    /** True when this is the internal "Widget Overlay" sentinel: assigning it to
+     *  Home/Back makes that button TOGGLE the widget overlay on the external
+     *  display instead of launching an app. Stored as a magic package name so
+     *  the existing AppEntry serialization (and its backup) carries it with zero
+     *  migration. */
+    val isWidgetOverlay: Boolean get() = packageName == WIDGET_OVERLAY_PKG
+
+    companion object {
+        /** Magic package name for the internal widget-overlay assignment. Not a
+         *  real package — dispatch sites must check [isWidgetOverlay] BEFORE any
+         *  launch attempt. */
+        const val WIDGET_OVERLAY_PKG = "portalpad.internal.widget_overlay"
+
+        /** The assignable "Widget Overlay" entry shown in the Home/Back picker. */
+        fun widgetOverlayEntry() = AppEntry(
+            packageName = WIDGET_OVERLAY_PKG,
+            componentName = null,
+            label = "Widget Overlay",
+        )
+    }
 }
 

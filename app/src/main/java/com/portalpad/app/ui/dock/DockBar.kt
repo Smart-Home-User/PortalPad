@@ -305,8 +305,21 @@ fun DockBar(
         visible = true
     }
 
-    // Auto-hide loop: every second, check if we've been idle past the threshold
-    LaunchedEffect(config.autoHideAfterSec, dockCustomizing, topBarPreviewing, pinnedToWallpaper) {
+    // Auto-hide loop: every second, check if we've been idle past the threshold.
+    // widgetOverlayOpen is a KEY so the effect re-evaluates on layer open/close —
+    // the earlier gate lived only inside the while-loop, so docks that early-exit
+    // (no auto-hide / pinned-to-wallpaper) never saw it and stayed visible and
+    // hoverable behind the widget layer's scrim.
+    val widgetOverlayUp by com.portalpad.app.PortalPadApp.instance
+        .widgetOverlayOpen.collectAsState()
+    LaunchedEffect(config.autoHideAfterSec, dockCustomizing, topBarPreviewing, pinnedToWallpaper, widgetOverlayUp) {
+        // Widget overlay is MODAL: the dock is unreachable beneath its scrim, so
+        // suppress it entirely — before every other early-exit, including the
+        // "no auto-hide / pinned" paths that return without entering the loop.
+        if (widgetOverlayUp) {
+            visible = false
+            return@LaunchedEffect
+        }
         android.util.Log.d(
             "DockPin",
             "effect: always=$alwaysShowOnWallpaper wallpaper=$wallpaperShowing " +
@@ -328,7 +341,8 @@ fun DockBar(
             val idleSec = (System.currentTimeMillis() - lastInteraction) / 1000
             // Never auto-hide while reordering or removing (the wiggle/Done UI must
             // stay up) or while the quick-settings flyout is open (it's anchored to
-            // the dock — hiding the dock out from under it looks broken).
+            // the dock — hiding the dock out from under it looks broken). (Widget-
+            // overlay suppression is the keyed gate at the top of this effect.)
             val newVisible = pinnedToWallpaper || reorderMode || removeMode ||
                 com.portalpad.app.PortalPadApp.instance.quickSettingsOpen.value ||
                 cursorOnBandState.value ||

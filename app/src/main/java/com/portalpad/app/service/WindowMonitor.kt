@@ -38,10 +38,16 @@ class WindowMonitor(
         val tasks: List<RunningTask>,
         val minimizedIds: Set<Int>,
         val maximizedId: Int?,
+        // True when ANY user window is currently maximized/display-filling — tracked
+        // taskId set OR a package flagged maximized (covers windows maximized via the
+        // top bar AND via Android's caption "expand" → convert path, which only flags
+        // the package). Drives the Unmaximize enable-gate so it lights whenever a
+        // restore would actually do something, not only for top-bar-maximized windows.
+        val hasMaximized: Boolean,
         val desktop: Boolean,
     ) {
         companion object {
-            val EMPTY = Snapshot(emptyList(), emptySet(), null, false)
+            val EMPTY = Snapshot(emptyList(), emptySet(), null, false, false)
         }
     }
 
@@ -61,7 +67,9 @@ class WindowMonitor(
             val maximized = if (desktop) {
                 runCatching { freeform.currentlyMaximizedTaskId() }.getOrNull()
             } else null
-            emit(Snapshot(tasks, minimized, maximized, desktop))
+            val hasMax = maximized != null ||
+                tasks.any { freeform.isMaximizedPackage(it.packageName) }
+            emit(Snapshot(tasks, minimized, maximized, hasMax, desktop))
             delay(2000L)
         }
     }.flowOn(Dispatchers.Default)

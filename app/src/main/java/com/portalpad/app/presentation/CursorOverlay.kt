@@ -383,7 +383,7 @@ class CursorOverlay(
             super.onDraw(canvas)
             if (!visible) return
             if (cursorType != CursorType.ARROW) {
-                drawResize(canvas, cursorType)
+                if (cursorType == CursorType.MOVE) drawMove(canvas) else drawResize(canvas, cursorType)
                 return
             }
             // Draw the arrow with its tip at the view's top-left (0, 0).
@@ -395,6 +395,30 @@ class CursorOverlay(
             canvas.drawPath(shadowPath, shadowPaint)
             canvas.drawPath(arrowPath, fillPaint)
             canvas.drawPath(arrowPath, outlinePaint)
+        }
+
+        /** Four-way move arrow — the "drag to move" cursor shown over a window's
+         *  collapsed top-bar grab handle. Horizontal + vertical double-headed arrows,
+         *  centered on the cursor point. */
+        private fun drawMove(canvas: Canvas) {
+            val len = 12f
+            val head = 5f
+            resizePath.reset()
+            resizePath.moveTo(-len, 0f); resizePath.lineTo(len, 0f)
+            resizePath.moveTo(len, 0f); resizePath.lineTo(len - head, -head)
+            resizePath.moveTo(len, 0f); resizePath.lineTo(len - head, head)
+            resizePath.moveTo(-len, 0f); resizePath.lineTo(-len + head, -head)
+            resizePath.moveTo(-len, 0f); resizePath.lineTo(-len + head, head)
+            resizePath.moveTo(0f, -len); resizePath.lineTo(0f, len)
+            resizePath.moveTo(0f, len); resizePath.lineTo(-head, len - head)
+            resizePath.moveTo(0f, len); resizePath.lineTo(head, len - head)
+            resizePath.moveTo(0f, -len); resizePath.lineTo(-head, -len + head)
+            resizePath.moveTo(0f, -len); resizePath.lineTo(head, -len + head)
+            canvas.save()
+            canvas.translate(width / 2f, height / 2f)
+            canvas.drawPath(resizePath, resizeOutlinePaint)
+            canvas.drawPath(resizePath, resizeStrokePaint)
+            canvas.restore()
         }
 
         /** Double-headed resize arrow, centered near the cursor point and rotated

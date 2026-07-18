@@ -59,6 +59,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.foundation.text.ClickableText
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -549,11 +557,11 @@ private fun UpdateScreen(onBack: () -> Unit) {
             selected.tag == latest?.tag && result?.newerReleases?.isNotEmpty() == true -> result.newerReleases
             else -> listOf(selected)
         }
-        // Flatten releases into rows: tag header, note lines, blank separator.
-        val noteRows: List<Pair<String, Boolean>> = notes.flatMap { r ->
-            listOf(r.tag to true) +
-                renderNotes(r.body).lines().map { it to false } +
-                listOf("" to false)
+        // Flatten releases into rows: tag header, parsed markdown blocks, a gap.
+        val noteRows: List<NoteItem> = notes.flatMap { r ->
+            listOf(NoteItem.Tag(r.tag)) +
+                parseMarkdown(r.body).map { NoteItem.Block(it) } +
+                listOf(NoteItem.Gap)
         }
         Column(
             Modifier
@@ -599,17 +607,16 @@ private fun UpdateScreen(onBack: () -> Unit) {
                             .padding(end = 10.dp),
                     ) {
                         items(noteRows.size) { i ->
-                            val (line, isHeader) = noteRows[i]
-                            if (isHeader) {
-                                Text(
-                                    line,
+                            when (val row = noteRows[i]) {
+                                is NoteItem.Tag -> Text(
+                                    row.tag,
                                     color = AbPrimaryBright,
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.SemiBold,
                                     modifier = Modifier.padding(bottom = 2.dp),
                                 )
-                            } else {
-                                Text(line, color = AbOnSurfaceMuted, fontSize = 12.sp, lineHeight = 18.sp)
+                                is NoteItem.Block -> MdBlockView(row.block) { url -> openUrlExternal(ctx, url) }
+                                NoteItem.Gap -> Spacer(Modifier.height(8.dp))
                             }
                         }
                     }
@@ -1035,15 +1042,235 @@ private fun openUrlExternal(ctx: android.content.Context, url: String) {
     }
 }
 
-/** Markdown-lite: headers/bullets/emphasis stripped to plain styled lines. */
-private fun renderNotes(md: String): String =
-    md.lines().joinToString("\n") { raw ->
-        var l = raw.trimEnd()
-        l = l.replace(Regex("^#{1,6}\\s*"), "")
-        l = l.replace(Regex("^\\s*[-*+]\\s+"), "\u2022 ")
-        l = l.replace("**", "").replace("`", "")
-        l
-    }.trim()
+// ─────────────────────── GitHub-flavored release notes ──────────────────────
+// Hand-rolled (no dependency): parse the release body into blocks and render each
+// as a styled row. Covers headers, ordered/unordered/nested lists, task lists,
+// blockquotes, fenced code, horizontal rules, and inline bold / italic /
+// strikethrough / code / links. Themed to the notes card — not a pixel copy of
+// github.com. Tables / images / raw HTML degrade to readable plain text.
+
+private sealed interface MdBlock {
+    data class Header(val level: Int, val text: AnnotatedString) : MdBlock
+    data class Paragraph(val text: AnnotatedString) : MdBlock
+    data class ListItem(val indent: Int, val marker: String, val text: AnnotatedString) : MdBlock
+    data class Task(val indent: Int, val checked: Boolean, val text: AnnotatedString) : MdBlock
+    data class Quote(val text: AnnotatedString) : MdBlock
+    data class Code(val text: String) : MdBlock
+    object Rule : MdBlock
+    object Blank : MdBlock
+}
+
+private sealed interface NoteItem {
+    data class Tag(val tag: String) : NoteItem
+    data class Block(val block: MdBlock) : NoteItem
+    object Gap : NoteItem
+}
+
+private val MD_H = Regex("^(#{1,6})\\s+(.*)$")
+private val MD_HR = Regex("^\\s*([-*_])\\1{2,}\\s*$")
+private val MD_TASK = Regex("^(\\s*)[-*+]\\s+\\[([ xX])]\\s+(.*)$")
+private val MD_UL = Regex("^(\\s*)[-*+]\\s+(.*)$")
+private val MD_OL = Regex("^(\\s*)(\\d+)[.)]\\s+(.*)$")
+private val MD_QUOTE = Regex("^\\s*>\\s?(.*)$")
+
+/** Trim a line and drop a trailing GFM hard-break backslash. */
+private fun stripBreak(s: String): String = s.trimEnd().removeSuffix("\\").trimEnd()
+
+/** Pull indented continuation lines into the current list/task item, joined as
+ *  hard line breaks. Stops at a blank line, a new marker / header / rule / quote
+ *  / code fence, or a non-indented line. Returns the next unconsumed index. */
+private fun absorbContinuation(lines: List<String>, start: Int, sb: StringBuilder): Int {
+    var j = start
+    while (j < lines.size) {
+        val c = lines[j]
+        if (c.isBlank()) break
+        if (c.trimStart().startsWith("```")) break
+        if (MD_H.matches(c) || MD_HR.matches(c) || MD_QUOTE.matches(c)) break
+        if (MD_TASK.matches(c) || MD_OL.matches(c) || MD_UL.matches(c)) break
+        if (!(c.startsWith(" ") || c.startsWith("\t"))) break
+        sb.append('\n').append(stripBreak(c.trim()))
+        j++
+    }
+    return j
+}
+
+private fun parseMarkdown(md: String): List<MdBlock> {
+    val out = mutableListOf<MdBlock>()
+    val lines = md.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    var inCode = false
+    val code = StringBuilder()
+    var i = 0
+    while (i < lines.size) {
+        val line = lines[i]
+        val fence = line.trimStart().startsWith("```")
+        if (inCode) {
+            if (fence) { out.add(MdBlock.Code(code.toString().trimEnd('\n'))); code.clear(); inCode = false }
+            else code.append(line).append('\n')
+            i++; continue
+        }
+        if (fence) { inCode = true; i++; continue }
+
+        val task = MD_TASK.find(line)
+        val ol = if (task == null) MD_OL.find(line) else null
+        val ul = if (task == null && ol == null) MD_UL.find(line) else null
+        when {
+            line.isBlank() -> { out.add(MdBlock.Blank); i++ }
+            MD_HR.matches(line) -> { out.add(MdBlock.Rule); i++ }
+            MD_H.matches(line) -> {
+                val m = MD_H.find(line)!!
+                out.add(MdBlock.Header(m.groupValues[1].length, inlineMd(m.groupValues[2])))
+                i++
+            }
+            MD_QUOTE.matches(line) -> { out.add(MdBlock.Quote(inlineMd(MD_QUOTE.find(line)!!.groupValues[1]))); i++ }
+            task != null -> {
+                val sb = StringBuilder(stripBreak(task.groupValues[3]))
+                i = absorbContinuation(lines, i + 1, sb)
+                out.add(MdBlock.Task(task.groupValues[1].length / 2, task.groupValues[2].lowercase() == "x", inlineMd(sb.toString())))
+            }
+            ol != null -> {
+                val sb = StringBuilder(stripBreak(ol.groupValues[3]))
+                i = absorbContinuation(lines, i + 1, sb)
+                out.add(MdBlock.ListItem(ol.groupValues[1].length / 2, "${ol.groupValues[2]}.", inlineMd(sb.toString())))
+            }
+            ul != null -> {
+                val ind = ul.groupValues[1].length / 2
+                val sb = StringBuilder(stripBreak(ul.groupValues[2]))
+                i = absorbContinuation(lines, i + 1, sb)
+                out.add(MdBlock.ListItem(ind, if (ind % 2 == 1) "\u25E6" else "\u2022", inlineMd(sb.toString())))
+            }
+            else -> { out.add(MdBlock.Paragraph(inlineMd(stripBreak(line)))); i++ }
+        }
+    }
+    if (inCode) out.add(MdBlock.Code(code.toString().trimEnd('\n')))
+    return out
+}
+
+/** Inline spans → AnnotatedString: `code`, [links](url), bold-italic, bold,
+ *  strikethrough, italic. URL targets are stored as "URL" annotations. */
+private fun inlineMd(s: String): AnnotatedString = buildAnnotatedString {
+    var i = 0
+    while (i < s.length) {
+        val rest = s.substring(i)
+        val code = Regex("^`([^`]+)`").find(rest)
+        if (code != null) {
+            withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = AbSurfaceElevated, color = AbOnSurface)) {
+                append(code.groupValues[1])
+            }
+            i += code.value.length; continue
+        }
+        val link = Regex("^\\[([^\\]]+)]\\(([^)\\s]+)\\)").find(rest)
+        if (link != null) {
+            pushStringAnnotation("URL", link.groupValues[2])
+            withStyle(SpanStyle(color = AbAccent, textDecoration = TextDecoration.Underline)) { append(link.groupValues[1]) }
+            pop()
+            i += link.value.length; continue
+        }
+        val bi = Regex("^\\*\\*\\*(.+?)\\*\\*\\*").find(rest)
+        if (bi != null) {
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic)) { append(bi.groupValues[1]) }
+            i += bi.value.length; continue
+        }
+        val bold = Regex("^\\*\\*(.+?)\\*\\*").find(rest) ?: Regex("^__(.+?)__").find(rest)
+        if (bold != null) {
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(bold.groupValues[1]) }
+            i += bold.value.length; continue
+        }
+        val strike = Regex("^~~(.+?)~~").find(rest)
+        if (strike != null) {
+            withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) { append(strike.groupValues[1]) }
+            i += strike.value.length; continue
+        }
+        val ital = Regex("^\\*(.+?)\\*").find(rest) ?: Regex("^_(.+?)_").find(rest)
+        if (ital != null) {
+            withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { append(ital.groupValues[1]) }
+            i += ital.value.length; continue
+        }
+        append(s[i]); i++
+    }
+}
+
+@Composable
+private fun MdText(
+    text: AnnotatedString,
+    onUrl: (String) -> Unit,
+    color: Color = AbOnSurfaceMuted,
+    fontSize: androidx.compose.ui.unit.TextUnit = 12.sp,
+    fontWeight: FontWeight? = null,
+    italic: Boolean = false,
+    modifier: Modifier = Modifier,
+) {
+    ClickableText(
+        text = text,
+        modifier = modifier,
+        style = androidx.compose.ui.text.TextStyle(
+            color = color,
+            fontSize = fontSize,
+            fontWeight = fontWeight,
+            fontStyle = if (italic) FontStyle.Italic else null,
+            lineHeight = 18.sp,
+        ),
+        onClick = { offset ->
+            text.getStringAnnotations("URL", offset, offset).firstOrNull()?.let { onUrl(it.item) }
+        },
+    )
+}
+
+@Composable
+private fun MdBlockView(block: MdBlock, onUrl: (String) -> Unit) {
+    when (block) {
+        is MdBlock.Header -> {
+            val size = when (block.level) { 1 -> 16; 2 -> 15; 3 -> 14; else -> 13 }
+            Column(Modifier.padding(top = 6.dp, bottom = 3.dp)) {
+                MdText(
+                    block.text, onUrl,
+                    color = AbOnSurface,
+                    fontSize = size.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                // GitHub draws a rule under h1/h2 section headers.
+                if (block.level <= 2) {
+                    Spacer(Modifier.height(3.dp))
+                    Box(Modifier.fillMaxWidth().height(1.dp).background(AbOnSurfaceDim.copy(alpha = 0.25f)))
+                }
+            }
+        }
+        is MdBlock.Paragraph -> MdText(block.text, onUrl, modifier = Modifier.padding(vertical = 1.dp))
+        is MdBlock.ListItem -> Row(
+            Modifier.padding(start = (block.indent * 14).dp, top = 1.dp, bottom = 1.dp),
+        ) {
+            Text("${block.marker} ", color = AbOnSurfaceMuted, fontSize = 12.sp, lineHeight = 18.sp)
+            MdText(block.text, onUrl, modifier = Modifier.weight(1f))
+        }
+        is MdBlock.Task -> Row(
+            Modifier.padding(start = (block.indent * 14).dp, top = 1.dp, bottom = 1.dp),
+        ) {
+            Text(if (block.checked) "\u2611 " else "\u2610 ", color = AbOnSurfaceMuted, fontSize = 12.sp, lineHeight = 18.sp)
+            MdText(block.text, onUrl, modifier = Modifier.weight(1f))
+        }
+        is MdBlock.Quote -> Row(Modifier.padding(vertical = 1.dp)) {
+            Box(Modifier.width(3.dp).height(18.dp).background(AbAccent.copy(alpha = 0.5f)))
+            Spacer(Modifier.width(8.dp))
+            MdText(block.text, onUrl, color = AbOnSurfaceDim, italic = true, modifier = Modifier.weight(1f))
+        }
+        is MdBlock.Code -> Text(
+            block.text,
+            color = AbOnSurface,
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace,
+            lineHeight = 16.sp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 3.dp)
+                .clip(RoundedCornerShape(6.dp))
+                .background(AbSurfaceElevated)
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+        )
+        MdBlock.Rule -> Box(
+            Modifier.fillMaxWidth().padding(vertical = 6.dp).height(1.dp).background(AbOnSurfaceDim.copy(alpha = 0.3f)),
+        )
+        MdBlock.Blank -> Spacer(Modifier.height(6.dp))
+    }
+}
 
 private fun agoText(thenMs: Long, nowMs: Long): String {
     if (thenMs <= 0) return "unknown"

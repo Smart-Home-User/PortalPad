@@ -22,8 +22,8 @@ android {
         applicationId = "com.portalpad.app"
         minSdk = 30
         targetSdk = 34
-        versionCode = 130
-        versionName = "1.3-beta"
+        versionCode = 140
+        versionName = "1.4-beta"
         // Compile timestamp for the update checker's same-tag heuristic: when
         // the installed versionName equals GitHub's latest tag but the release
         // asset carries no sha256 digest, a release published AFTER this build
@@ -104,6 +104,15 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
     implementation("androidx.activity:activity-compose:1.9.0")
+
+    // QR / barcode scanner (wheel chip): ZXing core is pure-Java decode (no
+    // Google-services dependency, matching the app's self-contained ethos);
+    // CameraX handles preview + analysis + lifecycle.
+    implementation("com.google.zxing:core:3.5.3")
+    implementation("androidx.camera:camera-core:1.3.4")
+    implementation("androidx.camera:camera-camera2:1.3.4")
+    implementation("androidx.camera:camera-lifecycle:1.3.4")
+    implementation("androidx.camera:camera-view:1.3.4")
 
     // Compose
     implementation("androidx.compose.ui:ui")

@@ -8,8 +8,12 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.layout
 import androidx.compose.foundation.layout.*
+import androidx.core.graphics.drawable.toBitmap
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.shape.CircleShape
@@ -18,6 +22,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.Widgets
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.ContentCopy
@@ -133,6 +138,7 @@ fun SettingsScreen(
     var showDockCustomization by remember { mutableStateOf(false) }
     var showTopBarCustomization by remember { mutableStateOf(false) }
     var showFolderWindowCustomization by remember { mutableStateOf(false) }
+    var showWidgetOverlayCustomization by remember { mutableStateOf(false) }
     // Button-actions page (the same ControlsSubpage the trackpad/remote/air-mouse
     // interfaces open) launched from the Start tab's Home/Back buttons. "Back"
     // returns to Start.
@@ -177,15 +183,21 @@ fun SettingsScreen(
             // all Settings views, including every sub-page. Only the trackpad /
             // air-mouse / remote control surfaces omit it. No tab is highlighted
             // while on a sub-page (you're in a sub-area, not "on" a tab).
-            Box(Modifier.fillMaxWidth()) {
+            // Centered when it fits; SCROLLS horizontally when it doesn't
+            // (small screens / large font scales), instead of letting the last
+            // label wrap to a second line and grow the bar (field, second
+            // device: bold selected "Workspace" widened the row and "Controls"
+            // wrapped — but only on that tab, because bolding the shorter
+            // labels didn't overflow).
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                 Row(
                     Modifier
-                        .fillMaxWidth()
+                        .horizontalScroll(tabScroll)
                         .padding(horizontal = 8.dp),
                     horizontalArrangement = Arrangement.Center,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    val onSubPage = showResources || showDiagnostics || showSystem || showDisplay || showWallpaperPicker || showFolderManager || showPermissions || showDockCustomization || showTopBarCustomization || showFolderWindowCustomization || showStartSetup
+                    val onSubPage = showResources || showDiagnostics || showSystem || showDisplay || showWallpaperPicker || showFolderManager || showPermissions || showDockCustomization || showTopBarCustomization || showFolderWindowCustomization || showWidgetOverlayCustomization || showStartSetup
                     tabs.forEachIndexed { i, spec ->
                         if (i > 0) {
                             VerticalDivider(
@@ -218,6 +230,7 @@ fun SettingsScreen(
                                     showDockCustomization = false
                                     showTopBarCustomization = false
                                     showFolderWindowCustomization = false
+                                    showWidgetOverlayCustomization = false
                                     showPermissions = false
                                     showStartSetup = false
                                     selectedTab = i
@@ -230,11 +243,25 @@ fun SettingsScreen(
                                 tint = if (active) AbPrimary else AbOnSurfaceMuted,
                             )
                             Spacer(Modifier.width(8.dp))
-                            Text(
-                                spec.label,
-                                color = if (active) AbPrimary else AbOnSurfaceMuted,
-                                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-                            )
+                            Box(contentAlignment = Alignment.Center) {
+                                // Invisible SemiBold twin reserves the BOLD
+                                // width, so selecting a tab never changes the
+                                // row's total width — no reflow, ever. Labels
+                                // are hard single-line; overflow scrolls (see
+                                // container) instead of wrapping the bar taller.
+                                Text(
+                                    spec.label,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1, softWrap = false,
+                                    modifier = Modifier.alpha(0f),
+                                )
+                                Text(
+                                    spec.label,
+                                    color = if (active) AbPrimary else AbOnSurfaceMuted,
+                                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                                    maxLines = 1, softWrap = false,
+                                )
+                            }
                         }
                     }
                 }
@@ -389,6 +416,8 @@ fun SettingsScreen(
                 TopBarCustomizationPage(onBack = { showTopBarCustomization = false })
             } else if (showFolderWindowCustomization) {
                 FolderWindowCustomizationPage(onBack = { showFolderWindowCustomization = false })
+            } else if (showWidgetOverlayCustomization) {
+                WidgetOverlayCustomizationPage(onBack = { showWidgetOverlayCustomization = false })
             } else if (showStartSetup) {
                 StartSetupPage(
                     onBack = { showStartSetup = false },
@@ -421,6 +450,7 @@ fun SettingsScreen(
                     onOpenDockCustomization = { showDockCustomization = true },
                     onOpenTopBarCustomization = { showTopBarCustomization = true },
                     onOpenFolderWindowCustomization = { showFolderWindowCustomization = true },
+                    onOpenWidgetOverlayCustomization = { showWidgetOverlayCustomization = true },
                     scrollToTopSignal = scrollToTopTick,
                 )
                 2 -> ButtonsTab(onPickHome, onPickBack, scrollToTopSignal = scrollToTopTick)
@@ -519,7 +549,16 @@ private fun WallpaperPickerPage() {
         }
     }
 
-    TabBody {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        // Fixed header (through "Use my own image") stays put for quick upload access;
+        // only the wallpaper grid below scrolls, via weight(1f) so it fills the leftover
+        // space and scrolls within it — adapting to any device size.
+        Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Text(
             "Shown on the external display when no home app is set, or after you close all apps. This is PortalPad's own backdrop — it does not change your phone's wallpaper.",
             color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
@@ -534,7 +573,8 @@ private fun WallpaperPickerPage() {
             color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
         )
         // Per-canvas tip (amber = informational, like the SBS note below).
-        Spacer(Modifier.height(2.dp))
+        // (No manual Spacer — the TabBody 14dp arrangement gap above this Tip now
+        // matches the gap above the "Note:" line above it.)
         Text(
             text = androidx.compose.ui.text.buildAnnotatedString {
                 pushStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold))
@@ -546,7 +586,8 @@ private fun WallpaperPickerPage() {
         )
         // Category switch: Standard (16:9 / 1920x1080) vs Ultrawide (21:9 & 32:9).
         // Filters the grid below; opens on the tab matching the connected canvas.
-        Spacer(Modifier.height(2.dp))
+        // (No manual Spacer here — the TabBody 14dp arrangement gap already matches
+        // the gap below the control, keeping the space above and below symmetric.)
         Row(
             Modifier
                 .fillMaxWidth()
@@ -625,6 +666,15 @@ private fun WallpaperPickerPage() {
                 fontWeight = FontWeight.SemiBold,
             )
         }
+        } // end fixed header — only the grid below scrolls
+        val gridScroll = rememberScrollState()
+        val gridThumb = AbOnSurfaceMuted.copy(alpha = 0.5f)
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .verticalScroll(gridScroll),
+        ) {
         androidx.compose.foundation.layout.FlowRow(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
@@ -728,6 +778,68 @@ private fun WallpaperPickerPage() {
                 }
             }
         }
+        } // end inner scrolling grid
+        // Thin scrollbar on the right edge — only paints when the grid overflows
+        // (short/ultrawide content that fits shows nothing). Matches TabBody's,
+        // plus CHEVRON caps: ▲ above the track and ▼ below it, each lit in the
+        // accent while there's content THAT way (scroll position > 0 / < max)
+        // and dimmed at the end stop — an at-a-glance "more up / more down".
+        Box(
+            Modifier
+                .fillMaxSize()
+                .drawWithContent {
+                    drawContent()
+                    val max = gridScroll.maxValue
+                    if (max > 0) {
+                        val chevZone = 16.dp.toPx()   // cap reserved per end
+                        val trackTop = 8.dp.toPx() + chevZone
+                        val trackBottom = size.height - 8.dp.toPx() - chevZone
+                        val trackH = (trackBottom - trackTop).coerceAtLeast(1f)
+                        val viewport = size.height
+                        val total = viewport + max
+                        val thumbH = (trackH * (viewport / total)).coerceIn(28.dp.toPx(), trackH)
+                        val frac = gridScroll.value.toFloat() / max.toFloat()
+                        val thumbY = trackTop + (trackH - thumbH) * frac
+                        val w = 4.dp.toPx()
+                        val x = size.width - w - 3.dp.toPx()
+                        drawRoundRect(
+                            color = gridThumb,
+                            topLeft = androidx.compose.ui.geometry.Offset(x, thumbY),
+                            size = androidx.compose.ui.geometry.Size(w, thumbH),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(w / 2f, w / 2f),
+                        )
+                        // Chevrons: small triangles centered on the track's x.
+                        val cx = x + w / 2f
+                        val half = 5.dp.toPx()
+                        val rise = 5.dp.toPx()
+                        val lit = AbAccent
+                        val dim = gridThumb.copy(alpha = 0.25f)
+                        val upColor = if (gridScroll.value > 0) lit else dim
+                        val downColor = if (gridScroll.value < max) lit else dim
+                        val upBase = trackTop - 6.dp.toPx()
+                        drawPath(
+                            androidx.compose.ui.graphics.Path().apply {
+                                moveTo(cx - half, upBase)
+                                lineTo(cx + half, upBase)
+                                lineTo(cx, upBase - rise)
+                                close()
+                            },
+                            color = upColor,
+                        )
+                        val downBase = trackBottom + 6.dp.toPx()
+                        drawPath(
+                            androidx.compose.ui.graphics.Path().apply {
+                                moveTo(cx - half, downBase)
+                                lineTo(cx + half, downBase)
+                                lineTo(cx, downBase + rise)
+                                close()
+                            },
+                            color = downColor,
+                        )
+                    }
+                },
+        )
+        } // end grid + scrollbar Box
     }
 }
 
@@ -1859,12 +1971,27 @@ private fun BrandedTopBar(onSettingsPage: Boolean, onOpenSettings: () -> Unit) {
                 // Check for updates — sits right after the version so "your build"
                 // and "is there a newer one?" read together. Opens the in-app
                 // update page (v1.3+); the page itself links out to GitHub.
+                // Spins while a live update check is running (checking state).
+                val updChecking = com.portalpad.app.service.UpdateChecker.checking.value
+                val syncSpin = rememberInfiniteTransition(label = "sync")
+                val syncAngle by syncSpin.animateFloat(
+                    initialValue = 0f,
+                    targetValue = 360f,
+                    animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+                        animation = androidx.compose.animation.core.tween(
+                            durationMillis = 900,
+                            easing = androidx.compose.animation.core.LinearEasing,
+                        ),
+                    ),
+                    label = "syncAngle",
+                )
                 Icon(
                     Icons.Default.Sync,
                     contentDescription = "Check for updates",
                     tint = AbOnSurfaceMuted,
                     modifier = Modifier
                         .size(18.dp)
+                        .rotate(if (updChecking) syncAngle else 0f)
                         .clip(RoundedCornerShape(50))
                         .clickable {
                             ctx.startActivity(
@@ -1875,14 +2002,26 @@ private fun BrandedTopBar(onSettingsPage: Boolean, onOpenSettings: () -> Unit) {
                             )
                         },
                 )
-                // "« New" hint — visible only when the last update check found a
-                // release newer than this build (and it wasn't skipped). State is
-                // owned by UpdateChecker; refreshed on launch and on page checks.
+                // "« New" (purple) — a numerically newer, non-skipped release is out.
                 if (com.portalpad.app.service.UpdateChecker.badgeVisible.value) {
                     Spacer(Modifier.width(4.dp))
                     Text(
                         "\u00ab New",
                         color = AbAccent,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                // "« Released" (amber) — same version tag, but the official build
+                // isn't the one installed (different bytes / published after this
+                // build). Mutually exclusive with "« New"; a genuine ahead/dev build
+                // tints the version amber but shows no word here.
+                if (com.portalpad.app.service.UpdateChecker.releasedWordVisible.value &&
+                    !com.portalpad.app.service.UpdateChecker.badgeVisible.value
+                ) {
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        "\u00ab Released",
+                        color = com.portalpad.app.ui.theme.AbWarning,
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
@@ -3763,9 +3902,9 @@ private fun StartTab(onEnableClick: () -> Unit, onGoToSystemTab: () -> Unit, onG
         val homeEntry: com.portalpad.app.data.AppEntry? = homeAction
         val backEntry: com.portalpad.app.data.AppEntry? =
             (backAction as? com.portalpad.app.data.BackAction.Launch)?.entry
-        val homeLabel = homeAction?.label ?: "Not set (System Home)"
+        val homeLabel = homeAction?.label ?: "Wallpaper (default)"
         val backLabel = when (val b = backAction) {
-            is com.portalpad.app.data.BackAction.System -> "Back action"
+            is com.portalpad.app.data.BackAction.System -> "Back action (default)"
             is com.portalpad.app.data.BackAction.Launch -> b.entry.label
         }
         val buttonActionColumn: @Composable RowScope.(String, String, com.portalpad.app.data.AppEntry?, () -> Unit) -> Unit = { title, value, entry, onClick ->
@@ -3774,9 +3913,9 @@ private fun StartTab(onEnableClick: () -> Unit, onGoToSystemTab: () -> Unit, onG
                     .weight(1f)
                     .clip(RoundedCornerShape(10.dp))
                     .clickable { onClick() }
-                    .padding(vertical = 8.dp, horizontal = 8.dp),
+                    .padding(vertical = 4.dp, horizontal = 8.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 Text(
                     title, color = AbOnSurfaceMuted,
@@ -4533,6 +4672,24 @@ private fun ButtonsTab(onPickHome: () -> Unit, onPickBack: () -> Unit, scrollToT
                 enabled = !keyboardOnGlasses,
                 disabledNote = "Set the keyboard to the phone (above) to use this.",
             )
+            val pauseFlush by prefs.int(PreferencesRepository.Keys.RELAY_PAUSE_FLUSH_MS, default = 600)
+                .collectAsState(initial = 600)
+            Text(
+                "Android keyboard sync pause: ${pauseFlush} ms",
+                color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                "On the \"Type to external display\" page's Android keyboard, typed text is sent to the external field only after you stop typing for this long. Shorter = the external display updates sooner; longer = fewer syncs mid-thought, so a resumed keystroke is less likely to be missed while a sync settles.",
+                color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
+            )
+            Slider(
+                value = pauseFlush.toFloat(),
+                onValueChange = { n ->
+                    scope.launch { prefs.setInt(PreferencesRepository.Keys.RELAY_PAUSE_FLUSH_MS, n.toInt()) }
+                },
+                valueRange = 450f..900f,
+                steps = 2,
+            )
             // Accessibility is the detector for auto-open: it receives real focus/tap
             // events with the field's display id, and for fields that focus silently it
             // probes the focused node directly. When it's off, auto-open is unavailable
@@ -5276,6 +5433,130 @@ private fun CompactDpiField(
     )
 }
 
+// ── Color-tuning value field helpers ────────────────────────────────────────
+// The 14-value tuning vector mixes units, so the manual field formats/parses per
+// family: gamma (idx 5) is a raw exponent; the signed shifts/offsets (temp, tint,
+// black level, RGB offsets) are a % of range with 0 = neutral; everything else is
+// a multiplier shown as % where 1.0 = 100%. The editable text holds the NUMBER
+// only (no sign forced on positives) — the "%" is a separate suffix label.
+private val TUNE_SIGNED = setOf(3, 4, 6, 11, 12, 13)
+
+private fun tuneFieldText(index: Int, value: Float, range: ClosedFloatingPointRange<Float>): String =
+    when {
+        index == 5 -> "%.2f".format(value)
+        index in TUNE_SIGNED -> {
+            val end = if (range.endInclusive != 0f) range.endInclusive else 1f
+            Math.round(value / end * 100f).toString()
+        }
+        else -> Math.round(value * 100f).toString()
+    }
+
+private fun tuneSuffix(index: Int): String = if (index == 5 || index in TUNE_SIGNED) "" else "%"
+
+/** Friendly, value-dependent label for the direction-based biases. Temperature
+ *  and Tint read as a direction word + relative magnitude (0–100) — e.g.
+ *  "Temperature — Warm (40)". NO Kelvin: this control is a relative red/blue bias,
+ *  not a calibrated color temperature, so a K number would be fabricated. Other
+ *  params keep their plain label. */
+private fun tuneDynamicLabel(base: String, index: Int, value: Float, range: ClosedFloatingPointRange<Float>): String {
+    if (index != 3 && index != 4) return base
+    val end = if (range.endInclusive != 0f) range.endInclusive else 1f
+    val mag = Math.abs(Math.round(value / end * 100f))
+    val dir = when {
+        mag == 0 -> "Neutral"
+        index == 3 -> if (value > 0) "Warm ($mag)" else "Cool ($mag)"
+        else -> if (value > 0) "Green ($mag)" else "Magenta ($mag)"
+    }
+    return "$base — $dir"
+}
+
+/** Inverse of [tuneFieldText]: the typed number → the raw vals[index] value, or
+ *  null when the text isn't a parseable number yet (mid-type). */
+private fun tuneParse(index: Int, text: String, range: ClosedFloatingPointRange<Float>): Float? {
+    val f = text.trim().toFloatOrNull() ?: return null
+    return when {
+        index == 5 -> f
+        index in TUNE_SIGNED -> {
+            val end = if (range.endInclusive != 0f) range.endInclusive else 1f
+            f / 100f * end
+        }
+        else -> f / 100f
+    }
+}
+
+/** Compact editable value field for a color-tuning slider. Two-way bound: a slider
+ *  drag updates the number (while the field isn't focused), and typing a value
+ *  moves the slider — but only once the typed number is a complete, in-range value,
+ *  so the slider doesn't flail on partial input. Phone-side, so it opens the system
+ *  keyboard (never the relay). On blur the text canonicalises to the live value. */
+@Composable
+private fun TuneValueField(
+    index: Int,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    enabled: Boolean,
+    dim: Float,
+    onValue: (Float) -> Unit,
+) {
+    var focused by remember { mutableStateOf(false) }
+    var text by remember { mutableStateOf(tuneFieldText(index, value, range)) }
+    // Track the slider value while the field ISN'T being edited — a drag updates
+    // the number without clobbering the user mid-type.
+    LaunchedEffect(value, focused) { if (!focused) text = tuneFieldText(index, value, range) }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        androidx.compose.foundation.text.BasicTextField(
+            value = text,
+            onValueChange = { raw ->
+                // digits, one leading '-', one '.'
+                val filtered = raw.filterIndexed { i, c ->
+                    c.isDigit() || (c == '-' && i == 0) || (c == '.' && !raw.take(i).contains('.'))
+                }.take(7)
+                text = filtered
+                val parsed = tuneParse(index, filtered, range)
+                if (parsed != null && parsed >= range.start && parsed <= range.endInclusive) {
+                    onValue(parsed)
+                }
+            },
+            enabled = enabled,
+            singleLine = true,
+            textStyle = MaterialTheme.typography.bodyMedium.copy(
+                color = if (enabled) Color(0xFFC9A9FF) else AbOnSurfaceMuted,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            ),
+            cursorBrush = androidx.compose.ui.graphics.SolidColor(AbAccent),
+            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                keyboardType = if (index == 5) androidx.compose.ui.text.input.KeyboardType.Decimal
+                    else androidx.compose.ui.text.input.KeyboardType.Number,
+            ),
+            modifier = Modifier
+                .width(52.dp)
+                .onFocusChanged { fs ->
+                    if (focused && !fs.isFocused) {
+                        text = tuneFieldText(index, value.coerceIn(range.start, range.endInclusive), range)
+                    }
+                    focused = fs.isFocused
+                },
+            decorationBox = { inner ->
+                Box(
+                    Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .border(
+                            1.dp,
+                            AbOnSurfaceMuted.copy(alpha = if (enabled) 0.5f else 0.25f),
+                            RoundedCornerShape(8.dp),
+                        )
+                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                    contentAlignment = Alignment.Center,
+                ) { inner() }
+            },
+        )
+        val sfx = tuneSuffix(index)
+        if (sfx.isNotEmpty()) {
+            Spacer(Modifier.width(3.dp))
+            Text(sfx, color = AbOnSurfaceMuted.copy(alpha = dim), style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
 /**
  * Display subpage — opened from the display-info pill on the trackpad / remote /
  * air-mouse interface. Holds external-display tuning: aspect ratio now, with
@@ -5326,26 +5607,30 @@ fun DisplaySubpage(onBack: () -> Unit) {
             )
 
             SectionCard(title = "Display pipeline") {
+                val mirrorOn = app.prefs.panelSystemMirror.collectAsState(initial = false).value
+                val mirrorConnected = externalDisplayId != null || physicalExternalDisplayId != null
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f).padding(end = 12.dp)) {
-                        Text("System mirror (experimental)", color = AbOnSurface)
-                        Text(
-                            "Carries the external display's picture through the system compositor instead of an app-overlay window, so it no longer goes black when a USB or permission dialog appears, and some DRM video plays that otherwise wouldn't (like Netflix or Prime Video, though other streaming apps may still not work).",
-                            color = AbOnSurfaceMuted,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                        Spacer(Modifier.height(3.dp))
-                        Text(
-                            "Trade-off: color tuning, screen size, Side Mode and the performance overlay's frame-rate stats aren't available in this mode.\nTurn OFF for full color and all display controls.",
-                            color = AbOnSurfaceDim,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
+                    Text(
+                        "System mirror (experimental)",
+                        color = AbOnSurface,
+                        modifier = Modifier.weight(1f).padding(end = 12.dp),
+                    )
                     androidx.compose.material3.Switch(
-                        checked = app.prefs.panelSystemMirror.collectAsState(initial = false).value,
+                        checked = mirrorOn,
                         onCheckedChange = { scope.launch { app.prefs.setPanelSystemMirror(it) } },
                     )
                 }
+                MirrorStatusStrip(mirrorOn = mirrorOn, connected = mirrorConnected)
+                Text(
+                    "Carries the external display's picture through the system compositor instead of an app-overlay window, so it no longer goes black when a USB or permission dialog appears, and some DRM video that otherwise wouldn't play — like Netflix or Prime Video — now does.",
+                    color = AbOnSurfaceMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Text(
+                    "Trade-off: color tuning, screen size, Side Mode and the performance overlay's FPS stats aren't available in this mode.\nTurn OFF for full color and all display controls.",
+                    color = AbOnSurfaceDim,
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
             SectionCard(title = "Display DPI") {
                 // In an app-owned session with Shizuku stopped, DPI can't be
@@ -5778,16 +6063,29 @@ fun DisplaySubpage(onBack: () -> Unit) {
                     }
                     Spacer(Modifier.height(8.dp))
 
-                    // One slider bound to vals[index].
+                    // One slider bound to vals[index], with an editable value field
+                    // (see TuneValueField / tuneFieldText for the per-family units).
                     val tuneSlider: @Composable (String, Int, ClosedFloatingPointRange<Float>) -> Unit =
                         { label, index, range ->
-                            Text(
-                                label,
-                                color = AbOnSurface.copy(alpha = dim),
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
+                            val clamped = vals[index].coerceIn(range.start, range.endInclusive)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    tuneDynamicLabel(label, index, clamped, range),
+                                    color = AbOnSurface.copy(alpha = dim),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                TuneValueField(
+                                    index = index,
+                                    value = clamped,
+                                    range = range,
+                                    enabled = gpuOn,
+                                    dim = dim,
+                                    onValue = { vals[index] = it; maybeLive() },
+                                )
+                            }
                             androidx.compose.material3.Slider(
-                                value = vals[index].coerceIn(range.start, range.endInclusive),
+                                value = clamped,
                                 onValueChange = { vals[index] = it; maybeLive() },
                                 valueRange = range,
                                 enabled = gpuOn,
@@ -5835,8 +6133,8 @@ fun DisplaySubpage(onBack: () -> Unit) {
                         tuneSlider("Saturation", 2, 0f..2f)
                     }
                     section("White balance", false) {
-                        tuneSlider("Temperature (warm ↔ cool)", 3, -0.3f..0.3f)
-                        tuneSlider("Tint (green ↔ magenta)", 4, -0.3f..0.3f)
+                        tuneSlider("Temperature", 3, -0.3f..0.3f)
+                        tuneSlider("Tint", 4, -0.3f..0.3f)
                     }
                     section("Tone", false) {
                         tuneSlider("Gamma", 5, 0.5f..2.2f)
@@ -6057,16 +6355,22 @@ private fun PerformanceOverlaySection(
                 }
             }
             Text("Show", color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodySmall)
+            val mirrorOn by app.prefs.panelSystemMirror.collectAsState(initial = false)
+            // Active mode (res·Hz) DOES show under mirror, so it stays enabled.
+            // fps / frame time / dropped can't be measured in mirror — grey them
+            // (disabled color) while keeping each toggle's REAL saved state, so the
+            // user sees what they'll get back when mirror is off (we don't force
+            // them off).
             HudShowRow("Active mode (resolution · Hz)", showMode) { v ->
                 scope.launch { app.prefs.setBool(PreferencesRepository.Keys.HUD_SHOW_MODE, v) }
             }
-            HudShowRow("FPS (delivered)", showFps) { v ->
+            HudShowRow("FPS (delivered)", showFps, enabled = !mirrorOn) { v ->
                 scope.launch { app.prefs.setBool(PreferencesRepository.Keys.HUD_SHOW_FPS, v) }
             }
-            HudShowRow("Frame time (GL draw+swap)", showFrameTime) { v ->
+            HudShowRow("Frame time (GL draw+swap)", showFrameTime, enabled = !mirrorOn) { v ->
                 scope.launch { app.prefs.setBool(PreferencesRepository.Keys.HUD_SHOW_FRAMETIME, v) }
             }
-            HudShowRow("Dropped / behind vsync", showDropped) { v ->
+            HudShowRow("Dropped / behind vsync", showDropped, enabled = !mirrorOn) { v ->
                 scope.launch { app.prefs.setBool(PreferencesRepository.Keys.HUD_SHOW_DROPPED, v) }
             }
         }
@@ -6074,16 +6378,22 @@ private fun PerformanceOverlaySection(
 }
 
 @Composable
-private fun HudShowRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+private fun HudShowRow(
+    label: String,
+    checked: Boolean,
+    enabled: Boolean = true,
+    onChange: (Boolean) -> Unit,
+) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text(
             label,
-            color = AbOnSurface,
+            color = if (enabled) AbOnSurface else AbOnSurfaceDim,
             style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.weight(1f),
         )
         Switch(
             checked = checked,
+            enabled = enabled,
             onCheckedChange = onChange,
             colors = SwitchDefaults.colors(
                 checkedTrackColor = AbPrimary,
@@ -6151,6 +6461,7 @@ private fun WorkspaceTab(
     onOpenDockCustomization: () -> Unit = {},
     onOpenTopBarCustomization: () -> Unit = {},
     onOpenFolderWindowCustomization: () -> Unit = {},
+    onOpenWidgetOverlayCustomization: () -> Unit = {},
     scrollToTopSignal: Int = 0,
 ) {
     val app = PortalPadApp.instance
@@ -6158,6 +6469,7 @@ private fun WorkspaceTab(
     val scope = rememberCoroutineScope()
     val dockCfg by prefs.dockConfig.collectAsState(initial = DockConfig())
     val topBarCfg by prefs.topBarConfig.collectAsState(initial = com.portalpad.app.data.TopBarConfig())
+    val widgetOverlayCfg by prefs.widgetOverlayConfig.collectAsState(initial = com.portalpad.app.data.WidgetOverlayConfig())
     val dockEnabled by prefs.bool(PreferencesRepository.Keys.DOCK_ENABLED, default = true)
         .collectAsState(initial = true)
     val wallpaperCanvasUltrawide = remember {
@@ -6174,6 +6486,51 @@ private fun WorkspaceTab(
         .collectAsState(initial = com.portalpad.app.data.Wallpaper.effectiveDefault(wallpaperCanvasUltrawide))
 
     TabBody(scrollToTopSignal = scrollToTopSignal) {
+        // One-time discovery card for the widget overlay — shown until dismissed
+        // (persisted). Chosen over defaulting the Home button to Widget Overlay,
+        // which would hijack the most important control on a fresh install for an
+        // untested feature. Points the user at the assignment instead.
+        val nudgeSeen by prefs.bool(PreferencesRepository.Keys.WIDGET_OVERLAY_NUDGE_SEEN)
+            .collectAsState(initial = true)
+        if (!nudgeSeen) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(AbAccent.copy(alpha = 0.12f))
+                    .border(1.dp, AbAccent.copy(alpha = 0.45f), RoundedCornerShape(16.dp))
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.Top,
+            ) {
+                Icon(Icons.Default.Widgets, contentDescription = null, tint = AbAccent)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("New: Widget Overlay", color = AbOnSurface,
+                        fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Put Android widgets on your external display. Open Widget Overlay from the app drawer, or assign it to a Home or Back button (Controls tab) to summon it — then add widgets right there.",
+                        color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    // Compact "Got it" — a clickable Text, not a Material TextButton, so it
+                    // doesn't carry the 48dp min-height that made the box feel airy.
+                    Text(
+                        "Got it",
+                        color = AbPrimaryBright,
+                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable {
+                                scope.launch {
+                                    prefs.setBool(PreferencesRepository.Keys.WIDGET_OVERLAY_NUDGE_SEEN, true)
+                                }
+                            }
+                            .padding(vertical = 4.dp),
+                    )
+                }
+            }
+        }
         // Home backdrop — opens a separate picker page (kept off this page so it
         // doesn't crowd the Workspace). Shows the current selection as a subtitle.
         Row(
@@ -6230,6 +6587,13 @@ private fun WorkspaceTab(
                 label = "Handle permission prompts on the phone",
                 desc = "When an app opened on the external display asks for a permission (notifications, camera, etc.), Android shows the prompt there as an unusable black window. With this on, PortalPad closes the app, shows an Allow/Deny popup on the trackpad screen, applies your choices via Shizuku or Root, and reopens the app on the external display. Turn off to leave the system prompt as-is.",
                 key = PreferencesRepository.Keys.PERM_DIALOG_KEEP_ON_EXTERNAL,
+                default = true,
+                requirement = Requirement.ROOT_OR_SHIZUKU,
+            )
+            ToggleRowWithDesc(
+                label = "Closing a window also removes it from Recents",
+                desc = "Closing a window — from Close all, Manage windows, PortalPad's window controls, or the window's own close (X) button — fully ends the task, so it no longer appears in the phone's Recents. When off, closed apps may remain as a Recents card.",
+                key = PreferencesRepository.Keys.CLOSE_REMOVES_FROM_RECENTS,
                 default = true,
                 requirement = Requirement.ROOT_OR_SHIZUKU,
             )
@@ -6295,7 +6659,7 @@ private fun WorkspaceTab(
         }
         SectionCard(title = "External Display Appearance") {
             Text(
-                "Customize the look and behavior of the dock, the top window bar, and folder windows shown on the external display.",
+                "Customize the look and behavior of the dock, the top window bar, folder windows, and the widget overlay shown on the external display.",
                 color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
             )
             Spacer(Modifier.height(8.dp))
@@ -6316,6 +6680,12 @@ private fun WorkspaceTab(
                 value = "Background & labels",
                 onClick = onOpenFolderWindowCustomization,
             )
+            Spacer(Modifier.height(8.dp))
+            ActionRow(
+                label = "Widget Overlay",
+                value = "Widgets & background",
+                onClick = onOpenWidgetOverlayCustomization,
+            )
         }
         SectionCard(title = "App search") {
             ToggleRowWithDesc(
@@ -6330,7 +6700,7 @@ private fun WorkspaceTab(
         if (showResetConfirm) {
             ResetConfirmDialog(
                 title = "Reset Workspace to defaults?",
-                message = "This resets the dock layout & style, top bar, folder windows, app-search, and wallpaper to their defaults. Your dock apps and folders are kept.",
+                message = "This resets the dock layout & style, top bar, folder windows, widget overlay background, app-search, and wallpaper to their defaults. Your dock apps, folders, and widgets are kept.",
                 onConfirm = {
                     showResetConfirm = false
                     scope.launch {
@@ -6339,6 +6709,13 @@ private fun WorkspaceTab(
                         prefs.setDockConfig(DockConfig().copy(items = keptItems))
                         prefs.setTopBarConfig(com.portalpad.app.data.TopBarConfig())
                         prefs.setFolderWindowConfig(com.portalpad.app.data.FolderWindowConfig())
+                        // Widget overlay: reset the backdrop style but KEEP the
+                        // added widgets (mirrors the dock-items rule — clearing
+                        // them would also orphan their system bindings).
+                        prefs.setWidgetOverlayConfig(
+                            com.portalpad.app.data.WidgetOverlayConfig()
+                                .copy(widgets = widgetOverlayCfg.widgets),
+                        )
                         prefs.setBool(PreferencesRepository.Keys.DOCK_ENABLED, true)
                         prefs.setBool(PreferencesRepository.Keys.SEARCH_KEYBOARD_ON_PHONE, true)
                         prefs.resetHomeWallpapers()
@@ -7103,26 +7480,30 @@ private fun DisplayTab() {
 
     TabBody {
         SectionCard(title = "Display pipeline") {
+            val mirrorOn = prefs.panelSystemMirror.collectAsState(initial = false).value
+            val mirrorConnected = externalDisplayId != null || physicalExternalDisplayId != null
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f).padding(end = 12.dp)) {
-                    Text("System mirror (experimental)", color = AbOnSurface)
-                    Text(
-                        "Carries the external display's picture through the system compositor instead of an app-overlay window, so it no longer goes black when a USB or permission dialog appears, and some DRM video plays that otherwise wouldn't (like Netflix or Prime Video, though other streaming apps may still not work).",
-                        color = AbOnSurfaceMuted,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    Spacer(Modifier.height(3.dp))
-                    Text(
-                        "Trade-off: color tuning, screen size, Side Mode and the performance overlay's frame-rate stats aren't available in this mode.\nTurn OFF for full color and all display controls.",
-                        color = AbOnSurfaceDim,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
+                Text(
+                    "System mirror (experimental)",
+                    color = AbOnSurface,
+                    modifier = Modifier.weight(1f).padding(end = 12.dp),
+                )
                 androidx.compose.material3.Switch(
-                    checked = prefs.panelSystemMirror.collectAsState(initial = false).value,
+                    checked = mirrorOn,
                     onCheckedChange = { scope.launch { prefs.setPanelSystemMirror(it) } },
                 )
             }
+            MirrorStatusStrip(mirrorOn = mirrorOn, connected = mirrorConnected)
+            Text(
+                "Carries the external display's picture through the system compositor instead of an app-overlay window, so it no longer goes black when a USB or permission dialog appears, and some DRM video that otherwise wouldn't play — like Netflix or Prime Video — now does.",
+                color = AbOnSurfaceMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Text(
+                "Trade-off: color tuning, screen size, Side Mode and the performance overlay's FPS stats aren't available in this mode.\nTurn OFF for full color and all display controls.",
+                color = AbOnSurfaceDim,
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
         SectionCard(title = "Target display") {
             OutlinedCard(
@@ -8069,9 +8450,358 @@ private fun MatchAllSurfacesButton(
     }
 }
 
+/** Widget Overlay sub-page (Workspace ▸ External Display Appearance): the
+ *  feature's MANAGEMENT surface. Adding/placing widgets happens on the external
+ *  display itself (summon the layer, tap "+ Add"); this page is list/remove plus
+ *  the backdrop style — and the phone-side recovery path when a widget renders
+ *  broken on the external display. */
+@Composable
+private fun WidgetOverlayCustomizationPage(onBack: () -> Unit) {
+    val app = PortalPadApp.instance
+    val prefs = app.prefs
+    val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
+    val cfg by prefs.widgetOverlayConfig.collectAsState(
+        initial = com.portalpad.app.data.WidgetOverlayConfig(),
+    )
+    val externalDisplayId by app.externalDisplayId.collectAsState()
+
+    // Live preview: summon the real layer on the external display while this
+    // page is open (PFS collects the flag), dismiss on leave — same pattern as
+    // the folder-window preview. Known quirk (shared with that preview): a
+    // layer the user had open BEFORE entering the page is dismissed on leave.
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        app.setWidgetOverlayPreviewActive(true)
+        onDispose { app.setWidgetOverlayPreviewActive(false) }
+    }
+
+    // Hoisted so the scrollbar overlay below can read position/overflow — the
+    // page rolled its own scroll (not TabBody) and had NO visible scrollbar,
+    // so a long widget list scrolled invisibly (field report).
+    val woScrollState = rememberScrollState()
+    val woThumbColor = AbOnSurfaceMuted.copy(alpha = 0.5f)
+    Box(Modifier.fillMaxSize().background(AbBackground)) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .verticalScroll(woScrollState)
+                .padding(16.dp)
+                .padding(bottom = 72.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(
+                "Widget Overlay",
+                color = AbOnSurface,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                "A summonable layer of Android app widgets on the external display. " +
+                    "Assign \"Widget Overlay\" to the Home or Back button, then press it " +
+                    "to show or hide the layer. Add widgets on the external display " +
+                    "itself with its \"+ Add\" chip.",
+                color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
+            )
+            Text(
+                if (externalDisplayId == null)
+                    "Connect your external display to preview the widget overlay there."
+                else
+                    "Previewing on your external display — background and widget changes apply live.",
+                color = if (externalDisplayId == null) AbWarning else AbOnSurfaceMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            SectionCard(title = "Background") {
+                Text(
+                    "Backdrop behind the widget grid. Widgets draw their own backgrounds on top of it.",
+                    color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
+                )
+                Spacer(Modifier.height(6.dp))
+                BarStyleControls(
+                    style = cfg.background,
+                    showCornerRadius = false, // meaningless on a full-screen scrim
+                    defaultStyle = com.portalpad.app.data.WidgetOverlayConfig().background,
+                    onChange = { s ->
+                        scope.launch { prefs.setWidgetOverlayConfig(cfg.copy(background = s)) }
+                    },
+                )
+            }
+            SectionCard(
+                title = "Widgets (${cfg.widgets.size}/${com.portalpad.app.data.MAX_OVERLAY_WIDGETS})",
+            ) {
+                if (cfg.widgets.isEmpty()) {
+                    Text(
+                        "No widgets added yet. Summon the overlay on your external display and tap \"+ Add\".",
+                        color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodySmall,
+                    )
+                } else {
+                    // ── Sort control (top-right of the list). "Last added" is
+                    // free: config preserves insertion order. ──
+                    var sortAlpha by remember { mutableStateOf(false) }
+                    var sortMenuOpen by remember { mutableStateOf(false) }
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Sort by", color = AbOnSurfaceMuted,
+                            style = MaterialTheme.typography.bodySmall)
+                        Spacer(Modifier.width(6.dp))
+                        Box {
+                            Row(
+                                Modifier
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(AbSurfaceElevated)
+                                    .clickable { sortMenuOpen = true }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(if (sortAlpha) "Alphabetically" else "Last added",
+                                    color = AbPrimaryBright)
+                                Icon(
+                                    Icons.Default.ArrowDropDown,
+                                    contentDescription = null,
+                                    tint = AbPrimaryBright,
+                                )
+                            }
+                            DropdownMenu(
+                                expanded = sortMenuOpen,
+                                onDismissRequest = { sortMenuOpen = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("Last added") },
+                                    onClick = { sortAlpha = false; sortMenuOpen = false },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Alphabetically") },
+                                    onClick = { sortAlpha = true; sortMenuOpen = false },
+                                )
+                            }
+                        }
+                    }
+                    // ── App-group accordion (same model as the pickers): app
+                    // header left-aligned, Nova-style centered widget cards
+                    // inside, per-resolution status as the card subtitle,
+                    // Remove beneath. ──
+                    val awmHere = remember { android.appwidget.AppWidgetManager.getInstance(ctx) }
+                    val pmHere = remember { ctx.packageManager }
+                    data class WsEntry(
+                        val w: com.portalpad.app.data.OverlayWidget,
+                        val info: android.appwidget.AppWidgetProviderInfo?,
+                        val appLabel: String,
+                        val addIndex: Int,
+                    )
+                    val entriesAll = remember(cfg) {
+                        cfg.widgets.mapIndexed { idx, w ->
+                            val info = runCatching { awmHere.getAppWidgetInfo(w.appWidgetId) }.getOrNull()
+                            val pkg = w.provider.substringBefore("/")
+                            val appLabel = runCatching {
+                                pmHere.getApplicationInfo(pkg, 0).loadLabel(pmHere).toString()
+                            }.getOrDefault(pkg)
+                            WsEntry(w, info, appLabel, idx)
+                        }
+                    }
+                    val groupsWs = remember(entriesAll, sortAlpha) {
+                        val grouped = entriesAll.groupBy { it.appLabel }
+                        if (sortAlpha) {
+                            grouped.toSortedMap(String.CASE_INSENSITIVE_ORDER)
+                                .mapValues { (_, v) -> v.sortedBy { it.w.label.lowercase() } }
+                        } else {
+                            grouped.entries
+                                .sortedByDescending { (_, v) -> v.maxOf { it.addIndex } }
+                                .associate { (k, v) ->
+                                    k to v.sortedByDescending { it.addIndex }
+                                }
+                        }
+                    }
+                    var expandedWsApps by remember { mutableStateOf(setOf<String>()) }
+                    groupsWs.entries.forEachIndexed { gi, (appName, entries) ->
+                        if (gi > 0) {
+                            Box(
+                                Modifier.fillMaxWidth().height(1.dp)
+                                    .background(AbOnSurfaceMuted.copy(alpha = 0.16f)),
+                            )
+                        }
+                        val expandedWs = appName in expandedWsApps
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    expandedWsApps =
+                                        if (expandedWs) expandedWsApps - appName
+                                        else expandedWsApps + appName
+                                }
+                                .padding(vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            val icon = remember(appName) {
+                                runCatching {
+                                    pmHere.getApplicationIcon(
+                                        entries.first().w.provider.substringBefore("/"),
+                                    ).toBitmap().asImageBitmap()
+                                }.getOrNull()
+                            }
+                            if (icon != null) {
+                                Image(icon, contentDescription = null,
+                                    modifier = Modifier.size(30.dp))
+                                Spacer(Modifier.width(12.dp))
+                            }
+                            Text(appName, color = AbOnSurface,
+                                fontWeight = FontWeight.SemiBold, maxLines = 1,
+                                modifier = Modifier.weight(1f))
+                            Text("${entries.size}", color = AbOnSurfaceMuted,
+                                style = MaterialTheme.typography.bodySmall)
+                            Spacer(Modifier.width(4.dp))
+                            val chevRot by androidx.compose.animation.core.animateFloatAsState(
+                                targetValue = if (expandedWs) 0f else -90f,
+                                label = "wsChevron",
+                            )
+                            Icon(
+                                Icons.Default.ExpandMore,
+                                contentDescription = null,
+                                tint = AbOnSurfaceMuted,
+                                modifier = Modifier.size(22.dp).rotate(chevRot),
+                            )
+                        }
+                        if (expandedWs) {
+                            entries.forEach { entry ->
+                                val w = entry.w
+                                // One line per resolution: "Name (WxH): SxS
+                                // cells (state)". "cells" not pixels — cells
+                                // are fixed 70dp on every resolution, and the
+                                // unit matches the picker. Aspect buckets:
+                                // Portrait <1, Standard ≤2.2 (16:9/16:10),
+                                // Ultrawide ≤3.0 (21:9), Super Ultrawide >3.0
+                                // (32:9 — 3840×1080 is 3.56, previously
+                                // mislabeled plain Ultrawide). Raw WxH always
+                                // prints, so odd resolutions are never wrong,
+                                // just less friendly.
+                                val status = if (w.placements.isEmpty()) {
+                                    "not placed on any resolution yet"
+                                } else {
+                                    w.placements.entries.joinToString("\n") { (res, pl) ->
+                                        val parts = res.split("x")
+                                        val rw = parts.getOrNull(0)?.toIntOrNull()
+                                        val rh = parts.getOrNull(1)?.toIntOrNull()
+                                        val name = if (rw != null && rh != null && rh > 0) {
+                                            val ratio = rw.toFloat() / rh
+                                            when {
+                                                ratio < 1f -> "Portrait"
+                                                ratio <= 2.2f -> "Standard"
+                                                ratio <= 3.0f -> "Ultrawide"
+                                                else -> "Super Ultrawide"
+                                            } + " (${rw}×$rh)"
+                                        } else res
+                                        val state = when {
+                                            pl.hidden -> "hidden"
+                                            pl.col == com.portalpad.app.data.Placement.NO_FIT ->
+                                                "doesn't fit"
+                                            else -> "shown"
+                                        }
+                                        "$name: ${pl.spanW}×${pl.spanH} cells ($state)"
+                                    }
+                                }
+                                // Cells parenthetical on the widget NAME (a
+                                // property of the widget, not its app group) —
+                                // same defaultSpan math as the picker; omitted
+                                // for placeholder widgets whose provider is gone.
+                                val cellsSuffix = entry.info?.let { pi ->
+                                    "(${com.portalpad.app.service.WidgetHostManager.defaultSpan(pi.minWidth)}×" +
+                                        "${com.portalpad.app.service.WidgetHostManager.defaultSpan(pi.minHeight)} cells)"
+                                }
+                                com.portalpad.app.ui.common.WidgetPreviewCard(
+                                    info = entry.info,
+                                    name = w.label,
+                                    nameSuffix = cellsSuffix,
+                                    subtitle = status,
+                                    subtitleMaxLines = 6,
+                                    nameColor = AbOnSurface,
+                                    subtitleColor = AbOnSurfaceMuted,
+                                    trailing = {
+                                        androidx.compose.material3.TextButton(onClick = {
+                                            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                                                // Release the system binding, then drop from config.
+                                                com.portalpad.app.service.WidgetHostManager
+                                                    .deleteId(ctx, w.appWidgetId)
+                                                val cur = prefs.widgetOverlayConfig.first()
+                                                prefs.setWidgetOverlayConfig(
+                                                    cur.copy(widgets = cur.widgets.filterNot { it.id == w.id }),
+                                                )
+                                            }
+                                        }) { Text("Remove", color = AbWarning) }
+                                    },
+                                )
+                            }
+                        }
+                    }
+
+                    androidx.compose.material3.TextButton(onClick = {
+                        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                            val cur = prefs.widgetOverlayConfig.first()
+                            cur.widgets.forEach {
+                                com.portalpad.app.service.WidgetHostManager
+                                    .deleteId(ctx, it.appWidgetId)
+                            }
+                            prefs.setWidgetOverlayConfig(cur.copy(widgets = emptyList()))
+                        }
+                    }) { Text("Remove all widgets", color = AbWarning) }
+                }
+            }
+        }
+        // Overflow-only scrollbar, same presentation as TabBody's: paints a
+        // thumb only when the content actually scrolls, so short lists show
+        // nothing and long widget lists stop scrolling invisibly.
+        Box(
+            Modifier
+                .fillMaxSize()
+                .drawWithContent {
+                    drawContent()
+                    val max = woScrollState.maxValue
+                    if (max > 0) {
+                        val trackTop = 8.dp.toPx()
+                        val trackBottom = size.height - 8.dp.toPx()
+                        val trackH = (trackBottom - trackTop).coerceAtLeast(1f)
+                        val viewport = size.height
+                        val total = viewport + max
+                        val thumbH = (trackH * (viewport / total)).coerceIn(28.dp.toPx(), trackH)
+                        val frac = woScrollState.value.toFloat() / max.toFloat()
+                        val thumbY = trackTop + (trackH - thumbH) * frac
+                        val w = 4.dp.toPx()
+                        val x = size.width - w - 3.dp.toPx()
+                        drawRoundRect(
+                            color = woThumbColor,
+                            topLeft = androidx.compose.ui.geometry.Offset(x, thumbY),
+                            size = androidx.compose.ui.geometry.Size(w, thumbH),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(w / 2f, w / 2f),
+                        )
+                    }
+                },
+        )
+        Box(
+            Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(AbSurfaceElevated)
+                .border(1.dp, AbAccent.copy(alpha = 0.45f), RoundedCornerShape(14.dp))
+                .clickable { onBack() }
+                .padding(vertical = 16.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("\u2190 Back", color = AbOnSurface, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+        }
+    }
+}
+
 @Composable
 private fun BarStyleControls(
     style: com.portalpad.app.data.BarStyle,
+    // Corner radius is meaningless for a full-screen scrim (widget overlay);
+    // that page hides the control. Everything else keeps the default = true.
+    showCornerRadius: Boolean = true,
+    // What "Reset to defaults" restores — pages whose surface has a non-BarStyle()
+    // default (the widget overlay's dim scrim) pass their own.
+    defaultStyle: com.portalpad.app.data.BarStyle = com.portalpad.app.data.BarStyle(),
     onChange: (com.portalpad.app.data.BarStyle) -> Unit,
 ) {
     var expanded by androidx.compose.runtime.remember {
@@ -8229,19 +8959,21 @@ private fun BarStyleControls(
             colors = sliderColors(),
         )
 
-        Text(
-            "Corner radius: ${style.cornerRadiusDp}dp",
-            color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium,
-        )
-        Slider(
-            value = style.cornerRadiusDp.toFloat(),
-            onValueChange = { n -> onChange(style.copy(cornerRadiusDp = n.toInt())) },
-            valueRange = 0f..40f,
-            steps = 0,
-            colors = sliderColors(),
-        )
+        if (showCornerRadius) {
+            Text(
+                "Corner radius: ${style.cornerRadiusDp}dp",
+                color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodyMedium,
+            )
+            Slider(
+                value = style.cornerRadiusDp.toFloat(),
+                onValueChange = { n -> onChange(style.copy(cornerRadiusDp = n.toInt())) },
+                valueRange = 0f..40f,
+                steps = 0,
+                colors = sliderColors(),
+            )
+        }
         androidx.compose.material3.TextButton(
-            onClick = { onChange(com.portalpad.app.data.BarStyle()) },
+            onClick = { onChange(defaultStyle) },
         ) {
             Text("Reset to defaults")
         }
@@ -8613,6 +9345,93 @@ private fun <T> LabeledDropdown(
     }
 }
 
+// Status strip shown under the System mirror toggle. Two facets, both derived from the
+// single mirror setting and always inverse (one active, one inactive), so the strip reads
+// as an at-a-glance summary of the mode's trade-off. Shared by both Display-pipeline cards
+// (Start page + remote) so they can't drift; dimmed when no external display is attached.
+@Composable
+private fun MirrorStatusStrip(mirrorOn: Boolean, connected: Boolean) {
+    // A single small gap drives every internal space (top pad = between facets = above
+    // footnote = bottom pad) so they can't drift.
+    val gap = 6.dp
+    // Bleed the tinted band + hairlines out to the card edges, past SectionCard's 16.dp
+    // content padding; the inner content keeps that 16.dp so the text still lines up with
+    // the rest of the card.
+    val bleedToCardEdge = Modifier.layout { measurable, constraints ->
+        val extra = 16.dp.roundToPx() * 2
+        val placeable = measurable.measure(
+            constraints.copy(maxWidth = constraints.maxWidth + extra),
+        )
+        layout(placeable.width - extra, placeable.height) {
+            placeable.place(-extra / 2, 0)
+        }
+    }
+    Column(
+        bleedToCardEdge
+            .background(AbSurfaceVariant)
+            .alpha(if (connected) 1f else 0.55f),
+    ) {
+        HorizontalDivider(color = AbSurfaceElevated, thickness = 1.dp)
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = gap),
+            verticalArrangement = Arrangement.spacedBy(gap),
+        ) {
+            MirrorFacet(
+                "DRM protected video",
+                if (mirrorOn) "Supported" else "Blocked",
+                active = mirrorOn,
+                asterisk = mirrorOn,
+            )
+            MirrorFacet(
+                "Display tuning",
+                if (mirrorOn) "Off" else "Available",
+                active = !mirrorOn,
+                asterisk = false,
+            )
+            if (mirrorOn) {
+                Text(
+                    "* Not all DRM content plays, even when marked Supported.",
+                    color = AbOnSurfaceDim,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+        HorizontalDivider(color = AbSurfaceElevated, thickness = 1.dp)
+    }
+}
+
+// One facet of the mirror status strip: a state dot (filled mint = active, hollow dim
+// ring = inactive), a muted label, and a bold value. Colour is active/inactive, never
+// good/bad — each mode is a trade-off, not a fault.
+@Composable
+private fun MirrorFacet(label: String, value: String, active: Boolean, asterisk: Boolean) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            Modifier
+                .size(8.dp)
+                .clip(CircleShape)
+                .then(
+                    if (active) {
+                        Modifier.background(AbSuccess)
+                    } else {
+                        Modifier.border(1.5.dp, AbOnSurfaceDim, CircleShape)
+                    },
+                ),
+        )
+        Spacer(Modifier.width(7.dp))
+        Text(label, color = AbOnSurfaceMuted, style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.width(6.dp))
+        Text(
+            value + if (asterisk) "*" else "",
+            color = if (active) AbSuccess else AbOnSurfaceDim,
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.Bold,
+        )
+    }
+}
+
 @Composable
 private fun SectionCard(
     title: String,
@@ -8742,6 +9561,7 @@ private fun GestureActionRow(
     onPick: (com.portalpad.app.data.GestureAction) -> Unit,
 ) {
     val ctx = LocalContext.current
+    val rowScope = rememberCoroutineScope()
     var expanded by remember { mutableStateOf(false) }
     val launchesApp = selected == com.portalpad.app.data.GestureAction.LAUNCH_APP && appEntry != null
     Row(
@@ -8810,6 +9630,38 @@ private fun GestureActionRow(
                             } else {
                                 onPick(action)
                             }
+                        },
+                    )
+                }
+                // Widget Overlay: FIRST-CLASS item. It technically existed
+                // behind "Launch app…" → app picker → Widget Overlay row, but
+                // that's undiscoverable (field report: "u didnt add widget
+                // overlay for the three finger swipes"). One tap writes the
+                // sentinel app + LAUNCH_APP; the swipe then toggles the layer.
+                run {
+                    val isCurrent = selected == com.portalpad.app.data.GestureAction.LAUNCH_APP &&
+                        appEntry?.isWidgetOverlay == true
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                "Widget Overlay",
+                                color = if (isCurrent) AbAccent else AbOnSurface,
+                                fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Normal,
+                            )
+                        },
+                        onClick = {
+                            expanded = false
+                            rowScope.launch {
+                                val prefs = PortalPadApp.instance.prefs
+                                val entry = com.portalpad.app.data.AppEntry.widgetOverlayEntry()
+                                when (target) {
+                                    "gesture_up" -> prefs.setGestureAppUp(entry)
+                                    "gesture_down" -> prefs.setGestureAppDown(entry)
+                                    "gesture_left" -> prefs.setGestureAppLeft(entry)
+                                    "gesture_right" -> prefs.setGestureAppRight(entry)
+                                }
+                            }
+                            onPick(com.portalpad.app.data.GestureAction.LAUNCH_APP)
                         },
                     )
                 }

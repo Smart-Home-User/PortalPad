@@ -67,6 +67,9 @@ import com.portalpad.app.ui.theme.PortalPadTheme
 import com.portalpad.app.ui.trackpad.DisplaySelectorPill
 import com.portalpad.app.ui.trackpad.GestureSink
 import com.portalpad.app.ui.trackpad.TrackpadBottomBar
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.navigationBars
 import com.portalpad.app.ui.trackpad.TrackpadClickButtons
 import com.portalpad.app.ui.trackpad.TrackpadSurface
 import com.portalpad.app.ui.trackpad.TrackpadTopBar
@@ -451,7 +454,7 @@ class TrackpadActivity : PinnedDensityActivity() {
             // glass, and an injected touch restores that display's window
             // focus natively — volume keys are phone-bound only for the
             // seconds in between.
-            val sinceRelay = System.currentTimeMillis() - app.relayClosedAt
+            val sinceRelay = android.os.SystemClock.elapsedRealtime() - app.relayClosedAt
             if (sinceRelay in 0..3000) {
                 Log.d(TAG, "refocusExternalDisplay: SKIPPED (relay closed ${sinceRelay}ms ago; dropdown survives)")
                 return
@@ -723,9 +726,18 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
     // Selecting Air Mouse vs Trackpad also writes the InputMode pref so the
     // injector/air-mouse controller behave accordingly — this replaces the
     // old input-mode selector that used to live in Settings.
-    val storedInputMode = app.prefs.inputMode.collectAsState(
-        initial = com.portalpad.app.data.InputMode.TRACKPAD,
-    ).value
+    // Read ONCE, synchronously, like lastWasRemote/autoIface below: viewMode is
+    // initialized a few lines down from this value and never re-keys, so the old
+    // collectAsState(initial = TRACKPAD) silently LOST the restore race — the
+    // first composition ran with the placeholder before DataStore emitted, and
+    // an Air Mouse user returning from the relay (or any activity recreation)
+    // landed on Trackpad. Remote never had the bug because its flag was already
+    // read synchronously.
+    val storedInputMode = remember {
+        runCatching {
+            kotlinx.coroutines.runBlocking { app.prefs.inputMode.first() }
+        }.getOrDefault(com.portalpad.app.data.InputMode.TRACKPAD)
+    }
     // Was Remote the last-used interface? Read once, synchronously, so the very
     // first composition can restore it (Trackpad/AirMouse restore via InputMode;
     // Remote needs this flag). Only honored when the launch didn't explicitly ask
@@ -782,7 +794,24 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
     val isTrackpadMode = viewMode != com.portalpad.app.ui.trackpad.TrackpadViewMode.REMOTE
     var showAppDrawer by remember { mutableStateOf(false) }
     var showQuickWheel by remember { mutableStateOf(false) }
+    var showQrScanner by remember { mutableStateOf(false) }
+    // Camera off the moment the external display disconnects — the feed has no
+    // job without a session, and the disconnect flow shouldn't leave a live
+    // capture behind the banner.
     var showWindowWheel by remember { mutableStateOf(false) }
+    val physIdForQr by app.physicalExternalDisplayId.collectAsState()
+    androidx.compose.runtime.LaunchedEffect(physIdForQr) {
+        if (physIdForQr == null) {
+            showQrScanner = false
+            // Both wheels dismiss too: they float in their own Dialog windows
+            // ABOVE the activity, so the "External Display Disconnected"
+            // banner rendered BEHIND an open wheel (field). Everything a wheel
+            // launches targets the display that just left, so self-dismissal
+            // is also the honest state — and the banner shows unobstructed.
+            showQuickWheel = false
+            showWindowWheel = false
+        }
+    }
     // Quick Wheel ring contents (the bottom-bar drawer icon opens the wheel when
     // any slot is filled, else it falls straight through to the full drawer).
     val wheelSlots = app.prefs.wheelSlots.collectAsState(
@@ -796,7 +825,11 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
     DisposableEffect(homeAction) {
         TrackpadActivity.homeTrigger = {
             com.portalpad.app.service.PortalPadForegroundService.dismissSearchOverlay()
-            if (homeAction != null) launchEntry(homeAction, injector) else injector.home()
+            if (homeAction == null) {
+                com.portalpad.app.service.PortalPadForegroundService.goHomeWallpaper()
+            } else {
+                launchEntry(homeAction, injector)
+            }
         }
         onDispose { TrackpadActivity.homeTrigger = null }
     }
@@ -906,10 +939,17 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
     // stays in sync regardless of how the flashlight is toggled.
     val flashlight = remember { com.portalpad.app.service.FlashlightController(app) }
     val flashlightOn by flashlight.isOnFlow.collectAsState()
+    // Bumped by EVERY permission-grant callback so anything keyed on it — the
+    // Quick Wheel's "permission needed" chip list — recomputes the moment a
+    // grant lands, no matter WHICH flow requested it. The chip's own fix
+    // button was the only bumper before, so granting Camera via the QR button
+    // left a stale "1 permission needed" chip until the wheel was reopened.
+    var permRefresh by remember { mutableStateOf(0) }
     val cameraPermissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         contract = androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
     ) { granted ->
         if (granted) {
+            permRefresh++
             // Once granted, fulfill the originally-requested toggle.
             flashlight.toggle()
         } else {
@@ -917,6 +957,21 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                 app,
                 "Flashlight needs camera permission",
                 android.widget.Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
+    val permFixCameraLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+    ) { permRefresh++ }
+    val qrCameraPermissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            permRefresh++
+            showQrScanner = true
+        } else {
+            android.widget.Toast.makeText(
+                app, "QR scanner needs camera permission", android.widget.Toast.LENGTH_SHORT,
             ).show()
         }
     }
@@ -1050,14 +1105,18 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
             override fun onLongPressStart() {}
             override fun onLongPressEnd() {}
             override fun onScroll(dx: Float, dy: Float) = injector.scroll(dx, dy)
-            override fun onDragStart() = injector.dragStart()
+            override fun onDragStart(captionMove: Boolean) = injector.dragStart(captionMove)
             override fun onDragMove(dx: Float, dy: Float) = injector.dragMove(dx, dy)
             override fun onDragEnd() = injector.dragEnd()
             override fun onPinch(scale: Float) = injector.pinchUpdate(scale)
             override fun onPinchEnd() = injector.pinchCommit()
             override fun isOnResizeEdge(): Boolean =
-                injector.cursorType.value != com.portalpad.app.service.CursorType.ARROW
+                injector.cursorType.value != com.portalpad.app.service.CursorType.ARROW &&
+                    injector.cursorType.value != com.portalpad.app.service.CursorType.MOVE
             override fun isOnCaption(): Boolean = injector.cursorOnCaption.value
+            override fun pressOnHandleNow(): Boolean = injector.pressOnHandleNow()
+            override fun pressOnButtonNow(): Boolean = injector.pressOnButtonNow()
+            override fun pressDiag(): String = injector.handlePressDiag()
             override fun onThreeFingerSwipe(dx: Float, dy: Float) {
                 // Resolve the swipe direction, then run the user-configured action
                 // for it (defaults preserve the original right→Back / left→Home /
@@ -1405,7 +1464,11 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                 // to the front (search is a focusable overlay that otherwise
                 // stays on top of the launched app).
                 com.portalpad.app.service.PortalPadForegroundService.dismissSearchOverlay()
-                if (homeAction != null) launchEntry(homeAction, injector) else injector.home()
+                if (homeAction == null) {
+                    com.portalpad.app.service.PortalPadForegroundService.goHomeWallpaper()
+                } else {
+                    launchEntry(homeAction, injector)
+                }
             },
             onAppDrawer = {
                 // The drawer pill opens the Quick Wheel. Do NOT bypass to the full
@@ -1575,8 +1638,50 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
     }
 
     if (showQuickWheel) {
+        val permissionIssues = remember(showQuickWheel, permRefresh) {
+            buildList {
+                val camOk = androidx.core.content.ContextCompat.checkSelfPermission(
+                    ctxForPerm, android.Manifest.permission.CAMERA,
+                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (!camOk) {
+                    add(com.portalpad.app.ui.trackpad.PermissionIssue(
+                        label = "Camera",
+                        why = "QR / barcode scanner",
+                    ) { permFixCameraLauncher.launch(android.Manifest.permission.CAMERA) })
+                }
+                val notifOk = runCatching {
+                    android.provider.Settings.Secure.getString(
+                        ctxForPerm.contentResolver, "enabled_notification_listeners",
+                    )?.contains(ctxForPerm.packageName) == true
+                }.getOrDefault(false)
+                if (!notifOk) {
+                    add(com.portalpad.app.ui.trackpad.PermissionIssue(
+                        label = "Notification access",
+                        why = "Expand Notifications on the external display",
+                    ) {
+                        runCatching {
+                            ctxForPerm.startActivity(
+                                android.content.Intent(
+                                    android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS,
+                                ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                            )
+                        }
+                    })
+                }
+                if (!app.access.isReady) {
+                    add(com.portalpad.app.ui.trackpad.PermissionIssue(
+                        label = "Shizuku or root",
+                        why = "Launching apps and the Widget Overlay",
+                    ) { launchSettingsOnPhone(ctxForPerm) })
+                }
+            }
+        }
         com.portalpad.app.ui.trackpad.QuickWheelOverlay(
             slots = wheelSlots,
+            // Activity-measured nav inset: the wheel's Dialog window sometimes
+            // resolves 0 for it and clipped its bottom chips (field).
+            fallbackBottomInset = WindowInsets.navigationBars
+                .asPaddingValues().calculateBottomPadding(),
             onLaunchSlot = { entry ->
                 showQuickWheel = false
                 launchEntry(entry, injector)
@@ -1593,7 +1698,66 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                 showQuickWheel = false
                 showAppDrawer = true
             },
-            onDismiss = { showQuickWheel = false },
+            onWidgetOverlay = {
+                showQuickWheel = false
+                com.portalpad.app.service.PortalPadForegroundService.toggleWidgetOverlayPanel()
+            },
+            onWidgetOverlayEdit = {
+                // Long-press: open the layer STRAIGHT INTO edit mode. The edit
+                // request is buffered, so it works whether the layer is already
+                // up or about to be shown.
+                showQuickWheel = false
+                com.portalpad.app.PortalPadApp.instance.requestWidgetOverlayEdit()
+                com.portalpad.app.service.PortalPadForegroundService.showWidgetOverlayPanel()
+            },
+            onNotifications = {
+                showQuickWheel = false
+                com.portalpad.app.service.PortalPadForegroundService.toggleNotificationPanel()
+            },
+            permissionIssues = permissionIssues,
+            onQrScan = {
+                // Integrated: the feed lives INSIDE the wheel overlay — the
+                // wheel stays up; the squircle toggles the feed.
+                if (showQrScanner) {
+                    showQrScanner = false
+                } else {
+                    val hasCam = androidx.core.content.ContextCompat.checkSelfPermission(
+                        ctxForPerm, android.Manifest.permission.CAMERA,
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    if (hasCam) showQrScanner = true
+                    else qrCameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
+                }
+            },
+            qrFeed = if (showQrScanner) {
+                {
+                    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+                    com.portalpad.app.qr.QrScannerOverlay(
+                        lifecycleOwner = lifecycleOwner,
+                        accent = com.portalpad.app.ui.theme.AbPrimaryBright,
+                        onOpenOnDisplay = { url ->
+                            showQrScanner = false
+                            showQuickWheel = false
+                            openUrlOnExternalDisplay(app, injector, url)
+                        },
+                        onJoinWifi = { r ->
+                            showQrScanner = false
+                            showQuickWheel = false
+                            joinWifiFromQr(ctxForPerm, r)
+                        },
+                        onCopyText = { txt ->
+                            showQrScanner = false
+                            val cm = ctxForPerm.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                                as android.content.ClipboardManager
+                            cm.setPrimaryClip(android.content.ClipData.newPlainText("QR", txt))
+                            android.widget.Toast.makeText(
+                                app, "Copied to clipboard", android.widget.Toast.LENGTH_SHORT,
+                            ).show()
+                        },
+                        onClose = { showQrScanner = false },
+                    )
+                }
+            } else null,
+            onDismiss = { showQuickWheel = false; showQrScanner = false },
         )
     }
 
@@ -1657,7 +1821,26 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                 // VD id would show this banner 10 seconds late. The physical id
                 // clears the instant the panel disconnects — and its return within
                 // the banner's window drives the "Display Reconnected" flash.
-                DisconnectBanner(externalDisplayId = physicalExternalDisplayId)
+                val bannerActivity = androidx.compose.ui.platform.LocalContext.current
+                    as? android.app.Activity
+                DisconnectBanner(
+                    externalDisplayId = physicalExternalDisplayId,
+                    onReturnNow = {
+                        // Same destination as the auto-finish watcher, just now.
+                        // (Top-level composable: the Activity comes from
+                        // LocalContext, not an implicit receiver.)
+                        bannerActivity?.let { act ->
+                            runCatching {
+                                launchSettingsOnPhone(
+                                    act,
+                                    android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                                        android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT,
+                                )
+                            }
+                            act.finish()
+                        }
+                    },
+                )
 }
 
 
@@ -1793,8 +1976,83 @@ private fun resolveDisplayLabel(app: PortalPadApp, id: Int): String? {
     return "$name (${metrics.widthPixels}×${metrics.heightPixels})"
 }
 
+/** Open a scanned URL on the EXTERNAL display (falls back to the phone when no
+ *  external display / privilege — same constraints as launchEntry). */
+internal fun openUrlOnExternalDisplay(
+    app: com.portalpad.app.PortalPadApp,
+    injector: InputInjector,
+    url: String,
+) {
+    val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))
+        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+    val displayId = injector.displayId.takeIf { it != android.view.Display.DEFAULT_DISPLAY }
+        ?: app.externalDisplayId.value
+        ?: android.view.Display.DEFAULT_DISPLAY
+    val ok = runCatching {
+        val opts = android.app.ActivityOptions.makeBasic().setLaunchDisplayId(displayId).toBundle()
+        app.startActivity(intent, opts)
+        true
+    }.getOrDefault(false)
+    if (!ok) {
+        // Privilege-less cross-display launch throws; fall back to the phone so
+        // the link still opens rather than silently failing.
+        runCatching { app.startActivity(intent) }
+        android.util.Log.w("QrScan", "URL opened on phone (no cross-display privilege)")
+    }
+}
+
+/** Route a scanned Wi-Fi payload to the system. On R+ the Add-Network panel
+ *  pre-fills SSID; older versions fall back to Wi-Fi settings. We never join
+ *  silently — the OS presents its own confirmation. */
+internal fun joinWifiFromQr(context: android.content.Context, r: com.portalpad.app.qr.QrResult) {
+    val ssid = r.wifiSsid ?: return
+    runCatching {
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            val suggestion = android.net.wifi.WifiNetworkSuggestion.Builder()
+                .setSsid(ssid)
+                .apply {
+                    r.wifiPassword?.let { pass ->
+                        // WPA3 QRs mark T:SAE — mistyping them as WPA2 made the
+                        // join fail on WPA3-only networks.
+                        if (r.wifiType.equals("SAE", ignoreCase = true)) setWpa3Passphrase(pass)
+                        else setWpa2Passphrase(pass)
+                    }
+                }
+                .build()
+            val intent = android.content.Intent(android.provider.Settings.ACTION_WIFI_ADD_NETWORKS)
+                .putParcelableArrayListExtra(
+                    android.provider.Settings.EXTRA_WIFI_NETWORK_LIST,
+                    arrayListOf(suggestion),
+                )
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+        } else {
+            context.startActivity(
+                android.content.Intent(android.provider.Settings.ACTION_WIFI_SETTINGS)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+            android.widget.Toast.makeText(
+                context, "Add “$ssid” in Wi-Fi settings", android.widget.Toast.LENGTH_LONG,
+            ).show()
+        }
+    }.onFailure {
+        android.widget.Toast.makeText(
+            context, "Couldn't open Wi-Fi settings", android.widget.Toast.LENGTH_SHORT,
+        ).show()
+    }
+}
+
 internal fun launchEntry(entry: com.portalpad.app.data.AppEntry, injector: InputInjector) {
     val app = PortalPadApp.instance
+
+    // ─── Widget overlay sentinel ─────────────────────────────────────────────
+    // "Widget Overlay" assigned to Home/Back is an internal toggle, not an app —
+    // it must be dispatched BEFORE any launch attempt (the magic package name
+    // would fail to resolve and log noise otherwise).
+    if (entry.isWidgetOverlay) {
+        com.portalpad.app.service.PortalPadForegroundService.toggleWidgetOverlayPanel()
+        return
+    }
 
     // ─── Phone shortcut (Tasker task / app shortcut) ─────────────────────────
     // If this entry carries a shortcut Intent URI, it is meant to fire on the

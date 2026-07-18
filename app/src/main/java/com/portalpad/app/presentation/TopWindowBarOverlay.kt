@@ -77,6 +77,7 @@ class TopWindowBarOverlay(
 
     private var scope: CoroutineScope? = null
     private var revealJob: Job? = null
+    private var lastRevealDiag = 0L
     private var autoHideJob: Job? = null
     // Persistent observer (separate from [scope], which is recreated on show/
     // dismiss) that watches the top-bar config and restyles the live bar when the
@@ -125,6 +126,18 @@ class TopWindowBarOverlay(
     // drag settles (a size change alters `density`, which is baked into the views,
     // so it needs a full rebuild rather than a live restyle).
     private val uiHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    // 2032-attach retry (dock parity). A transient a11y-token error at attach
+    // used to be SWALLOWED here (try/catch { log; return }), leaving a zombie
+    // overlay object with no window until the next full attachVdOverlays pass —
+    // the "top bar just never shows" bug (window dump: dock + taskbar attached,
+    // no top-bar window). The dock got a 6×400ms retry in v1.3; this is the
+    // same cadence. Cancelled by dismiss().
+    private var attachRetries = 0
+    private var pendingAttachRetry: Runnable? = null
+
+    /** True when the bar's window is actually added (container live). */
+    val isAttached: Boolean get() = container != null
     private var pendingSizeRecreate: Runnable? = null
 
     private enum class Mode { IDLE, MOVE, RESIZE }
@@ -246,8 +259,11 @@ class TopWindowBarOverlay(
                     multi = { launchMaximizePickerOnPhone() },
                 )
             }
-            val btnRestoreFreeform = controlButton("\u2750", "Restore to freeform") {  // ❐ — demote the maximized window back to a floating window
+            val btnRestoreFreeform = controlButton("\u2750", "Unmaximize") {  // ❐ — shrink the maximized window back to a normal floating window
                 restoreFreeform()  // self-guards: toasts when there's no maximized window
+            }
+            val btnCaptionHandle = controlButton("\u25AD", "Window top bar") {  // ▭ — collapse the window top bar to a slim handle (or expand back)
+                requireWindows(1, "No windows") { toggleWindowTopBar() }
             }
             val btnArrange = controlButton("\u2637", "Arrange evenly") { // ☷ (even columns)
                 requireWindows(2, "Need at least 2 windows to arrange") { arrangeEvenly() }
@@ -268,6 +284,7 @@ class TopWindowBarOverlay(
                 btnMinimize to { st: WinState -> st.count >= 1 },
                 btnMaximize to { st: WinState -> st.count >= 1 },
                 btnRestoreFreeform to { st: WinState -> st.hasMaximized },
+                btnCaptionHandle to { st: WinState -> st.count >= 1 },
                 btnArrange to { st: WinState -> st.count >= 2 },
                 btnArrangeOrder to { st: WinState -> st.count >= 2 },
                 btnStack to { st: WinState -> st.count >= 2 },
@@ -275,7 +292,7 @@ class TopWindowBarOverlay(
                 btnClose to { st: WinState -> st.count >= 1 },
             )
             listOf(
-                listOf(btnMinimize, btnMaximize, btnRestoreFreeform),
+                listOf(btnMinimize, btnMaximize, btnRestoreFreeform, btnCaptionHandle),
                 listOf(btnArrange, btnArrangeOrder, btnStack),
                 listOf(btnRestore),
                 listOf(btnClose),
@@ -285,9 +302,12 @@ class TopWindowBarOverlay(
                 injector.backGuarded()
             }
             val btnHome = controlButton("\u2302", "Home") {           // ⌂
-                // Just lay the PortalPad wallpaper backdrop on the external display —
-                // NOT the trackpad's goHome() (which targets the phone launcher).
-                com.portalpad.app.service.PortalPadForegroundService.showWallpaper()
+                // Same behavior as the trackpad's Home-on-wallpaper-default
+                // (field request): dismisses the widget overlay if it's up,
+                // else lays the wallpaper backdrop. This bar only shows in
+                // non-desktop mode, where the minimize-all pass is skipped, so
+                // the wallpaper outcome is identical to the old direct call.
+                com.portalpad.app.service.PortalPadForegroundService.goHomeWallpaper()
             }
             val btnClose = controlButton("\u2715", "Close all") {         // ✕
                 showCloseAllConfirm()
@@ -353,9 +373,21 @@ class TopWindowBarOverlay(
             windowManager.addView(bar, lp)
             container = bar
             barParams = lp
+            attachRetries = 0
             Log.d(TAG, "Window control bar attached on display ${display.displayId}")
         } catch (t: Throwable) {
-            Log.e(TAG, "Could not attach window control bar", t)
+            // Retry marker (grep: "TopBar 2032 attach retry") — dock parity:
+            // transient a11y-token errors settle within a couple of cycles.
+            Log.e(TAG, "Could not attach window control bar (attempt ${attachRetries + 1}/6)", t)
+            if (attachRetries < 5) {
+                attachRetries++
+                val r = Runnable { pendingAttachRetry = null; show() }
+                pendingAttachRetry = r
+                uiHandler.postDelayed(r, 400L)
+                Log.w(TAG, "TopBar 2032 attach retry $attachRetries/6 scheduled in 400ms")
+            } else {
+                Log.e(TAG, "TopBar 2032 attach gave up after 6 attempts")
+            }
             return
         }
 
@@ -423,6 +455,26 @@ class TopWindowBarOverlay(
         // progress we keep the bar shown.
         revealJob = s.launch {
             injector.cursorPosition.collect { (x, y) ->
+                // DIAG-REVEAL: the reveal path had NO logging, so a "bar won't
+                // activate" report couldn't be discriminated (stuck overlay
+                // flag? suppress latch? dead collector? config?). One throttled
+                // line near the top edge names every gate. No lines at all
+                // while the cursor rides the top = this collector isn't running
+                // (attach/scope problem — see the attach lines).
+                val dnow = android.os.SystemClock.uptimeMillis()
+                if (y <= 200f && dnow - lastRevealDiag > 1000) {
+                    lastRevealDiag = dnow
+                    Log.d(TAG, "DIAG-REVEAL y=${y.toInt()} shown=$shown mode=$mode " +
+                        "overlayOpen=${com.portalpad.app.PortalPadApp.instance.widgetOverlayOpen.value} " +
+                        "hideCfg=${topBarCfg.autoHideAfterSec} suppress=$suppressRevealUntilExit")
+                }
+                // Widget overlay is MODAL: while its full-screen layer is up the
+                // bar is unreachable beneath the scrim, so suppress reveal (and
+                // hide if already shown). Returns to normal on layer dismissal.
+                if (com.portalpad.app.PortalPadApp.instance.widgetOverlayOpen.value) {
+                    if (shown && mode == Mode.IDLE) setShown(false)
+                    return@collect
+                }
                 if (mode != Mode.IDLE) { if (!shown) setShown(true); return@collect }
                 // autoHideAfterSec == 0 = always visible (truly pinned, matching the
                 // dock): keep it shown and skip all reveal/hide logic.
@@ -1102,8 +1154,22 @@ class TopWindowBarOverlay(
                     var id = display.displayId
                     var task: RunningTask? = null
 
-                    // 1) Try the tracked maximized task across candidate displays.
-                    if (tracked != null) {
+                    // 1) Prefer a window whose PACKAGE is flagged maximized. This
+                    //    survives relaunches (task ids change on every switch/relaunch,
+                    //    so the old task-id tracking goes stale and restore grabbed the
+                    //    wrong window — field bug).
+                    for (cand in ids) {
+                        val t = freeform.listTasks(cand).firstOrNull { rt ->
+                            freeform.isMaximizedPackage(rt.packageName) &&
+                                !rt.packageName.contains("launcher", ignoreCase = true) &&
+                                !rt.packageName.contains("nexuslauncher", ignoreCase = true) &&
+                                rt.packageName != "com.portalpad.app"
+                        }
+                        if (t != null) { id = cand; task = t; break }
+                    }
+
+                    // 2. Same-session tracked task id (pre-relaunch).
+                    if (task == null && tracked != null) {
                         for (cand in ids) {
                             val t = freeform.listTasks(cand).firstOrNull { it.taskId == tracked }
                             if (t != null) { id = cand; task = t; break }
@@ -1411,6 +1477,30 @@ class TopWindowBarOverlay(
             "stack" -> requireWindows(2, "Need at least 2 windows to stack") { stackWindows() }
             "restoreSession" -> restoreLastSession()
             "closeAll" -> closeAllExternalApps()
+            "windowTopBar" -> requireWindows(1, "No windows") { toggleWindowTopBar() }
+        }
+    }
+
+    /** Collapse/expand the freeform window top bar (Android caption) to a slim handle,
+     *  via the accessibility service. Shared by the top-bar ▭ button and the Window
+     *  Wheel entry. The toggle is global — flips every freeform window. */
+    private fun toggleWindowTopBar() {
+        val svc = com.portalpad.app.service.PortalPadAccessibilityService.instance
+        if (svc == null) {
+            runCatching {
+                com.portalpad.app.presentation.GlassesToast.show(
+                    com.portalpad.app.PortalPadApp.instance, display, "Enable accessibility for this", 2500L,
+                )
+            }
+            return
+        }
+        scope?.launch(Dispatchers.IO) {
+            val ok = runCatching { svc.toggleCaptionHandle(injector.displayId) }.getOrDefault(false)
+            if (!ok) runCatching {
+                com.portalpad.app.presentation.GlassesToast.show(
+                    com.portalpad.app.PortalPadApp.instance, display, "Couldn't toggle window top bar", 2500L,
+                )
+            }
         }
     }
 
@@ -1433,7 +1523,7 @@ class TopWindowBarOverlay(
             ) { snap, session ->
                 WinState(
                     snap.tasks.count { isUserWindow(it) },
-                    snap.maximizedId != null,
+                    snap.hasMaximized,
                     session.windows.isNotEmpty(),
                 )
             }.collect { state ->
@@ -1468,6 +1558,8 @@ class TopWindowBarOverlay(
     }
 
     fun dismiss() {
+        pendingAttachRetry?.let { uiHandler.removeCallbacks(it) }; pendingAttachRetry = null
+        attachRetries = 0
         pendingSizeRecreate?.let { uiHandler.removeCallbacks(it) }; pendingSizeRecreate = null
         revealJob?.cancel(); revealJob = null
         autoHideJob?.cancel(); autoHideJob = null

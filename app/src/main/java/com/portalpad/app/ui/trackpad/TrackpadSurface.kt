@@ -378,7 +378,7 @@ interface GestureSink {
     // so Android performs a real drag (e.g. moving a freeform window) instead of
     // a hover. onDragStart fires once when the drag begins, onDragMove per frame,
     // onDragEnd on lift. Default no-op impls keep other GestureSink users working.
-    fun onDragStart() {}
+    fun onDragStart(captionMove: Boolean = false) {}
     fun onDragMove(dx: Float, dy: Float) {}
     fun onDragEnd() {}
     // Pinch released — commit the accumulated zoom (no-op if it was a scroll).
@@ -390,6 +390,23 @@ interface GestureSink {
     // True when the cursor is over a freeform window's caption strip — a grab here
     // uses the same quick edge-hold engage but moves the window (no resize).
     fun isOnCaption(): Boolean = false
+    // One-shot DIAG (#2) sampled at press time: cursor type, the onCaption FLOW value,
+    // and a FRESH onHandle re-test at the current cursor position. Lets a failed
+    // caption grab (press read a stale/jittered flow → engaged resize) be told apart
+    // from a genuine resize-edge press. Default empty for non-injector sinks.
+    fun pressDiag(): String = ""
+    // Authoritative, synchronous "is the cursor on the caption handle right now?" check,
+    // sampled AT press time. The cursorType/onCaption flows can be stale or jittered off
+    // the pill at the instant of a press (see handle_restore.txt: RESIZE_V with a fresh
+    // onHandleNow=true), and the rect cache can be momentarily empty. This re-tests the
+    // live cursor position (querying fresh rects if the cache is empty) so a real grab
+    // isn't lost to a stale flow. Default false for non-injector sinks.
+    fun pressOnHandleNow(): Boolean = false
+    // True when the press lands on a caption tap-only control (window buttons /
+    // open pill menu). NO drag may engage from these — not even the generic
+    // touch-and-hold — because the injected touch drag would start on caption
+    // chrome and the ROM itself moves the window from there. Default false.
+    fun pressOnButtonNow(): Boolean = false
 }
 
 /**
@@ -439,6 +456,15 @@ private class GestureRecognizer(
     // Latched at press: was the cursor on a window caption strip? If so, a brief
     // hold grabs and moves the window (same quick engage as an edge).
     private var pressOnCaption = false
+    // Latched at press: was the cursor on the collapsed handle PILL (fresh re-test)? The
+    // pill is a deliberate grab affordance, so it engages the drag on press+move like a
+    // title bar — no still-hold required (unlike caption strips / resize edges).
+    private var pressOnHandle = false
+    // Latched at press: was the cursor on a caption tap-only control (window
+    // buttons / open pill menu)? NO drag engages from these — quick-zone OR
+    // generic hold — because an injected touch drag starting there is read by
+    // the ROM as a caption window-move, buttons included.
+    private var pressOnButton = false
     // Rest tracking for the quick-zone (edge/caption) hold. The grab engages only
     // after the finger has stayed within restSlopPx of this anchor for edgeHoldMs.
     // Any drift past the slop moves the anchor and restarts the timer, so a slide at
@@ -692,6 +718,25 @@ private class GestureRecognizer(
             // hold engages it below (border shows / window sticks) with no 24px move.
             pressOnEdge = sink.isOnResizeEdge()
             pressOnCaption = sink.isOnCaption()
+            pressOnHandle = sink.pressOnHandleNow()
+            pressOnButton = sink.pressOnButtonNow()
+            // Trust a fresh, synchronous re-test over the possibly-stale flow: if the
+            // cursor is actually on the caption handle at press time, force the caption
+            // MOVE engage (not resize), even if cursorType lagged as RESIZE_V or the rect
+            // cache was momentarily empty. Fixes intermittent "grab flips to resize".
+            if (pressOnHandle) {
+                pressOnCaption = true
+                pressOnEdge = false
+            }
+            // A press ON a tap-only caption control is click-territory, full stop.
+            if (pressOnButton) {
+                pressOnCaption = false
+                pressOnEdge = false
+            }
+            android.util.Log.i(
+                "PortalPadHandle",
+                "press-engage onEdge=$pressOnEdge onCaption=$pressOnCaption onButton=$pressOnButton ${sink.pressDiag()}",
+            )
             restAnchorX = p.position.x
             restAnchorY = p.position.y
             restAnchorAt = now
@@ -731,12 +776,19 @@ private class GestureRecognizer(
         val quickZone = pressOnEdge || pressOnCaption
         val graceOk = lastDragEndAt == 0L || now - lastDragEndAt >= edgeGraceMs
         val onQuickHold = quickZone && graceOk && now - restAnchorAt >= edgeHoldMs
-        val offZoneReady = !quickZone && !movedEarly && now - pressedAt >= longPressThresholdMs
+        // pressOnButton kills BOTH engage paths: the quick zone is already off
+        // (cleared at press), and the generic hold must not fire either — its
+        // injected touch drag would start on the caption's tap-only controls,
+        // which the ROM moves the window from. Buttons are taps, period.
+        val offZoneReady = !quickZone && !pressOnButton && !movedEarly && now - pressedAt >= longPressThresholdMs
+        // Drag model (all zones): tap = click; press + move (no hold) = just move the
+        // cursor; press + HOLD still (edgeHoldMs) THEN move = grab/drag. So a slide over a
+        // drag zone never grabs — only a deliberate hold does.
         if (!dragActive && pressedAt > 0 && (onQuickHold || offZoneReady)) {
             val totalFromPress = hypot(p.position.x - pressStartX, p.position.y - pressStartY)
             if (onQuickHold || totalFromPress > dragEngagePx) {
                 dragActive = true
-                sink.onDragStart()
+                sink.onDragStart(captionMove = pressOnCaption)
                 val what = if (pressOnEdge) "edge hold" else if (pressOnCaption) "caption hold" else "hold + move"
                 android.util.Log.d("Gesture", "DRAG START ($what)")
             }

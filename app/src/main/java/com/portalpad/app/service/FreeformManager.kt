@@ -57,6 +57,31 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
     fun markMinimized(taskId: Int) { minimizedTasks.add(taskId) }
     fun clearMinimized(taskId: Int) { minimizedTasks.remove(taskId) }
 
+    /** DIAG-MAX: dump each external window's state (bounds / platform visibility /
+     *  PortalPad-minimized-set membership / whether it's the tracked maximized
+     *  task). Used to see WHY a maximized app drops to the dock's minimize bar on a
+     *  resolution switch — the dock reflects a platform `visible=false` collapse. */
+    fun dumpExternalWindowStates(where: String) {
+        runCatching {
+            val minSet = minimizedTaskIds()
+            val maxId = maximizedTaskId
+            val tasks = listExternalTasks()
+            android.util.Log.d(
+                "PortalPadSleep",
+                "DIAG-MAX[$where] count=${tasks.size} maximizedTaskId=$maxId minSet=$minSet",
+            )
+            tasks.forEach { t ->
+                val b = t.bounds
+                android.util.Log.d(
+                    "PortalPadSleep",
+                    "DIAG-MAX[$where] task=${t.taskId} pkg=${t.packageName} disp=${t.displayId} " +
+                        "bounds=${b?.let { "[${it.left},${it.top}][${it.right},${it.bottom}]" } ?: "null"} " +
+                        "vis=${t.visible} min=${t.taskId in minSet} max=${t.taskId == maxId}",
+                )
+            }
+        }.onFailure { android.util.Log.w("PortalPadSleep", "DIAG-MAX[$where] dump failed: ${it.message}") }
+    }
+
     /** Windows "minimized" via the CLOSE model: the task is removed from the
      *  display (no off-screen sliver) and we remember its package + bounds here
      *  so the dock can relaunch it on demand. Survives the task's death (unlike
@@ -650,7 +675,52 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
     @Volatile private var maximizedTaskId: Int? = null
     private val preMaximizeBounds = java.util.concurrent.ConcurrentHashMap<Int, WindowBounds>()
 
+    // Persistent "maximized intent" keyed by PACKAGE (survives relaunches — task ids
+    // change when a fullscreen window is relaunched). A maximized window is restored
+    // NEAR-FULL on EVERY resolution, regardless of what a per-width slot remembers,
+    // so it stays maximized-looking across switches instead of shuffling into a tile.
+    private val maximizedPackages = java.util.Collections.synchronizedSet(HashSet<String>())
+    fun markMaximizedPackage(pkg: String) { if (pkg.isNotBlank()) maximizedPackages.add(pkg) }
+    fun clearMaximizedPackage(pkg: String) { maximizedPackages.remove(pkg) }
+    fun clearAllMaximized() { maximizedPackages.clear() }
+    fun isMaximizedPackage(pkg: String): Boolean = maximizedPackages.contains(pkg)
+
+    // Short per-package cooldown so the caption-fullscreen detector can re-convert a
+    // window on a SECOND user expand (the maximized flag no longer gates it — actual
+    // fullscreen state does), while a window's own transient fullscreen during its
+    // relaunch can't kick off a convert→fullscreen→convert loop.
+    // Monotonic (elapsedRealtime): a wall-clock jump backward made this 3s
+    // cooldown read as hours, silently disabling fullscreen-convert.
+    private val recentConversions = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    fun markConverted(pkg: String) { if (pkg.isNotBlank()) recentConversions[pkg] = android.os.SystemClock.elapsedRealtime() }
+    fun recentlyConverted(pkg: String, windowMs: Long = 3000L): Boolean =
+        (android.os.SystemClock.elapsedRealtime() - (recentConversions[pkg] ?: 0L)) < windowMs
+
     fun currentlyMaximizedTaskId(): Int? = maximizedTaskId
+
+    /** EXPERIMENTAL: convert a window the platform put into fullscreen MODE (e.g. the
+     *  user tapped the Android caption-bar "expand") into our near-full freeform
+     *  maximize, immediately. Fullscreen mode can't be undone in place on this ROM,
+     *  so this is a close+relaunch (state lost) — the same cost as the switch-time
+     *  path, just done now. Marks the package maximized so it stays near-full across
+     *  switches. Caller gates this (desktop mode, ≥2 windows, not already maximized). */
+    fun convertFullscreenToNearFull(taskId: Int, packageName: String, displayId: Int, displayW: Int, displayH: Int) {
+        if (!isReady || displayW <= 1 || displayH <= 1) return
+        markConverted(packageName)
+        markMaximizedPackage(packageName)
+        val comp = runCatching {
+            PortalPadApp.instance.packageManager
+                .getLaunchIntentForPackage(packageName)?.component?.flattenToShortString()
+        }.getOrNull()
+        if (comp == null) { PortalPadApp.instance.signalWindowsChanged(); return }
+        val target = WindowBounds.maximized(displayW, displayH)
+        android.util.Log.d("PortalPadSleep", "CAPTION-FS convert pkg=$packageName → near-full relaunch on disp=$displayId")
+        close(taskId)
+        runCatching { Thread.sleep(200) }
+        runCatching { launchFreeform(comp, displayId, target) }
+        ensureTiledWithReroll(packageName, comp, displayId, target, displayW, displayH)
+        PortalPadApp.instance.signalWindowsChanged()
+    }
 
     /** Maximize (keeps the freeform caption bar): front the chosen window via
      *  am start + resize it to fill the display. This is the reliable, only
@@ -694,13 +764,50 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
             runCatching { resize(taskId, WindowBounds.maximized(displayW, displayH)) }
         }
         maximizedTaskId = taskId
+        markMaximizedPackage(packageName)
         clearMinimized(taskId)
         PortalPadApp.instance.signalWindowsChanged()
     }
 
+    /** TRUE while the direct-binder resize path is working — the caption-move
+     *  throttle reads this to pick its cadence (fast binder sustains ~33/s;
+     *  the shell-spawn fallback must stay at the slower rate or commands pile
+     *  up faster than they complete and the window lags the finger). */
+    @Volatile var lastResizeWasFast = false
+        private set
+    // Logs on path CHANGES (fast<->shell), not once-per-process: the old
+    // one-shot latch printed at first resize and never again, so a capture
+    // started later could never see which path was active (field: a drift
+    // log came back empty because of exactly this).
+    @Volatile private var lastLoggedResizeFast: Boolean? = null
+
+    /** Called at each caption dragStart so EVERY drag's first resize logs its
+     *  path — the change-only latch was silent in steady state, so a capture
+     *  during a drift couldn't show which path was active (field x2). One
+     *  line per drag, always capturable. */
+    fun resetResizePathLog() { lastLoggedResizeFast = null }
+
     fun resize(taskId: Int, bounds: WindowBounds) {
-        runCatching {
-            access.resizeTask(taskId, bounds.left, bounds.top, bounds.right, bounds.bottom)
+        // Fast path: direct ActivityTaskManager.resizeTask over the bound
+        // privileged service — no process spawn per step. Falls back to the
+        // `am task resize` shell command when unavailable or when the
+        // reflection missed on this ROM, so the WORST case is exactly the old
+        // behavior.
+        val fast = runCatching {
+            val b = PortalPadApp.instance.activeBoundBackend
+            b?.isReady == true &&
+                b.resizeTaskFast(taskId, bounds.left, bounds.top, bounds.right, bounds.bottom)
+        }.getOrDefault(false)
+        lastResizeWasFast = fast
+        if (!fast) {
+            runCatching {
+                access.resizeTask(taskId, bounds.left, bounds.top, bounds.right, bounds.bottom)
+            }
+        }
+        if (lastLoggedResizeFast != fast) {
+            lastLoggedResizeFast = fast
+            android.util.Log.i("FreeformManager",
+                "resize path → ${if (fast) "FAST binder" else "shell fallback"}")
         }
         PortalPadApp.instance.signalWindowsChanged()
     }
@@ -824,6 +931,26 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
      *     inlined (not via launchFreeform) so the max-window cap doesn't block
      *     restoring an already-open window.
      *  No-op if nothing is maximized (caller passes the maximized task). */
+    // Pick the restore target: centered when this is the only user window on the display,
+    // otherwise cascade down-right by the count of other non-fullscreen user windows, so
+    // successive un-maximizes fan out instead of landing on the exact same centered rect
+    // (which stacks them edge-to-edge and hides one behind the other).
+    private fun restoreTargetFor(taskId: Int, displayId: Int, displayW: Int, displayH: Int): WindowBounds {
+        val existing = runCatching {
+            listTasks(displayId).count { t ->
+                val b = t.bounds
+                b != null && t.taskId != taskId &&
+                    !t.packageName.contains("launcher", ignoreCase = true) &&
+                    !(b.left <= 2 && b.top <= 2 && b.right >= displayW - 2 && b.bottom >= displayH - 2)
+            }
+        }.getOrDefault(0)
+        return if (existing <= 0) {
+            WindowBounds.restored(displayW, displayH)
+        } else {
+            WindowBounds.cascade(existing, displayW, displayH)
+        }
+    }
+
     fun restoreToFreeform(
         taskId: Int,
         component: String?,
@@ -834,7 +961,9 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
     ) {
         if (!isReady) return
         val target = preMaximizeBounds[taskId]
-            ?: if (displayW > 0 && displayH > 0) WindowBounds.restored(displayW, displayH) else null
+            ?: if (displayW > 0 && displayH > 0) {
+                restoreTargetFor(taskId, displayId, displayW, displayH)
+            } else null
         val freeformOn = runCatching {
             access.execShell("settings get global enable_freeform_support").trim().startsWith("1")
         }.getOrDefault(false)
@@ -865,13 +994,40 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
                 runCatching { access.startActivityOnDisplay(packageName, displayId) }
             }
         } else {
-            // Already freeform (bar-keeping maximize): resize back down + focus.
-            setWindowingModeFreeform(taskId)
-            if (target != null) resize(taskId, target)
-            focus(taskId)
+            // Normal case — already a freeform (bar-keeping) window: resize back down.
+            // BUT if the platform has it in fullscreen MODE (full-canvas — e.g. a
+            // caption-less OS-expanded window that never went through our conversion),
+            // resize + windowing-mode changes are IGNORED on this ROM, so a plain
+            // resize would silently do nothing. Relaunch it into freeform instead
+            // (state lost, but it actually un-maximizes). Verify it landed and only
+            // ever re-launch (never a second close), so it can't leave the window gone.
+            val cur = runCatching {
+                listTasks(displayId).firstOrNull { it.taskId == taskId }?.bounds
+            }.getOrNull()
+            val isFullscreen = cur != null &&
+                cur.left <= 2 && cur.top <= 2 &&
+                cur.right >= displayW - 2 && cur.bottom >= displayH - 2
+            if (isFullscreen && component != null && target != null) {
+                android.util.Log.d("PortalPadSleep", "unmaximize: target fullscreen-mode → relaunch to freeform pkg=$packageName")
+                close(taskId)
+                Thread.sleep(350)
+                runCatching { launchFreeform(component, displayId, target) }
+                var tries = 0
+                while (tries < 3 && runCatching { listTasks(displayId) }.getOrDefault(emptyList()).none { it.packageName == packageName }) {
+                    tries++
+                    Thread.sleep(400)
+                    runCatching { launchFreeform(component, displayId, target) }
+                }
+                ensureTiledWithReroll(packageName, component, displayId, target, displayW, displayH)
+            } else {
+                setWindowingModeFreeform(taskId)
+                if (target != null) resize(taskId, target)
+                focus(taskId)
+            }
         }
         preMaximizeBounds.remove(taskId)
         if (maximizedTaskId == taskId) maximizedTaskId = null
+        clearMaximizedPackage(packageName)
         PortalPadApp.instance.signalWindowsChanged()
     }
 
@@ -978,6 +1134,14 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
      *  sliver-free minimize and freed resources, in exchange for a relaunch
      *  rather than a live restore. */
     fun minimizeByClose(taskId: Int, packageName: String, bounds: WindowBounds?) {
+        // Samsung's open pill menu silently blocks window ops (same field
+        // report as arrange). Convert handle→caption via the menu item, which
+        // also dismisses the popup.
+        runCatching {
+            if (PortalPadAccessibilityService.instance?.dismissHandleMenuForAction() == true) {
+                Thread.sleep(150)
+            }
+        }
         val id = closedIdSeq.getAndIncrement()
         closedWindows[id] = ClosedWindow(id, packageName, bounds)
         close(taskId)
@@ -1032,9 +1196,30 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         Log.d(tag, "===== DIAGNOSTIC COMPLETE =====")
     }
 
+    /** Mirrored from the CLOSE_REMOVES_FROM_RECENTS pref (PortalPadApp
+     *  collects it). ON = closing a window also purges its Recents card via
+     *  the removeTask binder, DeX-style. OFF (default) = the historical
+     *  shell-spelling close, which on some ROMs leaves the Recents entry. */
+    @Volatile var closeRemovesFromRecents = false
+
     /** Close (finish) a task entirely. Tries the spellings that vary by OEM. */
     fun close(taskId: Int) {
         clearMinimized(taskId)
+        // DeX-style close: the removeTask binder finishes the task AND deletes
+        // its Recents record in one authoritative call. Pref-gated; on any
+        // failure we fall through to the shell spellings, so worst case is
+        // exactly the old behavior.
+        if (closeRemovesFromRecents) {
+            val removed = runCatching {
+                val b = PortalPadApp.instance.activeBoundBackend
+                b?.isReady == true && b.removeTask(taskId)
+            }.getOrDefault(false)
+            android.util.Log.d(TAG, "close($taskId): binder removeTask → $removed${if (removed) " (recents purged)" else " — shell fallback"}")
+            if (removed) {
+                PortalPadApp.instance.signalWindowsChanged()
+                return
+            }
+        }
         runCatching {
             val out = access.execShell("am task $taskId remove")
             if (out.containsError() || out.contains("Unknown", ignoreCase = true) ||
@@ -1320,7 +1505,7 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
         // back-to-front means the FRONTMOST window is handled last and ends on top,
         // reproducing the original stacking — matching restoreSession's order.
         // (Forward iteration fronted the backmost window last, inverting the stack.)
-        for (w in session.windows.reversed()) {
+        for ((revIdx, w) in session.windows.reversed().withIndex()) {
             // Pairing order: EXACT task id first — two same-package windows
             // (e.g. two Chromes) are interchangeable under component/package
             // matching, so the pairing was a coin flip and windows could swap
@@ -1341,13 +1526,48 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
             // Scale the saved bound to the live canvas when requested, clamped so it
             // always stays a valid in-bounds rect (keeps a different-size restore
             // from producing off-screen targets the platform would then clamp).
-            val bounds = if (scaleX != 1f || scaleY != 1f) {
+            val scaledBounds = if (scaleX != 1f || scaleY != 1f) {
                 val nl = (rawBounds.left * scaleX).toInt().coerceIn(0, (displayW - 1).coerceAtLeast(0))
                 val nt = (rawBounds.top * scaleY).toInt().coerceIn(0, (displayH - 1).coerceAtLeast(0))
                 val nr = (rawBounds.right * scaleX).toInt().coerceIn(nl + 1, displayW)
                 val nb = (rawBounds.bottom * scaleY).toInt().coerceIn(nt + 1, displayH)
                 WindowBounds(nl, nt, nr, nb)
             } else rawBounds
+            // ANTI-POLLUTION (heals already-corrupted slots): a SAVED target that
+            // fills the canvas while the session has ≥2 windows is a re-homed-
+            // fullscreen bound the snapshotter captured before the save-side guard
+            // existed — replaying it maximizes that window over the others. Drop it
+            // to an even-column slot so the window lands tiled instead of full-canvas.
+            // (Single-window sessions are left alone: a lone maximized window is
+            // legitimate. Column is by processing order — in the common case the
+            // other windows already hold clean columns and this fills the gap.)
+            val targetIsFull = session.windows.size >= 2 &&
+                scaledBounds.left <= 2 && scaledBounds.top <= 2 &&
+                scaledBounds.right >= displayW - 2 && scaledBounds.bottom >= displayH - 2
+            val bounds = when {
+                // MAXIMIZE INTENT (persistent, by package): a window the user maximized
+                // always returns NEAR-FULL on every resolution — ignore whatever tiled
+                // bounds a per-width slot remembers, so it stays maximized-looking across
+                // switches instead of shuffling into an even tile one direction (field
+                // report: chrome came back near-full going to ultrawide but tiled coming
+                // back to standard).
+                isMaximizedPackage(task.packageName) -> {
+                    android.util.Log.d(
+                        "PortalPadSleep",
+                        "RECOVERY retile MAXIMIZED-INTENT pkg=${task.packageName} → near-full",
+                    )
+                    WindowBounds.maximized(displayW, displayH)
+                }
+                targetIsFull -> {
+                    android.util.Log.d(
+                        "PortalPadSleep",
+                        "RECOVERY retile ANTI-FULLSCREEN pkg=${w.packageName} saved target was " +
+                            "full-canvas → even-column ${revIdx}/${session.windows.size}",
+                    )
+                    WindowBounds.evenColumn(revIdx, session.windows.size, displayW, displayH)
+                }
+                else -> scaledBounds
+            }
             val cur = task.bounds
             // A survivor the platform re-homed in FULLSCREEN windowing mode fills
             // the display and (proven on-device) ignores live resize + windowing-
@@ -1362,9 +1582,28 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
                 "RECOVERY retile pkg=${task.packageName} task=${task.taskId} " +
                     "cur=${cur?.let { "[${it.left},${it.top}][${it.right},${it.bottom}]" } ?: "null"} " +
                     "target=[${bounds.left},${bounds.top}][${bounds.right},${bounds.bottom}] " +
-                    "fullscreen=$isFullscreen relaunch=${isFullscreen && relaunchFullscreen}",
+                    "fullscreen=$isFullscreen relaunch=${isFullscreen && relaunchFullscreen} " +
+                    "vis=${task.visible} max=${task.taskId == maximizedTaskId}",
             )
-            if (isFullscreen && relaunchFullscreen) {
+            // A fullscreen-mode window the platform HID (vis=false) can't be tiled
+            // in place on this ROM and otherwise sits invisible in the dock's
+            // minimize bar (field bug: a maximized app that got mode-promoted on a
+            // resolution switch). Relaunch it into freeform at its float target so
+            // it comes back as a VISIBLE floating window — even in the move-first
+            // path (relaunchFullscreen=false), since leaving it hidden is worse than
+            // the relaunch's state loss.
+            val stuckHidden = isFullscreen && !task.visible
+            // The user drove this window fullscreen (e.g. Android caption-bar expand),
+            // and it can't be un-fullscreened in place on this ROM. Treat it as
+            // maximize intent so EVERY subsequent switch restores it near-full
+            // consistently (not just this one, via the relaunch below).
+            // NOT during disconnect/fallback recovery (relaunchFullscreen): there the
+            // windows arrive fullscreen because WE parked them fullscreen on the phone,
+            // not because the user maximized them — marking them all "maximized" made
+            // every window restore near-full and stack after an unplug/replug (field
+            // bug). Only a genuine switch-time mode-stuck window is real maximize intent.
+            if (stuckHidden && !relaunchFullscreen) markMaximizedPackage(task.packageName)
+            if (isFullscreen && (relaunchFullscreen || stuckHidden)) {
                 // RESCUE PATH for identity-vetted ORIGINALS first. The parked
                 // tasks from the disconnect flow arrive here fullscreen because
                 // WE set them fullscreen (phone parking) — a different species
@@ -1411,18 +1650,59 @@ class FreeformManager(private val accessProvider: () -> ElevatedAccess) {
                             .getLaunchIntentForPackage(w.packageName)?.component?.flattenToShortString()
                     }.getOrNull()
                 if (comp != null) {
+                    // A mode-stuck window the user had maximized should come back as a
+                    // big FREEFORM window (near-full, caption kept) — the state that
+                    // provably survives resolution switches — rather than a tiny tile.
+                    // BUT ONLY on genuine switch-time recovery: during a disconnect
+                    // recovery (relaunchFullscreen) the parked windows are fullscreen
+                    // AND frequently invisible because WE parked them — the same
+                    // false-positive its sibling markMaximizedPackage guard above
+                    // already excludes. Without this guard every replug relaunched
+                    // any momentarily-hidden window to maximized bounds instead of
+                    // its tile (field x2: vending landed at [8,8][1912,1072] while
+                    // its retile line targeted a tile; youtube, vis=true, tiled fine).
+                    // Disconnect-recovery relaunches keep their saved target.
+                    val relaunchBounds =
+                        if (stuckHidden && !relaunchFullscreen) WindowBounds.maximized(displayW, displayH) else bounds
                     close(task.taskId)
                     // Let the removal settle — also frees the window-cap slot so the
                     // relaunch below isn't blocked by the max-windows check.
                     runCatching { Thread.sleep(350) }
-                    runCatching { launchFreeform(comp, displayId, bounds) }
+                    runCatching { launchFreeform(comp, displayId, relaunchBounds) }
+                    // SAFETY (non-destructive relaunch): the relaunch can miss entirely
+                    // if it fired mid-switch while the display was still churning —
+                    // leaving the window CLOSED and gone (field bug: maximized app
+                    // vanished on switch). Verify the package actually landed on this
+                    // display; if not, RE-ISSUE the launch a few times as the display
+                    // settles. We only ever re-launch here (never a second close), so
+                    // this can't lose a window it hasn't already closed — worst case the
+                    // app just isn't back yet and a later retry gets it.
+                    val landed = {
+                        runCatching { listTasks(displayId) }.getOrDefault(emptyList())
+                            .any { it.packageName == task.packageName }
+                    }
+                    var tries = 0
+                    while (!landed() && tries < 3) {
+                        tries++
+                        runCatching { Thread.sleep(450) }
+                        runCatching { launchFreeform(comp, displayId, relaunchBounds) }
+                    }
                     // launchFreeform resizes ONCE, right after the relaunch. If the task
                     // isn't resizeable at that instant the resize is dropped and the
-                    // window stays fullscreen. Re-assert a few times as it settles.
-                    // Bails early (with a diagnostic) when the task is flatly
-                    // non-resizeable — e.g. Kindle's first-run/OOB activity — since no
-                    // amount of retrying can tile that.
-                    ensureTiledWithReroll(task.packageName, comp, displayId, bounds, displayW, displayH)
+                    // window stays fullscreen. Re-assert a few times as it settles (also
+                    // bails early for flatly non-resizeable OOB activities, e.g. Kindle).
+                    ensureTiledWithReroll(task.packageName, comp, displayId, relaunchBounds, displayW, displayH)
+                    if (landed()) {
+                        android.util.Log.d(
+                            "PortalPadSleep",
+                            "RECOVERY retile relaunch LANDED pkg=${task.packageName} (retries=$tries)",
+                        )
+                    } else {
+                        android.util.Log.w(
+                            "PortalPadSleep",
+                            "RECOVERY retile relaunch did NOT land pkg=${task.packageName} after $tries retries — left absent (never closed a second time)",
+                        )
+                    }
                     applied++
                     runCatching { Thread.sleep(120) }
                     continue

@@ -36,11 +36,12 @@ internal object LogTags {
             "LogcatStreamer:V MainActivity:V MediaController:V NativeMouse:V " +
             "PhoneCurtain:V " +
             "NavButtonsOverlay:V NotifListener:V NotifPanel:V PhoneExitBands:V " +
+            "OverlayHost:V QuickWheel:V " +
             "PortalPadA11y:V PortalPadDisplayDiag:V PortalPadFgService:V " +
             "PortalPadRelay:V PortalPadRestore:V PortalPadSleep:V QuickSettings:V " +
             "RestoreCover:V RootClickBackend:V RootManager:V RootShellService:V " +
             "ScreenRecorder:V Screenshot:V SearchOverlay:V ShellUserService:V " +
-            "ShizukuClickBackend:V " +
+            "ShizukuClickBackend:V PortalPadTorch:V " +
             "ShizukuManager:V ShizukuWarning:V TaskbarOverlay:V TrackpadActivity:V " +
             "TrackpadSurface:V UpdateChecker:V VDMirror:V VdRecorder:V WindowArranger:V " +
             "WindowControlBar:V "

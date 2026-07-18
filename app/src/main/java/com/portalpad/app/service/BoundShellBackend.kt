@@ -73,7 +73,14 @@ interface BoundShellBackend {
     // ─── Task / activity / shell ────────────────────────────────────────
     fun moveFocusedTaskToDisplay(displayId: Int): Boolean
     fun moveTaskToDisplay(taskId: Int, displayId: Int): Boolean
+    /** Direct-binder resize (no shell spawn). False = unsupported/missed → use the shell path. */
+    fun resizeTaskFast(taskId: Int, left: Int, top: Int, right: Int, bottom: Int): Boolean = false
+    /** Direct-binder removeTask: finish + purge from Recents (DeX-style close).
+     *  False = unsupported/failed → callers use the shell spellings. */
+    fun removeTask(taskId: Int): Boolean = false
     fun refocusTopTaskOnDisplay(displayId: Int): Boolean
+    /** Direct window-focus grab for a KNOWN taskId — see ShellUserService.focusTask. */
+    fun focusTask(taskId: Int): Boolean = false
     /** Display id of the focused root task (or -1). Reliable per-display focus signal. */
     fun getFocusedTaskDisplayId(): Int
     fun runCommand(cmd: String): String

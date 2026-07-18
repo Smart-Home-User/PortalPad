@@ -60,9 +60,19 @@ data class WindowBounds(
             return WindowBounds(left, top, left + w, top + h)
         }
 
-        /** Maximize to (nearly) the full display. */
-        fun maximized(displayW: Int, displayH: Int) =
-            WindowBounds(0, 0, displayW, displayH)
+        /** Maximize to NEARLY the full display — inset a few px on every edge.
+         *  An EXACT full-canvas match makes the platform promote the window to
+         *  fullscreen MODE, which on ROMs without `set-windowing-mode` then gets
+         *  stuck/hidden on a resolution switch (field bug: maximized app dropped to
+         *  the dock). Staying a few px inside keeps it a freeform window that
+         *  rescales across resolutions like any other, AND keeps it clear of the
+         *  anti-pollution "full-canvas" detection (>2px), so it's preserved rather
+         *  than de-polluted. The inset is imperceptible on-panel. */
+        fun maximized(displayW: Int, displayH: Int): WindowBounds {
+            val ix = if (displayW > 40) 8 else 0
+            val iy = if (displayH > 40) 8 else 0
+            return WindowBounds(ix, iy, displayW - ix, displayH - iy)
+        }
 
         /**
          * The [index]-th of [count] equal-width columns spanning the display —

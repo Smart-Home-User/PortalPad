@@ -9,6 +9,9 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- QR / barcode scanner (wheel chip). CAMERA permission is already
+         declared below for the flashlight; camera hardware stays optional. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -46,6 +49,12 @@
 
     <!-- Granted via Shizuku at runtime -->
     <uses-permission android:name="android.permission.INJECT_EVENTS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- Widget overlay: host Android app widgets on the external display. The
+         BIND_APPWIDGET app-op is granted once via `appwidget grantbind`
+         (Shizuku / root) — the same whitelist launchers get. -->
+    <uses-permission android:name="android.permission.BIND_APPWIDGET"
         tools:ignore="ProtectedPermissions" />
     <!-- EXPERIMENT (permfix): the VD mirror + cursor/dock overlays are
          TYPE_APPLICATION_OVERLAY windows, which One UI hides system-wide while
@@ -215,6 +224,16 @@
             android:exported="false"
             android:excludeFromRecents="true"
             android:windowSoftInputMode="adjustResize|stateAlwaysVisible"
+            android:theme="@style/Theme.PortalPad.FastLaunch" />
+
+        <!-- Phone-side text entry for the widget picker on the external
+             display: typed text filters the picker live. Same phone-pinned,
+             IME-on-phone pattern as SearchActivity. -->
+        <activity
+            android:name=".WidgetSearchActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.PortalPad.FastLaunch" />
 
         <!-- Logcat viewer: in-app diagnostic screen that streams filtered
